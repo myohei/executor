@@ -1,0 +1,63 @@
+name: Sync upstream
+
+on:
+  schedule:
+    # Every day at 09:00 JST (00:00 UTC)
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/UsefulSoftwareCo/executor.git
+
+      - name: Fetch upstream
+        run: git fetch upstream
+
+      - name: Merge upstream/main
+        id: merge
+        continue-on-error: true
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit
+
+      - name: Push (clean merge)
+        if: steps.merge.outcome == 'success'
+        run: git push origin main
+
+      - name: Push conflict branch + create PR
+        if: steps.merge.outcome != 'success'
+        run: |
+          BRANCH="sync-upstream-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH"
+          # Abort the conflicted merge, re-attempt on the branch for the PR
+          git merge --abort
+          git merge upstream/main --no-edit || true
+          git add -A
+          git commit -m "chore: sync upstream (conflicts need manual resolution)" --no-edit || true
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "chore: sync upstream $(date +%Y-%m-%d)" \
+            --body "Upstream has new changes that conflict with our local modifications. Please resolve manually." \
+            --base main \
+            --head "$BRANCH"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
