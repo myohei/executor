@@ -519,17 +519,21 @@ export const runSqliteProviderServiceSplitMigration = (
     if (!(yield* tableExists(client, "integration"))) return 0;
     const input = yield* readDatabaseInput(client, options);
     const plan = planMigration(input);
+    // Warn about skipped orgs before the early return: when EVERY org has hard
+    // errors, moved is 0 and the loop below never runs, which made a fully
+    // skipped migration silent (issue #1403's failure mode after the fix).
+    for (const org of plan.orgs) {
+      if (org.completed || org.hardErrors.length === 0) continue;
+      console.warn(
+        `provider-service-split: skipped org ${org.tenantHash}: ${org.hardErrors.join("; ")}`,
+      );
+    }
     const moved = plan.orgs.filter((org) => !org.completed && org.hardErrors.length === 0).length;
     if (moved === 0) return 0;
 
     for (const org of plan.orgs) {
       if (org.completed) continue;
-      if (org.hardErrors.length > 0) {
-        console.warn(
-          `provider-service-split: skipped org ${org.tenantHash}: ${org.hardErrors.join("; ")}`,
-        );
-        continue;
-      }
+      if (org.hardErrors.length > 0) continue;
       yield* execute(client, "BEGIN");
       const applyOne = Effect.gen(function* () {
         yield* applyOrg(client, org);

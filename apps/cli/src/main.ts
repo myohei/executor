@@ -1520,14 +1520,45 @@ const parseOptionalJsonObject = (
         Effect.mapError((error) => new Error(`Invalid --content JSON: ${error.message}`)),
       );
 
-const formatUnknownMessage = (cause: unknown): string => {
-  if (cause instanceof Error) return cause.message;
-  if (typeof cause === "string") return cause;
-  if (typeof cause === "object" && cause !== null && "message" in cause) {
-    const message = cause.message;
-    if (typeof message === "string") return message;
+const ownMessage = (value: unknown): string => {
+  if (typeof value === "string") return value.trim();
+  if (typeof value === "object" && value !== null && "message" in value) {
+    const message = (value as { message: unknown }).message;
+    if (typeof message === "string") return message.trim();
   }
-  return String(cause);
+  return "";
+};
+
+/**
+ * Render an unknown failure by walking its `cause` chain. Wrapper errors
+ * (tagged errors carrying only `{ cause }`) have an empty own message; without
+ * descending, a boot failure like a data-migration error printed as literally
+ * "Unknown error" (issue #1403). Nested messages that merely repeat their
+ * parent are dropped.
+ */
+const formatUnknownMessage = (cause: unknown): string => {
+  const messages: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = cause;
+  while (current !== null && current !== undefined && !seen.has(current)) {
+    seen.add(current);
+    const message = ownMessage(current);
+    if (message.length > 0 && !messages.some((existing) => existing.includes(message))) {
+      messages.push(message);
+    }
+    current =
+      typeof current === "object" && "cause" in current
+        ? (current as { cause: unknown }).cause
+        : undefined;
+  }
+  if (messages.length === 0) {
+    return typeof cause === "string"
+      ? cause
+      : cause instanceof Error
+        ? cause.message
+        : String(cause);
+  }
+  return messages.join("\ncaused by: ");
 };
 
 const readCliLogLevel = (argv: ReadonlyArray<string>): string | undefined => {
@@ -3205,7 +3236,12 @@ const program = (
       } else {
         console.error(renderCliError(cause));
       }
-      process.exitCode = 1;
+      // Exit hard, not via exitCode: this handler converts the failure into a
+      // success, so runMain's teardown never force-exits, and background fibers
+      // (the integrations-refresh fork) keep the event loop alive. A daemon
+      // that failed boot then lingers with its port unbound, and the desktop
+      // waits on the ready sentinel forever (issue #1403).
+      process.exit(1);
     }),
   ),
 );

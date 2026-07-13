@@ -1045,7 +1045,19 @@ export const planMigration = (input: MigrationInput): MigrationPlan => {
         hardErrors.push(error instanceof Error ? error.message : String(error));
         continue;
       }
-      const specHash = specHashFor(monolith);
+      // Same escape hatch as deriveServices above: under collectPolicyErrors a
+      // monolith without a usable specHash becomes a per-org hardError (org
+      // skipped, warned, left unstamped) instead of failing the whole plan. An
+      // escaped throw here took down every org in the run and, on the local
+      // boot rail, prevented the daemon from starting at all (issue #1403).
+      let specHash: string;
+      try {
+        specHash = specHashFor(monolith);
+      } catch (error) {
+        if (!input.collectPolicyErrors) throw error;
+        hardErrors.push(error instanceof Error ? error.message : String(error));
+        continue;
+      }
       const namespace = pluginBlobNamespace(tenant, monolith.plugin_id);
       const targetNamespace = pluginBlobNamespace(tenant, "openapi");
       const specBlobPresent =

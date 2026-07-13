@@ -288,6 +288,59 @@ describe("providerServiceSplitDataMigration", () => {
     }),
   );
 
+  it.effect("skips a specHash-less org intact and still migrates healthy orgs", () =>
+    Effect.gen(function* () {
+      const db = yield* Effect.promise(() => createSqliteTestFumaDb({ tables: collectTables() }));
+      const client = db.client;
+
+      // org_1: a real pre-split Google setup whose config never recorded a
+      // specHash (issue #1403 — this used to throw out of the planner and
+      // fail the whole boot migration).
+      yield* Effect.promise(() =>
+        insertIntegration(client, {
+          rowId: "google_row_org_1",
+          tenant: "org_1",
+          slug: "google",
+          pluginId: "google",
+          config: {
+            googleDiscoveryUrls: ["https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"],
+          },
+        }),
+      );
+      yield* Effect.promise(() => insertConnection(client, "org_1"));
+      yield* Effect.promise(() => insertTool(client, "calendar.events.list", "org_1"));
+      yield* Effect.promise(() => insertOperation(client, "calendar.events.list", "org_1"));
+      yield* seedCalendarOrg(client, "org_2");
+
+      expect(yield* runSqliteDataMigrations(client, [providerServiceSplitDataMigration])).toEqual([
+        "2026-07-08-provider-service-split",
+      ]);
+
+      const integrations = yield* Effect.promise(() =>
+        client.execute("SELECT tenant, slug, plugin_id FROM integration ORDER BY tenant, slug"),
+      );
+      expect(integrations.rows).toEqual([
+        { tenant: "org_1", slug: "google", plugin_id: "google" },
+        { tenant: "org_2", slug: "google_calendar", plugin_id: "openapi" },
+      ]);
+
+      const ledger = yield* Effect.promise(() =>
+        client.execute("SELECT tenant FROM provider_service_split_org_migration ORDER BY tenant"),
+      );
+      expect(ledger.rows).toEqual([{ tenant: "org_2" }]);
+
+      const connections = yield* Effect.promise(() =>
+        client.execute("SELECT tenant, integration FROM connection ORDER BY tenant"),
+      );
+      expect(connections.rows).toEqual([
+        { tenant: "org_1", integration: "google" },
+        { tenant: "org_2", integration: "google_calendar" },
+      ]);
+
+      yield* Effect.promise(() => db.close());
+    }),
+  );
+
   it.effect("uses the per-org ledger to recover after a mid-run crash", () =>
     Effect.gen(function* () {
       const db = yield* Effect.promise(() => createSqliteTestFumaDb({ tables: collectTables() }));
