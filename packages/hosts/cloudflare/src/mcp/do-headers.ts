@@ -37,8 +37,13 @@ export type IncomingPropagationHeaders = {
   readonly baggage?: string;
 };
 
-const currentTraceparent = Effect.map(Effect.currentSpan, (span) => {
-  if (!span || !span.traceId || !span.spanId) return undefined;
+// `currentParentSpan`, not `currentSpan`: the worker's MCP handler joins the
+// edge `http.server` span via `OtelTracer.withSpanContext`, which provides an
+// ExternalSpan as the fiber's ParentSpan without opening an Effect-local span.
+// `currentSpan` filters to real Spans and would come up empty there, silently
+// dropping propagation and letting the DO start a fresh root per request.
+const currentTraceparent = Effect.map(Effect.currentParentSpan, (span) => {
+  if (!span.traceId || !span.spanId) return undefined;
   const flags = span.sampled ? "01" : "00";
   return `00-${span.traceId}-${span.spanId}-${flags}`;
 }).pipe(Effect.orElseSucceed(() => undefined));

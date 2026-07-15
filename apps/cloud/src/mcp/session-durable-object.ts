@@ -14,7 +14,6 @@
 // ---------------------------------------------------------------------------
 
 import { env } from "cloudflare:workers";
-import { createTraceState } from "@opentelemetry/api";
 import { Data, Effect, Layer } from "effect";
 import type { Cause } from "effect";
 import * as OtelTracer from "@effect/opentelemetry/Tracer";
@@ -73,6 +72,7 @@ import {
   captureCauseEffect as reportCauseEffect,
   tagCurrentSentryScopeWithCurrentOtelSpan,
 } from "../observability";
+import { parseTraceparent } from "./traceparent";
 
 // Re-export the shared types so existing cloud importers
 // (`auth/handlers.ts`, etc.) keep their `../mcp/session-durable-object` path.
@@ -112,34 +112,6 @@ class OrganizationNotFoundError extends Data.TaggedError("OrganizationNotFoundEr
 class McpModelResumeForwardError extends Data.TaggedError("McpModelResumeForwardError")<{
   readonly cause: unknown;
 }> {}
-
-// W3C propagation across the worker→DO boundary. The worker injects its
-// `traceparent` and forwards incoming `tracestate` / `baggage`; we parse the
-// context and use `OtelTracer.withSpanContext` to stitch the DO's root span
-// under the worker span so the entire logical request lives in one trace.
-const TRACEPARENT_PATTERN = /^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
-
-type IncomingSpanContext = {
-  readonly traceId: string;
-  readonly spanId: string;
-  readonly traceFlags: number;
-  readonly traceState?: ReturnType<typeof createTraceState>;
-};
-
-const parseTraceparent = (
-  traceparent: string | null | undefined,
-  tracestate: string | null | undefined,
-): IncomingSpanContext | null => {
-  if (!traceparent) return null;
-  const match = TRACEPARENT_PATTERN.exec(traceparent);
-  if (!match) return null;
-  return {
-    traceId: match[2]!,
-    spanId: match[3]!,
-    traceFlags: parseInt(match[4]!, 16),
-    ...(tracestate ? { traceState: createTraceState(tracestate) } : {}),
-  };
-};
 
 /**
  * The DO keeps one postgres.js client for the MCP session runtime. postgres.js
