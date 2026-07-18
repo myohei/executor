@@ -1,4 +1,11 @@
 export { parse, resolveSpecText, fetchSpecText } from "./parse";
+export {
+  applySpecOverrides,
+  JsonPatchOperationSchema,
+  SpecOverridesSchema,
+  type JsonPatchOperation,
+  type SpecOverrides,
+} from "./spec-overrides";
 export { extract, streamOperationBindingsFromStructure } from "./extract";
 export {
   structuralSplit,
@@ -92,6 +99,7 @@ export {
   OpenApiExtractionError,
   OpenApiInvocationError,
   OpenApiOAuthError,
+  OpenApiSpecOverrideError,
   OpenApiAuthRequiredError,
 } from "./errors";
 

@@ -25,6 +25,17 @@ export class OpenApiExtractionError extends Schema.TaggedErrorClass<OpenApiExtra
   { httpApiStatus: 400 },
 ) {}
 
+export class OpenApiSpecOverrideError extends Schema.TaggedErrorClass<OpenApiSpecOverrideError>()(
+  "OpenApiSpecOverrideError",
+  {
+    operationIndex: Schema.Number,
+    operation: Schema.String,
+    path: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 400 },
+) {}
+
 export class OpenApiInvocationError extends Data.TaggedError("OpenApiInvocationError")<{
   readonly message: string;
   readonly statusCode: Option.Option<number>;
