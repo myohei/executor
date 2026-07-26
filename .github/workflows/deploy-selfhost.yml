@@ -48,9 +48,15 @@ jobs:
         env:
           ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
 
-      - name: Deploy
+      - name: Diagnose D1
         working-directory: apps/host-cloudflare
-        run: bun run deploy:setup
+        run: |
+          echo "=== whoami ==="
+          bunx wrangler whoami
+          echo "=== d1 list ==="
+          bunx wrangler d1 list --json
+          echo "=== d1 list (names) ==="
+          bunx wrangler d1 list --json | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{JSON.parse(s).forEach(d=>console.log(d.name,d.uuid))}catch(e){console.error("parse error:",e.message)}})'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
