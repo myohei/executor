@@ -4,6 +4,7 @@
   "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
   "main": "src/worker.ts",
+  "routes": [{ "pattern": "executor.yohei.tokyo", "custom_domain": true }],
   "observability": { "enabled": true },
   // The web UI (Workers Static Assets) — the shared multiplayer SPA built by
   // `vite build` into ./dist. `single-page-application` serves index.html for
@@ -22,7 +23,7 @@
     {
       "binding": "DB",
       "database_name": "executor",
-      "database_id": "ae748ca1-032c-4427-a1a0-fe39db77d1a9",
+      "database_id": "a0c6cfd1-cbdb-43e8-a668-3175e11344b9",
     },
   ],
   // Plugin blob seam backend: multi-MB values (resolved OpenAPI specs,
@@ -55,8 +56,8 @@
   // (the at-rest secret-encryption key) is a SECRET — set it with
   // `wrangler secret put EXECUTOR_SECRET_KEY`, never in vars.
   "vars": {
-    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
-    "ACCESS_AUD": "",
+    "ACCESS_TEAM_DOMAIN": "mercury-maeda.cloudflareaccess.com",
+    "ACCESS_AUD": "c34fbdce8241966ff1966c01bc2c8e03aa70d92a3fb2e564588d4c6b09a2ebae",
     "ACCESS_NAME_CLAIM": "name",
     "ACCESS_GROUPS_CLAIM": "groups",
     "ADMIN_EMAILS": "",
