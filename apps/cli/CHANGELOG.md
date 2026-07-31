@@ -1,5 +1,17 @@
 # executor
 
+## 1.5.38
+
+### Patch Changes
+
+- [#1507](https://github.com/UsefulSoftwareCo/executor/pull/1507) [`541549a`](https://github.com/UsefulSoftwareCo/executor/commit/541549a5dd8806f45b1a01ea6f4fa18ac41f53b1) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Fix: OAuth refresh rejections with non-spec error bodies (e.g. Datadog) now surface as expired connections with a reconnect path, and definitively dead refresh tokens are no longer retried against the authorization server**
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.5.38
+  - @executor-js/runtime-quickjs@1.5.38
+  - @executor-js/local@1.4.4
+  - @executor-js/api@1.4.58
+
 ## 1.5.37
 
 ### Patch Changes
