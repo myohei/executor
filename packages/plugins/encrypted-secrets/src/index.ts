@@ -4,7 +4,7 @@ import { Effect } from "effect";
 
 import {
   definePlugin,
-  Owner,
+  ownerForItemId,
   ProviderItemId,
   ProviderKey,
   StorageError,
@@ -29,8 +29,8 @@ import {
 // v2: the provider sees only an opaque `ProviderItemId` — there is NO scope
 // arg. The connection row that references the id owns the (tenant, owner,
 // subject) partition; the encrypted value is keyed solely by the opaque id.
-// Plugin storage writes still carry an `owner` (the executor's binding), which
-// is captured once from the ctx at provider construction.
+// Plugin storage writes carry an `owner`: the one embedded in the item id
+// (`oauth:org:…` → org-shared) when present, else the executor's binding.
 // ---------------------------------------------------------------------------
 
 type PluginStorage = PluginCtx<unknown>["pluginStorage"];
@@ -78,17 +78,10 @@ const decryptSecret = (key: Buffer, payload: string): Effect.Effect<string, Stor
 
 const ENCRYPTED_PROVIDER_KEY = ProviderKey.make("encrypted");
 
-/** Always store encrypted secrets at the org partition so that any subject
- *  within the tenant — a human user who completed browser OAuth or a Service
- *  Token driving an MCP tool call — can retrieve them. Access control is
- *  enforced by the connection row's own (tenant, owner, subject) partition;
- *  the provider is a shared, opaque-key vault. */
-const ownerOf = (_binding: OwnerBinding): Owner => Owner.make("org");
-
 const makeEncryptedProvider = (
   key: Buffer,
   storage: PluginStorage,
-  owner: Owner,
+  binding: OwnerBinding,
 ): CredentialProvider => ({
   key: ENCRYPTED_PROVIDER_KEY,
   writable: true,
@@ -106,12 +99,18 @@ const makeEncryptedProvider = (
   set: (id: ProviderItemId, value: string) =>
     encryptSecret(key, value).pipe(
       Effect.flatMap((payload) =>
-        storage.put({ collection: COLLECTION, key: id, owner, data: payload }),
+        storage.put({
+          collection: COLLECTION,
+          key: id,
+          owner: ownerForItemId(id, binding),
+          data: payload,
+        }),
       ),
       Effect.asVoid,
     ),
 
-  delete: (id: ProviderItemId) => storage.remove({ collection: COLLECTION, key: id, owner }),
+  delete: (id: ProviderItemId) =>
+    storage.remove({ collection: COLLECTION, key: id, owner: ownerForItemId(id, binding) }),
 
   list: () =>
     storage
@@ -144,10 +143,17 @@ export const encryptedSecretsPlugin = definePlugin((options?: EncryptedSecretsPl
     id: "encryptedSecrets" as const,
     storage: () => ({}),
     credentialProviders: (ctx: PluginCtx<unknown>): readonly CredentialProvider[] => [
-      makeEncryptedProvider(derivedKey, ctx.pluginStorage, ownerOf(ctx.owner)),
+      makeEncryptedProvider(derivedKey, ctx.pluginStorage, ctx.owner),
     ],
   };
 });
 
 // Exported for host-side tests / reuse.
 export { deriveKey, encryptSecret, decryptSecret };
+
+// Boot-time repair for rows the pre-fix provider filed under the acting
+// caller's partition (issue #1453).
+export {
+  encryptedSecretsRepartitionDataMigration,
+  runSqliteEncryptedSecretsRepartition,
+} from "./repartition-migration";
