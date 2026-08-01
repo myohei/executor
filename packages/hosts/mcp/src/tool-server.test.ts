@@ -274,6 +274,44 @@ describe("MCP host server — native elicitation mode", () => {
     });
   });
 
+  it("execute tool keeps the returned value in content when output was also emitted", async () => {
+    const engine = makeStubEngine({
+      execute: () =>
+        Effect.succeed({
+          result: { subject: "Flight receipt", total: 42 },
+          output: [
+            {
+              type: "content",
+              content: {
+                type: "text",
+                text: "Flight receipt",
+              },
+            },
+          ],
+        }),
+    });
+
+    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
+      const result = await client.callTool({
+        name: "execute",
+        arguments: { code: "emit(subject); return receipt;" },
+      });
+
+      const content = result.content as Array<Record<string, unknown>>;
+      expect(content).toHaveLength(2);
+      expect(content[0]).toMatchObject({ type: "text", text: "Flight receipt" });
+      expect(content[1]).toMatchObject({
+        type: "text",
+        text: JSON.stringify({ subject: "Flight receipt", total: 42 }, null, 2),
+      });
+      expect(result.structuredContent).toMatchObject({
+        status: "completed",
+        result: { subject: "Flight receipt", total: 42 },
+      });
+      expect(result.isError).toBeFalsy();
+    });
+  });
+
   it("execute tool renders emitted MCP image content as MCP images", async () => {
     const engine = makeStubEngine({
       execute: () =>
@@ -415,6 +453,10 @@ describe("MCP host server — native elicitation mode", () => {
           uri: "executor-file:///remote.pdf",
           name: "remote.pdf",
           mimeType: "application/pdf",
+        },
+        {
+          type: "text",
+          text: JSON.stringify({ forwarded: true }, null, 2),
         },
       ]);
       expect(result.structuredContent).toMatchObject({

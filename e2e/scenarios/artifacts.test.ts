@@ -791,6 +791,7 @@ scenario(
 
     const ARTIFACT_TOOLS = [
       "create-artifact",
+      "edit-artifact",
       "list-artifacts",
       "show-artifact",
       "execute-action",
@@ -818,7 +819,12 @@ scenario(
     // URL, gets everything by default. Without this the assertions above would
     // also pass on a server that had simply lost artifacts.
     const defaultTools = yield* defaultSession.listTools();
-    for (const tool of ["create-artifact", "list-artifacts", "show-artifact"] as const) {
+    for (const tool of [
+      "create-artifact",
+      "edit-artifact",
+      "list-artifacts",
+      "show-artifact",
+    ] as const) {
       expect(defaultTools, `${tool} is present on a default session`).toContain(tool);
     }
     const defaultSkills = yield* defaultSession.call("skills", {});

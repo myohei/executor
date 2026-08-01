@@ -53,8 +53,10 @@ import {
 } from "@executor-js/execution";
 import {
   MCP_APPS_SHELL_RESOURCE_URI,
+  applyArtifactEdits,
   smokeRenderRejection,
   validateArtifactCode,
+  type ArtifactEdit,
   type ArtifactSmokeRenderResult,
 } from "./create-artifact";
 import { TOOL_CALL_CONTRACT_MESSAGE } from "./tool-call-code";
@@ -574,6 +576,11 @@ const toMcpOutputResult = (
   const extraText: string[] = [];
   if (result.error) {
     extraText.push(formatted.text);
+  } else if (result.result != null) {
+    // A script may both emit() and return: keep the returned value in the
+    // content channel too, or clients that ignore structuredContent drop it.
+    // formatted.text already renders the return value plus any logs.
+    extraText.push(formatted.text);
   } else if (result.logs && result.logs.length > 0) {
     extraText.push(`Logs:\n${result.logs.join("\n")}`);
   }
@@ -838,6 +845,22 @@ const startMarker = (name: string, attributes: Record<string, unknown>): Effect.
 const renderRejectedResult = (reason: string): McpToolResult => ({
   content: [{ type: "text", text: `create-artifact rejected: ${reason}` }],
   structuredContent: { status: "error", error: reason },
+  isError: true,
+});
+
+/** An edit batch that could not be applied. Carries the current stored source
+ *  so the model can rebuild its edits without a `show-artifact` round trip. */
+const editRejectedResult = (reason: string, currentCode: string): McpToolResult => ({
+  content: [
+    {
+      type: "text",
+      text: [
+        `edit-artifact rejected: ${reason}`,
+        "Nothing was changed. The artifact's current source is in structuredContent.code — build the retry against it.",
+      ].join("\n"),
+    },
+  ],
+  structuredContent: { status: "error", error: reason, code: currentCode },
   isError: true,
 });
 
@@ -1650,53 +1673,21 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
     };
 
     /**
-     * Bind the integration roles an artifact's code uses, at create time.
-     *
-     * Binding happens HERE rather than at render time because this is the only
-     * moment the author, the code and their connections are all in hand — and
-     * because a create that can't bind is a create that would have saved a
-     * broken artifact. The model finds out now, with the candidate list, rather
-     * than the user finding out later through a query error inside the UI.
-     *
-     * `artifactId` turns the same call into an update in place. A model tweaking
-     * a dashboard has the whole component in hand already — it fetched it with
-     * `show-artifact`, edited it, and is calling back with the result — so a
-     * separate `update-artifact` tool would take the same four arguments and
-     * differ only in whether a row is minted. One tool keeps the catalog small
-     * and makes the wrong thing (a copy per tweak) the thing the model has to
-     * ask for rather than the thing it gets by default.
-     *
-     * An update replaces the code outright — v1 keeps no version history — and
-     * re-extracts and re-resolves the bindings from the NEW source, because the
-     * roles the new code uses are not necessarily the ones the old code did.
-     * `title` and `description` are optional on an update and absent means keep
-     * what is stored, so a pure code tweak doesn't have to restate them.
+     * The shared back half of `create-artifact` and `edit-artifact`: everything
+     * that happens once the full candidate source is in hand. Static checks,
+     * the smoke render, binding and the save are identical whether the code
+     * arrived whole or was assembled from stored source plus edits — sharing
+     * the pipeline is what guarantees an edit cannot save anything a create
+     * would have refused.
      */
-    const createArtifact = (input: {
+    const validateRenderAndSave = (input: {
       readonly code: string;
-      readonly title?: string;
-      readonly description?: string;
-      readonly connections?: Readonly<Record<string, string>>;
-      readonly artifactId?: string;
+      readonly title: string;
+      readonly description?: string | undefined;
+      readonly connections?: Readonly<Record<string, string>> | undefined;
+      readonly existing: Artifact | null;
     }): Effect.Effect<McpToolResult, unknown> =>
       Effect.gen(function* () {
-        // An update reads the existing row FIRST, both to carry its title and
-        // description forward and to refuse a foreign id before any work. The
-        // refusal is `artifact_unavailable` — the same answer `execute-action`
-        // gives — so create-artifact cannot be used to probe which ids exist.
-        const existing =
-          input.artifactId === undefined ? null : yield* loadArtifact(input.artifactId);
-        if (input.artifactId !== undefined && !existing) return actionArtifactUnavailableResult();
-
-        const title = input.title ?? existing?.title;
-        if (title === undefined) {
-          return renderRejectedResult(
-            "title is required when creating an artifact. Give it a short human-readable name.",
-          );
-        }
-        // Only an update inherits; a create with no description stores none.
-        const description = input.description ?? existing?.description ?? undefined;
-
         const rejection = validateArtifactCode(input.code);
         if (rejection) return renderRejectedResult(rejection);
 
@@ -1739,10 +1730,10 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
 
         const saveInput = {
           code: input.code,
-          title,
+          title: input.title,
           preview,
-          ...(description === undefined ? {} : { description }),
-          ...(existing === null ? {} : { existingId: existing.id }),
+          ...(input.description === undefined ? {} : { description: input.description }),
+          ...(input.existing === null ? {} : { existingId: input.existing.id }),
         };
 
         const roles = extractArtifactRoles(input.code);
@@ -1770,12 +1761,113 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
           "mcp.artifact.role_count": roles.length,
         });
         return yield* saveAndDeliverArtifact({ ...saveInput, bindings: resolved.bindings });
+      });
+
+    /**
+     * Bind the integration roles an artifact's code uses, at create time.
+     *
+     * Binding happens HERE rather than at render time because this is the only
+     * moment the author, the code and their connections are all in hand — and
+     * because a create that can't bind is a create that would have saved a
+     * broken artifact. The model finds out now, with the candidate list, rather
+     * than the user finding out later through a query error inside the UI.
+     *
+     * `artifactId` turns the same call into an update in place — for a REWRITE,
+     * where the new source shares little with the old and edits would be longer
+     * than the code. A tweak belongs on `edit-artifact`, which patches the
+     * stored source instead of replacing it. Either way one row is kept: a copy
+     * per revision is the thing the model has to ask for, never the default.
+     *
+     * An update replaces the code outright — v1 keeps no version history — and
+     * re-extracts and re-resolves the bindings from the NEW source, because the
+     * roles the new code uses are not necessarily the ones the old code did.
+     * `title` and `description` are optional on an update and absent means keep
+     * what is stored, so a pure code tweak doesn't have to restate them.
+     */
+    const createArtifact = (input: {
+      readonly code: string;
+      readonly title?: string;
+      readonly description?: string;
+      readonly connections?: Readonly<Record<string, string>>;
+      readonly artifactId?: string;
+    }): Effect.Effect<McpToolResult, unknown> =>
+      Effect.gen(function* () {
+        // An update reads the existing row FIRST, both to carry its title and
+        // description forward and to refuse a foreign id before any work. The
+        // refusal is `artifact_unavailable` — the same answer `execute-action`
+        // gives — so create-artifact cannot be used to probe which ids exist.
+        const existing =
+          input.artifactId === undefined ? null : yield* loadArtifact(input.artifactId);
+        if (input.artifactId !== undefined && !existing) return actionArtifactUnavailableResult();
+
+        const title = input.title ?? existing?.title;
+        if (title === undefined) {
+          return renderRejectedResult(
+            "title is required when creating an artifact. Give it a short human-readable name.",
+          );
+        }
+        // Only an update inherits; a create with no description stores none.
+        const description = input.description ?? existing?.description ?? undefined;
+
+        return yield* validateRenderAndSave({
+          code: input.code,
+          title,
+          description,
+          connections: input.connections,
+          existing,
+        });
       }).pipe(
         Effect.withSpan("mcp.host.tool.create_artifact", {
           attributes: {
             "mcp.tool.name": "create-artifact",
             "mcp.artifact.update": input.artifactId !== undefined,
             "mcp.execute.code_length": input.code.length,
+          },
+        }),
+      );
+
+    /**
+     * `edit-artifact`: the update path for tweaks, patching the stored source
+     * with exact find-and-replace edits so the call scales with the change
+     * rather than the component. The edited result runs the same
+     * validate → smoke-render → bind → save pipeline as a full create, so an
+     * edit cannot save anything a create would have refused.
+     *
+     * A failed edit hands the CURRENT source back in `structuredContent.code`.
+     * The model's usual recovery — `show-artifact`, re-read, retry — is a whole
+     * extra round trip to fetch a thing this call already loaded; giving it
+     * back here makes the retry immediate.
+     */
+    const editArtifact = (input: {
+      readonly artifactId: string;
+      readonly edits: readonly ArtifactEdit[];
+      readonly title?: string;
+      readonly description?: string;
+      readonly connections?: Readonly<Record<string, string>>;
+    }): Effect.Effect<McpToolResult, unknown> =>
+      Effect.gen(function* () {
+        // Same probe-proof refusal as create-artifact's update arm.
+        const existing = yield* loadArtifact(input.artifactId);
+        if (!existing) return actionArtifactUnavailableResult();
+
+        const applied = applyArtifactEdits(existing.code, input.edits);
+        if (!applied.ok) return editRejectedResult(applied.message, existing.code);
+
+        yield* Effect.annotateCurrentSpan({
+          "mcp.artifact.edit_count": input.edits.length,
+        });
+        return yield* validateRenderAndSave({
+          code: applied.code,
+          title: input.title ?? existing.title,
+          description: input.description ?? existing.description ?? undefined,
+          connections: input.connections,
+          existing,
+        });
+      }).pipe(
+        Effect.withSpan("mcp.host.tool.edit_artifact", {
+          attributes: {
+            "mcp.tool.name": "edit-artifact",
+            "mcp.artifact.id": input.artifactId,
           },
         }),
       );
@@ -1858,7 +1950,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
               'To use two accounts of the same integration, tag each call site with a role — `tools.linear("prod").issues.list` and `tools.linear("staging").issues.list` — and map every role in `connections`.',
               "All data access is declarative `tools.*`: `.queryOptions()` to read, `.infiniteQueryOptions()` to page through a cursor, `.mutationOptions()` to write. There is no `run()` and no arbitrary code — never hand-roll `useQuery({ queryKey, queryFn })`, or invalidation breaks.",
               "To read every page of a paginated tool, call `useInfiniteQuery(tools.<integration>.<tool>.infiniteQueryOptions(args, { cursorKey, getNextPageParam }))` once and render `data.pages`. Never call hooks inside a loop — a `useQuery` per page is rejected.",
-              "To CHANGE an artifact that already exists — a tweak, a fix, a new column — pass its `artifactId` and it is updated in place. Fetch the current source with `show-artifact` first, edit that, and send the whole component back. Never create a second artifact for a revision of an existing one.",
+              "To CHANGE an artifact that already exists, use `edit-artifact` — it patches the stored source with find-and-replace edits, so a tweak costs only the changed lines. Only use create-artifact with `artifactId` for a full rewrite, sending the complete new component. Never create a second artifact for a revision of an existing one.",
               "Clients that cannot display MCP apps receive a link to the saved artifact instead; pass it to the user.",
             ].join("\n"),
             inputSchema: {
@@ -1869,7 +1961,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
                 .min(1)
                 .optional()
                 .describe(
-                  "The artifact to update in place, from `list-artifacts` or a previous create. Omit to create a new one. `code` fully replaces the stored source and the connection bindings are re-resolved from it, so send the complete component, not a fragment.",
+                  "The artifact to REWRITE in place, from `list-artifacts` or a previous create. Omit to create a new one. `code` fully replaces the stored source and the connection bindings are re-resolved from it, so send the complete component, not a fragment. For a tweak, use `edit-artifact` instead.",
                 ),
               connections: z
                 .record(z.string(), z.string())
@@ -1902,6 +1994,72 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
       ).pipe(
         Effect.withSpan("mcp.host.register_tool", {
           attributes: { "mcp.tool.name": "create-artifact" },
+        }),
+      );
+
+      yield* Effect.sync(() =>
+        registerAppTool(
+          server,
+          "edit-artifact",
+          {
+            description: [
+              "Change an existing artifact by patching its stored source with exact find-and-replace edits, and re-render it.",
+              "PREFER THIS over create-artifact for tweaks — a new column, a fixed label, a restyled section — because you send only the changed lines, not the whole component. Use create-artifact with `artifactId` only for a rewrite where most of the code changes.",
+              "Each edit's `oldText` must appear EXACTLY ONCE in the current source, verbatim (whitespace included); include enough surrounding lines to make it unique, or set `replaceAll: true` to change every occurrence. Edits apply in order, each seeing the previous one's result.",
+              "The batch is atomic: if any edit fails to match, nothing is saved and the error returns the current source in structuredContent.code — rebuild the edits from that instead of calling show-artifact again.",
+              "The edited component is validated and smoke-rendered exactly like a create, and connection bindings are re-resolved from the result; pass `connections` if an edit introduces an ambiguous integration.",
+            ].join("\n"),
+            inputSchema: {
+              artifactId: z
+                .string()
+                .trim()
+                .min(1)
+                .describe("The artifact to edit, from `list-artifacts` or a previous create."),
+              edits: z
+                .array(
+                  z.object({
+                    oldText: z
+                      .string()
+                      .min(1)
+                      .describe(
+                        "Exact text to find in the current source, whitespace included. Must match exactly once unless replaceAll is true.",
+                      ),
+                    newText: z.string().describe("The replacement text."),
+                    replaceAll: z
+                      .boolean()
+                      .optional()
+                      .describe("Replace every occurrence instead of requiring a unique match."),
+                  }),
+                )
+                .min(1)
+                .describe("Find-and-replace edits, applied in order. All-or-nothing."),
+              connections: z
+                .record(z.string(), z.string())
+                .optional()
+                .describe(
+                  "Connection for each integration role the EDITED code uses, exactly as on create-artifact. Only needed when an edit introduces an integration with several connections.",
+                ),
+              title: z
+                .string()
+                .trim()
+                .min(1)
+                .optional()
+                .describe("New title. Omit to keep the current one."),
+              description: z
+                .string()
+                .optional()
+                .describe("New description. Omit to keep the current one."),
+            },
+            _meta: {
+              ui: { resourceUri: MCP_APPS_SHELL_RESOURCE_URI, visibility: ["model"] },
+            },
+          },
+          ({ artifactId, edits, connections, title, description }) =>
+            runToolEffect(editArtifact({ artifactId, edits, connections, title, description })),
+        ),
+      ).pipe(
+        Effect.withSpan("mcp.host.register_tool", {
+          attributes: { "mcp.tool.name": "edit-artifact" },
         }),
       );
 
