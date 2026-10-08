@@ -19,6 +19,7 @@ import { serveTestHttpApp } from "@executor-js/sdk/testing";
 
 import { scenario } from "../src/scenario";
 import { Api, Browser, Target } from "../src/services";
+import { visit } from "../src/surfaces/browser";
 
 const api = composePluginApi([mcpHttpPlugin()] as const);
 
@@ -53,16 +54,14 @@ scenario(
       yield* Effect.gen(function* () {
         yield* browser.session(identity, async ({ page, step }) => {
           await step("Open the add-MCP flow pointed at the auth-gated server", async () => {
-            await page.goto(`/integrations/add/mcp?url=${encodeURIComponent(endpoint)}`, {
-              waitUntil: "networkidle",
-            });
+            await visit(page, `/integrations/add/mcp?url=${encodeURIComponent(endpoint)}`);
             // Before the fix this dead-ended on a red "add credentials below"
             // error with no editor. Now the auth-method editor renders.
             await page.getByText("How does this server authenticate?").waitFor();
           });
 
           await step("The probe seeded a detected Bearer-header method", async () => {
-            await page.getByText("Method 1 · Detected").waitFor();
+            await page.getByText("API key · Detected").waitFor();
             // The preview card flags the gate rather than failing the probe.
             await page.getByText("Auth required").first().waitFor();
           });

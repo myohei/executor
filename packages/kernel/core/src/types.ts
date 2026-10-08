@@ -3,6 +3,7 @@ import type * as Cause from "effect/Cause";
 import type * as Effect from "effect/Effect";
 
 import type { CodeExecutionError } from "./effect-errors";
+import type { ExecuteErrorKind } from "./error-kind";
 
 /** Branded tool path */
 export type ToolPath = string & { readonly __toolPath: unique symbol };
@@ -42,7 +43,11 @@ export type ExecuteResult = {
   result: unknown;
   output?: ExecuteOutputItem[];
   error?: string;
+  /** Enumerable failure class for telemetry; never carries message content. */
+  errorKind?: ExecuteErrorKind;
   logs?: string[];
+  /** Successful connected-tool paths observed during this execution. */
+  toolPaths?: readonly string[];
 };
 
 /**

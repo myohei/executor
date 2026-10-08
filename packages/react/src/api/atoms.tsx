@@ -12,10 +12,12 @@ import {
   type OAuthGrant,
   type Owner,
   type ProviderItemId,
+  type TokenEndpointAuthMethod,
   type ToolAddress,
 } from "@executor-js/sdk/shared";
 import * as Atom from "effect/unstable/reactivity/Atom";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
+import * as Reactivity from "effect/unstable/reactivity/Reactivity";
 import * as Effect from "effect/Effect";
 
 import { ExecutorApiClient } from "./client";
@@ -132,7 +134,10 @@ export const providersAtom = ExecutorApiClient.query("providers", "list", {
 export const providerItemsAtom = (key: ProviderKey) =>
   ExecutorApiClient.query("providers", "items", {
     params: { key },
-    timeToLive: "30 seconds",
+    // Long retention on purpose: external-provider listings (1Password) are
+    // slow, so pickers render the last-known list instantly and revalidate in
+    // the background on mount instead of flashing a loading state each open.
+    timeToLive: "10 minutes",
     reactivityKeys: [ReactivityKey.providers],
   });
 
@@ -193,6 +198,37 @@ export const refreshConnection = ExecutorApiClient.mutation("connections", "refr
  *  manual-vs-automatic split that keeps the automatic path from churning the
  *  cache on every load). */
 export const checkConnectionHealth = ExecutorApiClient.mutation("connections", "checkHealth");
+
+export interface CheckConnectionHealthArgs {
+  readonly params: {
+    readonly owner: Owner;
+    readonly integration: IntegrationSlug;
+    readonly name: ConnectionName;
+  };
+  readonly query: { readonly ifStaleMs?: number };
+  readonly reactivityKeys?: ReadonlyArray<unknown>;
+}
+
+/** The AUTOMATIC health probe, one atom PER CONNECTION.
+ *
+ *  `checkConnectionHealth` above is one shared mutation atom. Awaiting it
+ *  (`useAtomSet(..., { mode: "promiseExit" })`) resolves with the atom's next
+ *  settled result, whichever call produced it, and a new call interrupts the
+ *  one in flight. A surface that probes every row of a list in one pass
+ *  therefore cancels all but the last probe and hands every row the LAST
+ *  row's verdict. Each row then reads a foreign verdict as a change to its own
+ *  connection, refreshes the connections cache, and re-probes: the probe storm
+ *  the automatic path was built to avoid. Keying the atom by connection address
+ *  gives every probe its own fiber and its own result. */
+export const checkConnectionHealthFor = Atom.family((address: ConnectionAddress) =>
+  ExecutorApiClient.runtime.fn<CheckConnectionHealthArgs>()((args) => {
+    const probe = Effect.gen(function* () {
+      const client = yield* ExecutorApiClient;
+      return yield* client.connections.checkHealth({ params: args.params, query: args.query });
+    }).pipe(Effect.withSpan("connection.health.probe", { attributes: { address } }));
+    return args.reactivityKeys ? Reactivity.mutation(probe, args.reactivityKeys) : probe;
+  }),
+);
 
 /** Validate an IN-FLIGHT credential without saving it (the key-first connect
  *  flow). Returns the probe result the UI derives a connection name from. */
@@ -568,6 +604,7 @@ export const createOAuthClientOptimistic = oauthClientsOptimisticAtom.pipe(
           readonly tokenUrl: string;
           readonly grant: OAuthGrant;
           readonly clientId: string;
+          readonly tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
           readonly resource?: string | null;
           readonly originIntegration?: IntegrationSlug | null;
         };
@@ -582,6 +619,9 @@ export const createOAuthClientOptimistic = oauthClientsOptimisticAtom.pipe(
           tokenUrl: arg.payload.tokenUrl,
           resource: arg.payload.resource ?? null,
           clientId: arg.payload.clientId,
+          ...(arg.payload.tokenEndpointAuthMethod === undefined
+            ? {}
+            : { tokenEndpointAuthMethod: arg.payload.tokenEndpointAuthMethod }),
           // Mirror the server's stamp so the just-registered app matches its
           // integration in the picker immediately (before the refetch lands).
           origin: { kind: "manual", integration: arg.payload.originIntegration ?? null },

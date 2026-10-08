@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
-import { Effect, Predicate } from "effect";
+import { Deferred, Effect, Fiber, Option, Predicate } from "effect";
+import { withQueryContext } from "@executor-js/fumadb/query";
 
 import {
   AuthTemplateSlug,
@@ -7,15 +8,20 @@ import {
   IntegrationSlug,
   OAuthClientSlug,
   OAuthState,
+  ProviderKey,
+  Subject,
+  Tenant,
   ToolAddress,
   ToolName,
 } from "./ids";
 import { authToolFailure } from "./auth-tool-failure";
+import { createExecutor } from "./executor";
 import { decodeOAuthCallbackState } from "./oauth";
 import { OAuthStartError } from "./oauth-client";
 import { missingGrantedOAuthScopes } from "./oauth-service";
 import { definePlugin } from "./plugin";
-import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
+import type { CredentialProvider } from "./provider";
+import { makeTestConfig, makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
 import { ToolResult } from "./tool-result";
 import { serveOAuthTestServer } from "./testing/oauth-test-server";
 
@@ -65,24 +71,81 @@ const oauthPlugin = definePlugin(() => ({
 
 const plugins = [memoryCredentialsPlugin(), oauthPlugin] as const;
 
+// Stated explicitly where a test builds a SECOND root database handle by hand:
+// both handles must carry the same owner-policy context to address one
+// connection, so the values cannot be left to `makeTestConfig`'s defaults.
+const SHARED_STORE_TENANT = "test-tenant";
+const SHARED_STORE_SUBJECT = "test-subject";
+
+/** The URL a `fetch` double was handed, however the caller spelled it. */
+const fetchTarget = (input: Parameters<typeof globalThis.fetch>[0]): string =>
+  typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+
+/**
+ * A `fetch` that holds token-endpoint requests open AFTER the authorization
+ * server has answered them.
+ *
+ * Parking after the response is the point. The refresh token has been rotated
+ * upstream by then, and the in-flight gate entry is still registered, so a peer
+ * arriving during the park has to resolve against an OPEN grant rather than a
+ * settled one. Parking before the response would prove nothing: the grant would
+ * never reach the server, and a peer that went on to run its own grant would
+ * find the stored token still live and succeed.
+ *
+ * Idle until `arm()`, so connection setup (the authorization-code exchange)
+ * runs through untouched.
+ */
+const makeTokenRequestPark = () => {
+  let armed = false;
+  let onSeen: (() => void) | null = null;
+  const seen = new Promise<void>((resolve) => {
+    onSeen = resolve;
+  });
+  let onRelease: (() => void) | null = null;
+  const parked = new Promise<void>((resolve) => {
+    onRelease = resolve;
+  });
+  // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: the park wraps the platform fetch and must delegate back to it, which is the only seam that can hold a token request open mid-grant.
+  const platformFetch: typeof globalThis.fetch = globalThis.fetch;
+  const fetch: typeof globalThis.fetch = async (input, init) => {
+    const response = await platformFetch(input, init);
+    if (armed && new URL(fetchTarget(input)).pathname === "/token") {
+      onSeen?.();
+      await parked;
+    }
+    return response;
+  };
+  return {
+    fetch,
+    arm: () => {
+      armed = true;
+    },
+    /** Resolves once a token request has been answered and is being held. */
+    seen,
+    release: () => onRelease?.(),
+  };
+};
+
+/** Every refresh-token grant the authorization server was asked for. */
+const refreshGrantsIn = (
+  requests: ReadonlyArray<{ readonly path: string; readonly body: string }>,
+) =>
+  requests.filter(
+    (request) => request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+  );
+
 interface TokenEndpointCall {
   readonly host: string;
   readonly grantType: string | null;
 }
 
-// Route token-endpoint requests aimed at a *non-loopback* host (the
-// regional/attacker hosts a multi-site rebind test exercises) back to the
-// loopback test AS, recording the host + grant each one was sent to. The token
-// exchange/refresh runs through `oauth4webapi`, which calls the global `fetch`
-// at request time, so swapping `globalThis.fetch` lets the real
-// `oauth.complete` / refresh path drive the rebind decision while still hitting
-// a live authorization server. Loopback traffic (the authorize/login hops)
-// passes straight through untouched. Returns a restore function.
+// Route configured and regional token hosts to the live loopback authorization
+// server through ExecutorConfig.fetch, recording each outgoing token request.
 const routeTokenEndpointToLoopback = (
   server: { readonly issuerUrl: string },
   record: TokenEndpointCall[],
-): (() => void) => {
-  // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: oauth4webapi reads the global `fetch` at call time, so doubling it is the only seam to observe the token exchange/refresh host.
+): typeof fetch => {
+  // oxlint-disable-next-line executor/no-raw-fetch -- test transport boundary.
   const originalFetch = globalThis.fetch;
   const loopback = new URL(server.issuerUrl);
   const patched: typeof fetch = async (input, init) => {
@@ -113,12 +176,7 @@ const routeTokenEndpointToLoopback = (
       ? originalFetch(new Request(rerouted.href, input))
       : originalFetch(rerouted.href, init);
   };
-  // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: install the doubled fetch (see above).
-  globalThis.fetch = patched;
-  return () => {
-    // oxlint-disable-next-line executor/no-raw-fetch -- test boundary: restore the original fetch.
-    globalThis.fetch = originalFetch;
-  };
+  return patched;
 };
 
 describe("oauth.start / oauth.complete", () => {
@@ -193,6 +251,223 @@ describe("oauth.start / oauth.complete", () => {
           expect(yield* server.acceptsAccessToken(out.token)).toBe(true);
         }),
       ),
+  );
+
+  it.effect("complete returns after the durable grant while remote tool discovery continues", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const discoveryStarted = yield* Deferred.make<void>();
+        const releaseDiscovery = yield* Deferred.make<void>();
+        const keptAlive: Promise<unknown>[] = [];
+        const slowOAuthPlugin = definePlugin(() => ({
+          id: "acme" as const,
+          storage: () => ({}),
+          resolveTools: () =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(discoveryStarted, undefined);
+              yield* Deferred.await(releaseDiscovery);
+              return {
+                tools: [{ name: ToolName.make("whoami"), description: "whoami" }],
+              };
+            }),
+          describeAuthMethods: () => [
+            {
+              id: "oauth",
+              label: "OAuth2",
+              kind: "oauth" as const,
+              template: String(TEMPLATE),
+              oauth: { scopes: ["read"] },
+            },
+          ],
+          invokeTool: ({ credential }) => Effect.succeed({ token: credential.value }),
+          extension: (ctx) => ({
+            seed: () =>
+              ctx.core.integrations.register({
+                slug: INTEG,
+                description: "Slow Acme",
+                config: {},
+              }),
+          }),
+        }))();
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({
+          plugins: [memoryCredentialsPlugin(), slowOAuthPlugin] as const,
+          waitUntil: (promise) => keptAlive.push(promise),
+        });
+        yield* Effect.addFinalizer(() =>
+          Deferred.succeed(releaseDiscovery, undefined).pipe(
+            Effect.andThen(Effect.promise(() => Promise.all(keptAlive))),
+          ),
+        );
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main-account"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+
+        const completed = yield* executor.oauth
+          .complete({ state: started.state, code: callback.code }, { toolSync: "background" })
+          .pipe(Effect.timeoutOption("1 second"));
+        expect(
+          Option.isSome(completed),
+          "the callback returns while listTools remains deliberately blocked",
+        ).toBe(true);
+        expect(keptAlive).toHaveLength(1);
+        yield* Deferred.await(discoveryStarted);
+
+        const connections = yield* executor.connections.list({ integration: INTEG });
+        expect(connections.map((connection) => String(connection.name))).toEqual(["mainAccount"]);
+
+        yield* Deferred.succeed(releaseDiscovery, undefined);
+        yield* Effect.promise(() => Promise.all(keptAlive));
+        const tools = yield* executor.tools.list({ integration: INTEG });
+        expect(tools.map((tool) => String(tool.name))).toEqual(["whoami"]);
+      }),
+    ),
+  );
+
+  it.effect("persists HTTP Basic client auth for code exchange and refresh", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({
+          scopes: ["read"],
+          defaultTokenEndpointAuthMethod: "client_secret_basic",
+        });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          tokenEndpointAuthMethod: "basic",
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("basic-client"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "basicClient"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        const refreshed = (yield* executor.execute(
+          ToolAddress.make("tools.acme.org.basicClient.whoami"),
+          {},
+        )) as { token: string };
+        expect(refreshed.token).toMatch(/^at_/);
+
+        const tokenRequests = (yield* server.requests).filter(
+          (request) => request.path === "/token" && request.method === "POST",
+        );
+        expect(tokenRequests).toHaveLength(2);
+        for (const request of tokenRequests) {
+          expect(request.headers.authorization).toMatch(/^Basic /);
+          expect(request.body).not.toContain("client_secret=");
+        }
+        expect(tokenRequests[0]?.body).toContain("grant_type=authorization_code");
+        expect(tokenRequests[1]?.body).toContain("grant_type=refresh_token");
+      }),
+    ),
+  );
+
+  it.effect("persists raw HTTP Basic credentials for code exchange and refresh", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const clientId = "test-client";
+        const clientSecret = "test-secret";
+        const server = yield* serveOAuthTestServer({
+          scopes: ["read"],
+          defaultTokenEndpointAuthMethod: "client_secret_basic",
+        });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId,
+          clientSecret,
+          tokenEndpointAuthMethod: "basic_raw",
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("raw-basic-client"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "rawBasicClient"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        yield* executor.execute(ToolAddress.make("tools.acme.org.rawBasicClient.whoami"), {});
+
+        const tokenRequests = (yield* server.requests).filter(
+          (request) => request.path === "/token" && request.method === "POST",
+        );
+        expect(tokenRequests).toHaveLength(2);
+        const expectedAuthorization = `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`;
+        for (const request of tokenRequests) {
+          expect(request.headers.authorization).toBe(expectedAuthorization);
+          expect(request.body).not.toContain("client_secret=");
+        }
+        expect(tokenRequests[0]?.body).toContain("grant_type=authorization_code");
+        expect(tokenRequests[1]?.body).toContain("grant_type=refresh_token");
+      }),
+    ),
   );
 
   it.effect("carries the URL org selector in provider state without changing redirect_uri", () =>
@@ -809,6 +1084,45 @@ describe("oauth.start / oauth.complete", () => {
       }),
     ),
   );
+
+  it.effect("start refuses an integration that is not in the catalog, before any session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+        // Deliberately NOT seeded: the slug names nothing in the catalog — the
+        // shape of a reconnect against a connection whose integration was
+        // removed, or an agent replaying a stale slug.
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+
+        const error = yield* Effect.flip(
+          executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: IntegrationSlug.make("removed_mcp"),
+            template: TEMPLATE,
+          }),
+        );
+        expect(Predicate.isTagged("OAuthStartError")(error)).toBe(true);
+        if (!Predicate.isTagged("OAuthStartError")(error)) return;
+        const startError = error as OAuthStartError;
+        expect(startError.message).toBe("Integration not found: removed_mcp");
+        // Refused up front: no session row was created for the doomed flow.
+        const sessions = yield* Effect.promise(() => config.db.findMany("oauth_session", {}));
+        expect(sessions).toHaveLength(0);
+      }),
+    ),
+  );
 });
 
 describe("oauth token refresh in resolveConnectionValue", () => {
@@ -882,6 +1196,513 @@ describe("oauth token refresh in resolveConnectionValue", () => {
         );
       }),
     ),
+  );
+
+  // Issue #1520, in one process. A self-host builds a FRESH execution stack per
+  // MCP session over ONE database handle, so two sessions resolving the same
+  // connection each read the same stored refresh token and each believe they
+  // are the refresh winner. The authorization server rotates that token, so the
+  // loser redeems one the winner already spent, and a server that detects reuse
+  // revokes the whole family: the connection dies and the user must
+  // reauthorize. The first refresh always succeeds, which is why the fault
+  // stays invisible until a later expiry.
+  it.effect("two execution stacks over one host database share a single refresh grant", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const park = makeTokenRequestPark();
+
+        // One database handle and one credential store under two execution
+        // stacks — what a self-host holds while two MCP sessions are open.
+        const config = { ...makeTestConfig({ plugins }), fetch: park.fetch };
+        const sessionA = yield* createExecutor(config);
+        const sessionB = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => sessionA.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => sessionB.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+        );
+
+        yield* sessionA.acme.seed();
+        yield* sessionA.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const started = yield* sessionA.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* sessionA.oauth.complete({ state: started.state, code: callback.code });
+
+        const address = ToolAddress.make("tools.acme.org.main.whoami");
+        const original = (yield* sessionA.execute(address, {})) as { token: string };
+
+        // Expire the access token so BOTH stacks must refresh.
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "main"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        yield* server.clearRequests;
+        park.arm();
+
+        const first = yield* Effect.forkChild(sessionA.execute(address, {}));
+        const second = yield* Effect.forkChild(sessionB.execute(address, {}));
+        // Release only once a grant has been answered and is being held open,
+        // so the peer resolves against a grant that is still in flight. Without
+        // the park the peer could arrive after the winner had already settled,
+        // find a fresh token, refresh nothing, and pass this test for the wrong
+        // reason.
+        yield* Effect.promise(() => park.seen);
+        park.release();
+
+        const firstToken = (yield* Fiber.join(first)) as { token: string };
+        const secondToken = (yield* Fiber.join(second)) as { token: string };
+
+        expect(firstToken.token, "the refresh minted a new access token").not.toBe(original.token);
+        expect(secondToken.token, "both stacks resolved the SAME refreshed token").toBe(
+          firstToken.token,
+        );
+        expect(
+          refreshGrantsIn(yield* server.requests),
+          "one refresh grant for the connection, not one per execution stack",
+        ).toHaveLength(1);
+      }),
+    ),
+  );
+
+  // The gate spans tenants (one map per root DB handle), so its key must keep
+  // tenant and subject unambiguous. Both are opaque strings that may contain
+  // any delimiter: under a colon-joined key, tenant "a" + subject "user:b" and
+  // tenant "a:user" + subject "b" both flatten to "a:user:user:b:…", so two
+  // DIFFERENT tenants' refreshes would share one gate entry and one tenant's
+  // caller would be handed the other tenant's access token.
+  it.effect(
+    "colliding tenant/subject pairs never share a refresh gate entry",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const serverA = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const serverB = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const parkA = makeTokenRequestPark();
+          const parkB = makeTokenRequestPark();
+
+          // ONE root DB handle under TWO tenants — the shape a multi-tenant host
+          // holds — so both executors share one refresh gate. `shared.db` stays
+          // bound to tenant A's owner-policy context; tenant B's row edits below
+          // build their own scoped handle by hand. Each tenant gets its OWN
+          // credential store instance: the memory store keys items without a
+          // tenant, so sharing one across tenants would cross their tokens at
+          // the store layer and mask the gate-key collision this test is about.
+          const pluginsA = [memoryCredentialsPlugin(), oauthPlugin] as const;
+          const pluginsB = [memoryCredentialsPlugin(), oauthPlugin] as const;
+          const shared = makeTestConfig({ plugins: pluginsA, tenant: "a", subject: "user:b" });
+          const configA = { ...shared, fetch: parkA.fetch };
+          const configB = {
+            ...shared,
+            plugins: pluginsB,
+            tenant: Tenant.make("a:user"),
+            subject: Subject.make("b"),
+            fetch: parkB.fetch,
+          };
+          const sessionA = yield* createExecutor(configA);
+          const sessionB = yield* createExecutor(configB);
+          yield* Effect.addFinalizer(() => sessionA.close().pipe(Effect.ignore));
+          yield* Effect.addFinalizer(() => sessionB.close().pipe(Effect.ignore));
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => shared.testDb.close()).pipe(Effect.ignore),
+          );
+
+          // Each tenant mints its own USER-owned connection (user rows carry the
+          // session subject, which is what the colliding pair needs) against its
+          // own authorization server, so token provenance is observable.
+          const connect = (session: typeof sessionA, server: typeof serverA) =>
+            Effect.gen(function* () {
+              yield* session.acme.seed();
+              yield* session.oauth.createClient({
+                owner: "org",
+                slug: CLIENT,
+                authorizationUrl: server.authorizationEndpoint,
+                tokenUrl: server.tokenEndpoint,
+                grant: "authorization_code",
+                clientId: "test-client",
+                clientSecret: "test-secret",
+              });
+              const started = yield* session.oauth.start({
+                owner: "user",
+                client: CLIENT,
+                clientOwner: "org",
+                name: ConnectionName.make("mine"),
+                integration: INTEG,
+                template: TEMPLATE,
+              });
+              expect(started.status).toBe("redirect");
+              if (started.status !== "redirect") return;
+              const callback = yield* server.completeAuthorizationCodeFlow({
+                authorizationUrl: started.authorizationUrl,
+              });
+              yield* session.oauth.complete({ state: started.state, code: callback.code });
+            });
+          yield* connect(sessionA, serverA);
+          yield* connect(sessionB, serverB);
+
+          const address = ToolAddress.make("tools.acme.user.mine.whoami");
+          const originalA = (yield* sessionA.execute(address, {})) as { token: string };
+          const originalB = (yield* sessionB.execute(address, {})) as { token: string };
+          expect(originalB.token).not.toBe(originalA.token);
+
+          // Expire BOTH rows so both tenants must refresh. `shared.db` is bound
+          // to tenant A; tenant B's partition needs its own scoped handle.
+          const dbB = withQueryContext(shared.testDb.db, { tenant: "a:user", subject: "b" });
+          yield* Effect.promise(() =>
+            shared.db.updateMany("connection", {
+              where: (b) => b("name", "=", "mine"),
+              set: { expires_at: Date.now() - 60_000 },
+            }),
+          );
+          yield* Effect.promise(() =>
+            dbB.updateMany("connection", {
+              where: (b) => b("name", "=", "mine"),
+              set: { expires_at: Date.now() - 60_000 },
+            }),
+          );
+
+          parkA.arm();
+          parkB.arm();
+          const first = yield* Effect.forkChild(sessionA.execute(address, {}));
+          // Hold tenant A's grant open so its gate entry is still registered
+          // when tenant B performs its lookup of the would-be colliding key.
+          yield* Effect.promise(() => parkA.seen);
+          const second = yield* Effect.forkChild(sessionB.execute(address, {}));
+          // With a collision-free key, tenant B misses the gate and sends its
+          // OWN grant. Under a colliding key it would await tenant A's deferred
+          // and never reach its server, so cap the wait with a real timer (the
+          // test clock is virtual, so Effect.sleep would never fire) instead of
+          // hanging the suite; the assertions below then report the bleed.
+          yield* Effect.promise(() =>
+            Promise.race([parkB.seen, new Promise((resolve) => setTimeout(resolve, 2_000))]),
+          );
+          parkA.release();
+          parkB.release();
+
+          const tokenA = (yield* Fiber.join(first)) as { token: string };
+          const tokenB = (yield* Fiber.join(second)) as { token: string };
+
+          expect(tokenA.token, "tenant A refreshed to a new token").not.toBe(originalA.token);
+          expect(tokenB.token, "tenant B refreshed to a new token").not.toBe(originalB.token);
+          expect(tokenB.token, "no cross-tenant token bleed").not.toBe(tokenA.token);
+          expect(yield* serverA.acceptsAccessToken(tokenA.token)).toBe(true);
+          expect(
+            yield* serverB.acceptsAccessToken(tokenB.token),
+            "tenant B's token was minted by tenant B's own authorization server",
+          ).toBe(true);
+          expect(
+            refreshGrantsIn(yield* serverA.requests),
+            "tenant A ran its own refresh grant",
+          ).toHaveLength(1);
+          expect(
+            refreshGrantsIn(yield* serverB.requests),
+            "tenant B ran its own refresh grant — two distinct refresh executions",
+          ).toHaveLength(1);
+        }),
+      ),
+    // Two authorization servers, two full mint flows and two refreshes — about
+    // twice the cost of the single-tenant gate tests, which sits on the 5s
+    // default when the test runs cold.
+    20_000,
+  );
+
+  // The gate entry is shared, so the stack that REGISTERS a grant is only the
+  // first arrival, not its owner. Running the grant on that caller's fiber
+  // would hand it that caller's interruption — a disconnected MCP client, an
+  // execution deadline, a cancelled tool call — and abandon a refresh token the
+  // authorization server has ALREADY rotated. What the store still holds is
+  // then dead, and the next grant is answered invalid_grant: the interruption
+  // would have killed the connection. So the grant runs detached, and callers
+  // only await it.
+  it.effect("an interrupted first arrival still settles the grant and persists its token", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const park = makeTokenRequestPark();
+
+        const config = { ...makeTestConfig({ plugins }), fetch: park.fetch };
+        const sessionA = yield* createExecutor(config);
+        const sessionB = yield* createExecutor(config);
+        yield* Effect.addFinalizer(() => sessionA.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() => sessionB.close().pipe(Effect.ignore));
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+        );
+
+        yield* sessionA.acme.seed();
+        yield* sessionA.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+        const started = yield* sessionA.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* sessionA.oauth.complete({ state: started.state, code: callback.code });
+
+        const address = ToolAddress.make("tools.acme.org.main.whoami");
+        const original = (yield* sessionA.execute(address, {})) as { token: string };
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "main"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        yield* server.clearRequests;
+        park.arm();
+
+        // The first arrival registers the grant, and its session drops the
+        // instant the authorization server has rotated the token — the worst
+        // possible moment, and the one a disconnecting MCP client picks.
+        const arrival = yield* Effect.forkChild(Effect.exit(sessionA.execute(address, {})));
+        yield* Effect.promise(() => park.seen);
+        yield* Fiber.interrupt(arrival);
+        park.release();
+
+        // That the grant finishes at all, with nobody left waiting on it, is
+        // the property under test: a rotated token that is never persisted is a
+        // dead connection.
+        const persisted = yield* Effect.promise(async () => {
+          for (let attempt = 0; attempt < 500; attempt += 1) {
+            const row = await config.db.findFirst("connection", {
+              where: (b) => b("name", "=", "main"),
+            });
+            const expiresAt = row?.expires_at;
+            if (expiresAt != null && Number(expiresAt) > Date.now()) return true;
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          return false;
+        });
+        expect(persisted, "the detached grant settled and persisted its rotated token").toBe(true);
+
+        const recovered = (yield* sessionB.execute(address, {})) as { token: string };
+        expect(recovered.token, "the peer stack resolved the rotated token").not.toBe(
+          original.token,
+        );
+        expect(
+          yield* server.acceptsAccessToken(recovered.token),
+          "and the authorization server still honours it",
+        ).toBe(true);
+        expect(
+          refreshGrantsIn(yield* server.requests),
+          "the interrupted arrival's grant settled, so no second grant was needed",
+        ).toHaveLength(1);
+      }),
+    ),
+  );
+
+  // Two product instances, one connection, one credential store. The in-flight
+  // refresh gate serialises refreshes across every execution stack over ONE
+  // root database handle and cannot see past it, so between two INSTANCES —
+  // two replicas, two isolates — nothing but the store itself stands between
+  // two refreshers and the same rotated token. The provider below opens a seam
+  // exactly where the danger is — between the read of the stored refresh token
+  // and whatever the reader writes next — because a probe that "tests" the
+  // store by rewriting the value it just read would put the spent token back
+  // over the peer's rotated one, and kill the connection it was added to
+  // protect.
+  it.effect(
+    "a refresher paused after reading the stored token never writes it back over a peer's rotated one",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+
+          const store = new Map<string, string>();
+          // Every item id written, in order — the tape that says WHICH item a
+          // refresher touched, which is the whole question here.
+          const writes: string[] = [];
+          const pausedAtRead = yield* Deferred.make<void>();
+          const resumeFromRead = yield* Deferred.make<void>();
+          // One-shot: the FIRST read of a refresh token stops there; the
+          // peer's read, moments later, runs straight through.
+          let pauseNextRefreshRead = false;
+
+          const sharedStore: CredentialProvider = {
+            key: ProviderKey.make("shared-memory"),
+            writable: true,
+            get: (id) =>
+              Effect.gen(function* () {
+                const value = store.get(String(id)) ?? null;
+                if (pauseNextRefreshRead && String(id).endsWith(":refresh")) {
+                  pauseNextRefreshRead = false;
+                  yield* Deferred.succeed(pausedAtRead, undefined);
+                  yield* Deferred.await(resumeFromRead);
+                }
+                return value;
+              }),
+            set: (id, value) =>
+              Effect.sync(() => {
+                writes.push(String(id));
+                store.set(String(id), value);
+              }),
+            delete: (id) => Effect.sync(() => void store.delete(String(id))),
+          };
+
+          // One database and one credential store, two executors over them —
+          // the deployment this race needs and the one a single harness
+          // cannot express.
+          //
+          // Each executor gets its OWN root database handle onto that one
+          // database, because that handle is what identifies an instance: the
+          // in-flight refresh gate is shared per handle, so two executors over
+          // the SAME handle are two execution stacks in one instance and the
+          // second would simply join the first's grant — closing the very
+          // window this test exists to open. A second replica holds a second
+          // handle, which is what the extra `withQueryContext` wrapper is.
+          const config = {
+            ...makeTestConfig({
+              plugins: [oauthPlugin] as const,
+              tenant: SHARED_STORE_TENANT,
+              subject: SHARED_STORE_SUBJECT,
+            }),
+            providers: [sharedStore],
+          };
+          const instanceA = yield* createExecutor(config);
+          const instanceB = yield* createExecutor({
+            ...config,
+            db: withQueryContext(config.testDb.db, {
+              tenant: SHARED_STORE_TENANT,
+              subject: SHARED_STORE_SUBJECT,
+            }),
+          });
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => config.testDb.close()).pipe(Effect.ignore),
+          );
+          yield* Effect.addFinalizer(() => instanceA.close().pipe(Effect.ignore));
+          yield* Effect.addFinalizer(() => instanceB.close().pipe(Effect.ignore));
+
+          yield* instanceA.acme.seed();
+          yield* instanceA.oauth.createClient({
+            owner: "org",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: server.tokenEndpoint,
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+          });
+          const started = yield* instanceA.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+          yield* instanceA.oauth.complete({ state: started.state, code: callback.code });
+
+          const refreshItemId = [...store.keys()].find((key) => key.endsWith(":refresh"));
+          expect(refreshItemId, "the completed connection stored a refresh token").toBeDefined();
+          const spentRefreshToken = store.get(refreshItemId!);
+
+          // Expire the access token so both instances must refresh.
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "main"),
+              set: { expires_at: Date.now() - 60_000 },
+            }),
+          );
+
+          // A begins a refresh and stops the instant it has the stored refresh
+          // token in hand. This is the window.
+          pauseNextRefreshRead = true;
+          const refresherA = yield* Effect.forkChild(
+            Effect.exit(instanceA.execute(ToolAddress.make("tools.acme.org.main.whoami"), {})),
+          );
+          yield* Deferred.await(pausedAtRead);
+
+          // B refreshes on that same token, to completion. The authorization
+          // server rotates it, so what the store holds afterwards is the only
+          // value left that can ever mint again.
+          yield* instanceB.execute(ToolAddress.make("tools.acme.org.main.whoami"), {});
+          const rotatedByB = store.get(refreshItemId!);
+          expect(rotatedByB, "the peer's refresh rotated the stored token").not.toBe(
+            spentRefreshToken,
+          );
+          const writesBeforeAResumes = writes.length;
+
+          // A resumes into a world where the token it is holding is already
+          // spent — and still has to prove the store is writable before it
+          // tries to spend it.
+          yield* Deferred.succeed(resumeFromRead, undefined);
+          yield* Fiber.join(refresherA);
+
+          expect(
+            store.get(refreshItemId!),
+            "the peer's rotated refresh token is still what the store holds",
+          ).toBe(rotatedByB);
+          expect(
+            [...store.entries()]
+              .filter(([, value]) => value === spentRefreshToken)
+              .map(([key]) => key),
+            "the spent refresh token was not written back anywhere",
+          ).toEqual([]);
+
+          // The gate did still run for A — on an item of its own, holding no
+          // credential. Its grant then failed on the spent token, so it
+          // persisted nothing: this one write is everything A wrote.
+          const writtenByA = writes.slice(writesBeforeAResumes);
+          expect(writtenByA, "the resumed refresher wrote exactly one item").toHaveLength(1);
+          expect(writtenByA[0], "and it was not the refresh token's own item").not.toBe(
+            refreshItemId,
+          );
+          expect(
+            [spentRefreshToken, rotatedByB],
+            "the item it wrote carries no credential",
+          ).not.toContain(store.get(writtenByA[0]!));
+
+          // Both instances really did reach the authorization server, so the
+          // interleaving under test happened rather than being short-circuited.
+          expect(
+            (yield* server.requests).filter(
+              (request) =>
+                request.path === "/token" && request.body.includes("grant_type=refresh_token"),
+            ),
+            "both instances sent a refresh grant",
+          ).toHaveLength(2);
+        }),
+      ),
   );
 
   it.effect(
@@ -1201,6 +2022,73 @@ describe("oauth token refresh in resolveConnectionValue", () => {
       ),
   );
 
+  it.effect(
+    "checkHealth without a probe serves a sync-stamped verdict instead of burying it under healthy",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+          yield* executor.acme.seed();
+
+          yield* executor.oauth.createClient({
+            owner: "org",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: server.tokenEndpoint,
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+            resource: server.mcpResourceUrl,
+          });
+
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+          yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+          // Tool sync found the upstream rejecting the freshly minted token
+          // (e.g. an MCP discovery handshake answering 401) and stamped it.
+          // The token itself still resolves, so a credential-only check would
+          // otherwise report healthy and hide a connection that has no tools.
+          const stamped = {
+            status: "expired",
+            checkedAt: Date.now(),
+            detail: "MCP OAuth reauthorization required",
+            reason: "tool_sync_failed",
+          };
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "main"),
+              set: { last_health: stamped },
+            }),
+          );
+
+          const result = yield* executor.connections.checkHealth({
+            owner: "org",
+            integration: INTEG,
+            name: ConnectionName.make("main"),
+          });
+          expect(result).toMatchObject(stamped);
+
+          const row = yield* Effect.promise(() =>
+            config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
+          );
+          expect(row?.last_health).toMatchObject(stamped);
+        }),
+      ),
+  );
+
   it.effect("records missing authorization-code scopes without blocking the connection", () =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1315,29 +2203,27 @@ describe("oauth token refresh in resolveConnectionValue", () => {
 // the org lives on, signalled by the callback's non-standard `domain`/`site`
 // param. The token endpoint host must rebind to that region for both the
 // initial exchange and later refreshes — but only when the callback host is a
-// trusted sibling subdomain, never an attacker-influenced arbitrary origin.
+// supported Datadog region, never an attacker-influenced arbitrary origin.
 describe("oauth.complete regional token-endpoint rebind (Datadog multi-site)", () => {
   // Configured (statically advertised) host: the leftmost label differs from
-  // the org's region, but they share the `datadoghq.test` parent.
-  const ADVERTISED_TOKEN_URL = "https://app.datadoghq.test/token";
+  // the org's region, but they share the `datadoghq.com` parent.
+  const ADVERTISED_TOKEN_URL = "https://app.datadoghq.com/token";
 
   it.effect(
-    "redeems + refreshes at the callback's sibling-subdomain region, never the advertised host",
+    "redeems + refreshes at the callback's supported region, never the advertised host",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
           const server = yield* serveOAuthTestServer({ scopes: ["read"] });
-          const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
-          yield* executor.acme.seed();
-
           // Reroute the https regional/advertised hosts back to the loopback test
           // AS so the real exchange/refresh path drives the rebind decision while
-          // hitting a live server. Restored when the test scope closes.
+          // hitting a live server through this executor's fetch transport.
           const tokenCalls: TokenEndpointCall[] = [];
-          yield* Effect.acquireRelease(
-            Effect.sync(() => routeTokenEndpointToLoopback(server, tokenCalls)),
-            (restore) => Effect.sync(restore),
-          );
+          const { executor, config } = yield* makeTestWorkspaceHarness({
+            plugins,
+            fetch: routeTokenEndpointToLoopback(server, tokenCalls),
+          });
+          yield* executor.acme.seed();
 
           // Authorize on the loopback AS (passthrough), but advertise the US1-style
           // token host the way Datadog's AS metadata does.
@@ -1370,19 +2256,19 @@ describe("oauth.complete regional token-endpoint rebind (Datadog multi-site)", (
           yield* executor.oauth.complete({
             state: started.state,
             code: callback.code,
-            callbackDomain: "us5.datadoghq.test",
+            callbackDomain: "us5.datadoghq.com",
           });
 
           // The code was redeemed at the regional host, not the advertised one.
           const exchangeCall = tokenCalls.find((c) => c.grantType === "authorization_code");
-          expect(exchangeCall?.host).toBe("us5.datadoghq.test");
+          expect(exchangeCall?.host).toBe("us5.datadoghq.com");
 
           // The regional token endpoint is persisted on the connection so later
           // refreshes target the same region (the AS metadata still says US1).
           const row = yield* Effect.promise(() =>
             config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
           );
-          expect(row?.oauth_token_url).toBe("https://us5.datadoghq.test/token");
+          expect(row?.oauth_token_url).toBe("https://us5.datadoghq.com/token");
 
           // Mint, then expire so the next resolve must refresh.
           const firstToken = (yield* executor.execute(
@@ -1405,72 +2291,146 @@ describe("oauth.complete regional token-endpoint rebind (Datadog multi-site)", (
 
           // The refresh hit the persisted region too …
           const refreshCall = tokenCalls.find((c) => c.grantType === "refresh_token");
-          expect(refreshCall?.host).toBe("us5.datadoghq.test");
+          expect(refreshCall?.host).toBe("us5.datadoghq.com");
           // … and the statically advertised host was never contacted.
-          expect(tokenCalls.some((c) => c.host === "app.datadoghq.test")).toBe(false);
+          expect(tokenCalls.some((c) => c.host === "app.datadoghq.com")).toBe(false);
         }),
       ),
   );
 
-  it.effect("ignores a non-sibling callback domain — exchange stays on the advertised host", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
-        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
-        yield* executor.acme.seed();
+  for (const [tokenUrl, callbackDomain] of [
+    [ADVERTISED_TOKEN_URL, "evil.example.test"],
+    ["https://provider.co.uk/token", "attacker.co.uk"],
+    ["https://auth.example.test/token", "untrusted.example.test"],
+    [ADVERTISED_TOKEN_URL, "unlisted.datadoghq.com"],
+    ["https://oauth2.googleapis.com/token", "untrusted.googleapis.com"],
+    [ADVERTISED_TOKEN_URL, "http://us5.datadoghq.com"],
+    [ADVERTISED_TOKEN_URL, "us5.datadoghq.com:8443"],
+    [ADVERTISED_TOKEN_URL, "https://user:password@us5.datadoghq.com"],
+    [ADVERTISED_TOKEN_URL, "us5.datadoghq.com/other-path"],
+    [ADVERTISED_TOKEN_URL, "us5.datadoghq.com?redirect=elsewhere"],
+  ]) {
+    it.effect(`keeps shared client credentials at ${tokenUrl} for callback ${callbackDomain}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const tokenCalls: TokenEndpointCall[] = [];
+          const { executor, config } = yield* makeTestWorkspaceHarness({
+            plugins,
+            fetch: routeTokenEndpointToLoopback(server, tokenCalls),
+          });
+          yield* executor.acme.seed();
 
-        const tokenCalls: TokenEndpointCall[] = [];
-        yield* Effect.acquireRelease(
-          Effect.sync(() => routeTokenEndpointToLoopback(server, tokenCalls)),
-          (restore) => Effect.sync(restore),
-        );
+          yield* executor.oauth.createClient({
+            owner: "org",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl,
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+          });
 
-        yield* executor.oauth.createClient({
-          owner: "org",
-          slug: CLIENT,
-          authorizationUrl: server.authorizationEndpoint,
-          tokenUrl: ADVERTISED_TOKEN_URL,
-          grant: "authorization_code",
-          clientId: "test-client",
-          clientSecret: "test-secret",
-        });
+          const member = yield* Effect.acquireRelease(
+            createExecutor({ ...config, orgWrites: "denied" }),
+            (instance) => instance.close().pipe(Effect.orDie),
+          );
+          const started = yield* member.oauth.start({
+            owner: "user",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
 
-        const started = yield* executor.oauth.start({
-          owner: "org",
-          client: CLIENT,
-          clientOwner: "org",
-          name: ConnectionName.make("main"),
-          integration: INTEG,
-          template: TEMPLATE,
-        });
-        expect(started.status).toBe("redirect");
-        if (started.status !== "redirect") return;
-        const callback = yield* server.completeAuthorizationCodeFlow({
-          authorizationUrl: started.authorizationUrl,
-        });
+          yield* member.oauth.complete({
+            state: started.state,
+            code: callback.code,
+            callbackDomain,
+          });
 
-        // An attacker-influenced callback host that is NOT a sibling subdomain of
-        // the configured token host (`evil.example.test` vs `app.datadoghq.test`).
-        // The token request carries the client secret + code + PKCE verifier, so
-        // the rebind must refuse and fall back to the advertised host.
-        yield* executor.oauth.complete({
-          state: started.state,
-          code: callback.code,
-          callbackDomain: "evil.example.test",
-        });
+          const exchangeCall = tokenCalls.find((c) => c.grantType === "authorization_code");
+          expect(exchangeCall?.host).toBe(new URL(tokenUrl).host);
+          expect(tokenCalls.some((c) => c.host === callbackDomain)).toBe(false);
 
-        const exchangeCall = tokenCalls.find((c) => c.grantType === "authorization_code");
-        expect(exchangeCall?.host).toBe("app.datadoghq.test");
-        expect(tokenCalls.some((c) => c.host === "evil.example.test")).toBe(false);
+          // Nothing regional was persisted: refresh keeps using the configured host.
+          const row = yield* Effect.promise(() =>
+            config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
+          );
+          expect(row?.oauth_token_url ?? null).toBeNull();
+        }),
+      ),
+    );
+  }
+});
 
-        // Nothing regional was persisted: refresh keeps using the configured host.
-        const row = yield* Effect.promise(() =>
-          config.db.findFirst("connection", { where: (b) => b("name", "=", "main") }),
-        );
-        expect(row?.oauth_token_url ?? null).toBeNull();
-      }),
-    ),
-  );
+describe("OAuth refresh token destination trust", () => {
+  for (const override of [
+    "https://attacker.co.uk/token",
+    "https://unlisted.datadoghq.com/token",
+    "https://us5.datadoghq.com/other-path",
+    "https://us5.datadoghq.com/token?redirect=elsewhere",
+    "https://us5.datadoghq.com:8443/token",
+    "https://user:password@us5.datadoghq.com/token",
+    "http://us5.datadoghq.com/token",
+  ]) {
+    it.effect(`requires reconnect without sending credentials to ${override}`, () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+          const tokenCalls: TokenEndpointCall[] = [];
+          const { executor, config } = yield* makeTestWorkspaceHarness({
+            plugins,
+            fetch: routeTokenEndpointToLoopback(server, tokenCalls),
+          });
+          yield* executor.acme.seed();
+          yield* executor.oauth.createClient({
+            owner: "org",
+            slug: CLIENT,
+            authorizationUrl: server.authorizationEndpoint,
+            tokenUrl: "https://app.datadoghq.com/token",
+            grant: "authorization_code",
+            clientId: "test-client",
+            clientSecret: "test-secret",
+          });
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+          const callback = yield* server.completeAuthorizationCodeFlow({
+            authorizationUrl: started.authorizationUrl,
+          });
+          yield* executor.oauth.complete({ state: started.state, code: callback.code });
+          yield* Effect.promise(() =>
+            config.db.updateMany("connection", {
+              where: (b) => b("name", "=", "main"),
+              set: { expires_at: Date.now() - 60_000, oauth_token_url: override },
+            }),
+          );
+          tokenCalls.length = 0;
+          yield* server.clearRequests;
+          const error = yield* Effect.flip(
+            executor.execute(ToolAddress.make("tools.acme.org.main.whoami"), {}),
+          );
+          expect(JSON.stringify(error)).toContain("no longer trusted");
+          expect(tokenCalls).toEqual([]);
+          expect(yield* server.requests).toEqual([]);
+        }),
+      ),
+    );
+  }
 });
 
 describe("missingGrantedOAuthScopes canonicalization", () => {
@@ -1839,6 +2799,163 @@ describe("reactive OAuth refresh on upstream 401", () => {
         expect(result).toMatchObject({ ok: false, error: { status: 401 } });
         expect(state.calls).toHaveLength(1);
         expect(refreshGrants(yield* server.requests)).toHaveLength(0);
+      }),
+    ),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// RFC 8707 resource omission for a resource-less client (#1789)
+//
+// A client persisted with NO resource sends no `resource` parameter on ANY
+// request — authorize, code exchange, refresh, client-credentials. Microsoft
+// Entra v2 rejects requests that carry `resource` next to a v2 `scope`
+// (AADSTS9010010), and the way out is a client whose resource is absent; that
+// absence must hold on every grant, or the token audience diverges between
+// authorize and token. The mirror-image assertions — a client WITH a resource
+// sends it on authorize + exchange + refresh — live in the tests above.
+// ---------------------------------------------------------------------------
+describe("resource-less client sends no resource parameter (#1789)", () => {
+  it.effect("authorize, code exchange, and refresh all omit `resource`", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor, config } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        // `resource: null` — explicitly none, not merely unset.
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: null,
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        expect(new URL(started.authorizationUrl).searchParams.has("resource")).toBe(false);
+
+        const callback = yield* server.completeAuthorizationCodeFlow({
+          authorizationUrl: started.authorizationUrl,
+        });
+        yield* executor.oauth.complete({ state: started.state, code: callback.code });
+
+        // Force expiry so the next execute refreshes.
+        yield* Effect.promise(() =>
+          config.db.updateMany("connection", {
+            where: (b) => b("name", "=", "main"),
+            set: { expires_at: Date.now() - 60_000 },
+          }),
+        );
+        const refreshed = (yield* executor.execute(
+          ToolAddress.make("tools.acme.org.main.whoami"),
+          {},
+        )) as { token: string };
+        expect(refreshed.token).toMatch(/^at_/);
+
+        // What the authorization server actually SAW: the authorize request,
+        // the code exchange, and the refresh each carried no `resource`.
+        const requests = yield* server.requests;
+        const authorize = requests.find((r) => r.path === "/authorize" && r.method === "GET");
+        expect(authorize).toBeDefined();
+        expect(authorize?.query.resource ?? null).toBeNull();
+        const exchange = requests.find(
+          (r) => r.path === "/token" && r.body.includes("grant_type=authorization_code"),
+        );
+        expect(exchange).toBeDefined();
+        expect(exchange?.body ?? "").not.toContain("resource=");
+        const refresh = requests.find(
+          (r) => r.path === "/token" && r.body.includes("grant_type=refresh_token"),
+        );
+        expect(refresh).toBeDefined();
+        expect(refresh?.body ?? "").not.toContain("resource=");
+      }),
+    ),
+  );
+
+  it.effect("client_credentials omits `resource` for a resource-less client", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "client_credentials",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: null,
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("cc"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("connected");
+
+        const requests = yield* server.requests;
+        const grant = requests.find(
+          (r) => r.path === "/token" && r.body.includes("grant_type=client_credentials"),
+        );
+        expect(grant).toBeDefined();
+        expect(grant?.body ?? "").not.toContain("resource=");
+      }),
+    ),
+  );
+
+  it.effect("client_credentials sends `resource` when the client has one", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveOAuthTestServer({ scopes: ["read"] });
+        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "client_credentials",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+          resource: server.mcpResourceUrl,
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("cc"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("connected");
+
+        const requests = yield* server.requests;
+        const grant = requests.find(
+          (r) => r.path === "/token" && r.body.includes("grant_type=client_credentials"),
+        );
+        expect(grant?.body).toContain(`resource=${encodeURIComponent(server.mcpResourceUrl)}`);
       }),
     ),
   );

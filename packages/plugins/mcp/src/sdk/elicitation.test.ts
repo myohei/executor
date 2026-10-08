@@ -1,7 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Predicate, Schema, Semaphore } from "effect";
-import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/sdk/validation/cfworker";
-import type { JsonSchemaType } from "@modelcontextprotocol/sdk/validation/types";
+import type { JsonSchemaType } from "@modelcontextprotocol/client";
+import { CfWorkerJsonSchemaValidator } from "@modelcontextprotocol/client/validators/cf-worker";
 
 import {
   AuthTemplateSlug,
@@ -167,6 +167,50 @@ describe("MCP elicitation (end-to-end)", () => {
     }),
   );
 
+  it.effect("the answer's terms reach the server, and the offered ones reach the handler", () =>
+    Effect.gen(function* () {
+      const server = yield* serveElicitationTestServer;
+      const executor = yield* makeTestExecutor(server.url);
+      const tools = yield* executor.tools.list();
+      const rememberedEcho = findTool(tools, "remembered_echo");
+
+      let offered: unknown;
+      const remembered = yield* executor.execute(
+        rememberedEcho.address,
+        { value: "keep" },
+        {
+          onElicitation: (ctx) => {
+            offered = ctx.request.meta;
+            return Effect.succeed(
+              ElicitationResponse.make({
+                action: "accept",
+                content: {},
+                meta: { persist: "always" },
+              }),
+            );
+          },
+        },
+      );
+      const once = yield* executor.execute(
+        rememberedEcho.address,
+        { value: "drop" },
+        { onElicitation: () => Effect.succeed(ElicitationResponse.make({ action: "accept" })) },
+      );
+      yield* executor.close();
+
+      expect(offered).toEqual({ persist: ["session", "always"] });
+      expect(remembered).toMatchObject({
+        ok: true,
+        data: { content: [{ type: "text", text: "approved:keep:always" }] },
+      });
+      // No choice made, none invented: a bare accept stays one-time.
+      expect(once).toMatchObject({
+        ok: true,
+        data: { content: [{ type: "text", text: "approved:drop:once" }] },
+      });
+    }),
+  );
+
   it.effect("tool without elicitation works normally", () =>
     Effect.gen(function* () {
       const server = yield* serveElicitationTestServer;
@@ -226,7 +270,7 @@ describe("MCP elicitation (end-to-end)", () => {
         ]),
       );
       expect(schema?.outputTypeScript).toContain('type: "text"');
-      expect(schema?.outputTypeScript).toContain("structuredContent?: { [k: string]: unknown; }");
+      expect(schema?.outputTypeScript).toContain("structuredContent?: unknown;");
 
       const result = yield* executor.execute(
         simpleEcho.address,

@@ -7,7 +7,12 @@
 
 import { describe, expect, it } from "@effect/vitest";
 import { Cause, Effect, Exit, Layer, Ref, Result } from "effect";
-import { StorageError, UniqueViolationError } from "@executor-js/sdk/core";
+import {
+  CredentialWriteIncompleteError,
+  StorageConnectionError,
+  StorageError,
+  UniqueViolationError,
+} from "@executor-js/sdk/core";
 
 import { capture, ErrorCapture, InternalError } from "./observability";
 
@@ -44,6 +49,51 @@ describe("capture", () => {
       const squashed = Cause.squash(causes[0]!) as StorageError;
       expect(squashed).toBeInstanceOf(StorageError);
       expect(squashed.message).toBe("db down");
+    }),
+  );
+
+  it.effect("translates StorageConnectionError the same way as StorageError", () =>
+    Effect.gen(function* () {
+      const { layer, seen } = yield* makeRecorder("trace-conn");
+      const err = new StorageConnectionError({
+        message: "FumaDB plugin_storage.findFirst failed: CONNECTION_ENDED",
+        label: "plugin_storage.findFirst",
+        code: "CONNECTION_ENDED",
+        retryable: false,
+        cause: "driver",
+      });
+
+      const result = yield* Effect.flip(capture(Effect.fail(err))).pipe(Effect.provide(layer));
+
+      expect(result).toBeInstanceOf(InternalError);
+      expect(result.traceId).toBe("trace-conn");
+
+      const causes = yield* Ref.get(seen);
+      expect(causes.length).toBe(1);
+      const squashed = Cause.squash(causes[0]!) as StorageConnectionError;
+      expect(squashed).toBeInstanceOf(StorageConnectionError);
+      expect(squashed.code).toBe("CONNECTION_ENDED");
+    }),
+  );
+
+  it.effect("marks an incomplete credential write retryable without exposing details", () =>
+    Effect.gen(function* () {
+      const { layer, seen } = yield* makeRecorder("trace-retry");
+      const err = new CredentialWriteIncompleteError({
+        message: "provider reference and owner stay internal",
+        cause: "provider detail",
+      });
+
+      const result = yield* Effect.flip(capture(Effect.fail(err))).pipe(Effect.provide(layer));
+
+      expect(result).toEqual(
+        new InternalError({
+          traceId: "trace-retry",
+          retryable: true,
+        }),
+      );
+      expect(Object.keys(result).sort()).toEqual(["_tag", "retryable", "traceId"]);
+      expect(yield* Ref.get(seen)).toHaveLength(1);
     }),
   );
 

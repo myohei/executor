@@ -4,9 +4,16 @@
 
 import { env } from "cloudflare:workers";
 import { Context, Data, Effect, Layer, Option, Predicate, Schema } from "effect";
-import { GeneratePortalLinkIntent, WorkOS } from "@workos-inc/node/worker";
+import {
+  GeneratePortalLinkIntent,
+  WorkOS,
+  type Event as WorkOSEvent,
+  type EventName as WorkOSEventName,
+  type OrganizationMembershipStatus,
+} from "@workos-inc/node/worker";
 import { defaults as ironDefaults, unseal as unsealIron } from "iron-webcrypto";
 import { decodeJwt, jwtVerify } from "jose";
+import { workosAccessTokenOptions } from "./access-token-options";
 import { JWKSInvalid, JWKSNoMatchingKey, JWKSTimeout } from "jose/errors";
 import { parseCookie } from "./cookies";
 import { createCachedRemoteJWKSet, type CachedRemoteJWKSet } from "./jwks-cache";
@@ -15,6 +22,7 @@ import {
   tryPromiseService,
   withServiceLogging,
   workosErrorFromFailure,
+  type WorkOSError,
 } from "./errors";
 
 const COOKIE_NAME = "wos-session";
@@ -45,6 +53,20 @@ type WorkOSAutoPaginatable<Resource> = {
   readonly data: Resource[];
   readonly listMetadata: WorkOSListMetadata;
   readonly autoPagination: () => Promise<Resource[]>;
+};
+
+/**
+ * One read of the WorkOS Events API stream. `events` names the types to
+ * return; `after` resumes from an event id (exclusive), `rangeStart` (ISO)
+ * bounds a first read that has no cursor yet. Mirrors the SDK's
+ * `ListEventOptions` with readonly inputs.
+ */
+export type WorkOSListEventsOptions = {
+  readonly events: readonly WorkOSEventName[];
+  readonly after?: string;
+  readonly rangeStart?: string;
+  readonly limit?: number;
+  readonly order?: "asc" | "desc";
 };
 
 export type WorkOSCollectedList<Resource> = {
@@ -179,7 +201,7 @@ const getWorkOSSessionJwks = (() => {
 
 const verifyJwtOnce = (accessToken: string, jwks: CachedRemoteJWKSet) =>
   Effect.tryPromise({
-    try: () => jwtVerify(accessToken, jwks),
+    try: () => jwtVerify(accessToken, jwks, workosAccessTokenOptions),
     catch: (cause) => new ServiceAdapterError({ cause }),
   });
 
@@ -213,21 +235,82 @@ const verifySealedSessionLocally = (
   jwks: CachedRemoteJWKSet,
 ): Effect.Effect<LocalSessionVerification, ServiceAdapterError> =>
   Effect.gen(function* () {
+    // Phase timings, not just child spans. `local_verify` is a leaf in
+    // production traces, so a ~3.3s verify has nothing under it to blame —
+    // and it stayed 3.3s after the JWKS fetch was eliminated entirely
+    // (jwks.fetch_count == 0), so the cost is one of the phases below. Under
+    // workerd `Date.now()` only advances at I/O boundaries, which is exactly
+    // what makes a raw span duration misleading here: recording each phase
+    // explicitly says which await the wall-clock actually crossed.
+    const verifyStartedAt = Date.now();
+
+    const unsealStartedAt = Date.now();
     const unsealed = yield* Effect.tryPromise({
       try: () => unsealWorkOSSession(sessionData, cookiePassword),
       catch: (cause) => new LocalSessionCookieError({ cause }),
     }).pipe(
       Effect.catchTag("LocalSessionCookieError", () => Effect.succeed(null as unknown | null)),
+      Effect.withSpan("workos.session.unseal"),
     );
+    const unsealMs = Date.now() - unsealStartedAt;
+    yield* Effect.annotateCurrentSpan({ "verify.unseal_ms": unsealMs });
     if (!unsealed) return { _tag: "InvalidCookie" };
 
+    const decodeStartedAt = Date.now();
     const session = Option.match(decodeSealedSessionPayload(unsealed), {
       onNone: (): SealedSessionPayload | null => null,
       onSome: (payload) => payload,
     });
+    yield* Effect.annotateCurrentSpan({ "verify.decode_ms": Date.now() - decodeStartedAt });
     if (!session) return { _tag: "InvalidCookie" };
 
-    const verified = yield* verifyJwtWithRefreshRetry(session.accessToken, jwks);
+    // Snapshot the JWKS cache around the verify so the `local_verify` span
+    // says whether THIS verify was a warm-cache signature check or paid for a
+    // live upstream JWKS fetch. The Aug 2026 latency regression was the cache
+    // silently missing on most verifies, and no span attribute distinguished
+    // the two paths.
+    const jwksBefore = jwks.inspect();
+    // Entry-state annotation goes on BEFORE the verify so a failing verify
+    // (the case worth debugging) still records whether the cache was warm.
+    yield* Effect.annotateCurrentSpan({
+      "jwks.cache_populated_at_start": jwksBefore.hasJwks,
+      ...(jwksBefore.fetchedAt === null
+        ? {}
+        : { "jwks.cache_age_ms": Date.now() - jwksBefore.fetchedAt }),
+    });
+    const jwtStartedAt = Date.now();
+    const verified = yield* verifyJwtWithRefreshRetry(session.accessToken, jwks).pipe(
+      Effect.withSpan("workos.session.jwt_verify"),
+      Effect.onExit(() => {
+        const jwksAfter = jwks.inspect();
+        const finishedAt = Date.now();
+        return Effect.annotateCurrentSpan({
+          "verify.jwt_ms": finishedAt - jwtStartedAt,
+          "verify.total_ms": finishedAt - verifyStartedAt,
+          // Blocking, not total: under stale-while-revalidate a background
+          // refresh moves `fetchCount` without costing this verify anything.
+          // Attribute latency to what the caller actually waited on.
+          "jwks.fetched_during_verify":
+            jwksAfter.blockingFetchCount > jwksBefore.blockingFetchCount,
+          "jwks.served_from_store": jwksAfter.storeHitCount > jwksBefore.storeHitCount,
+          "jwks.fetch_count": jwksAfter.fetchCount,
+          "jwks.blocking_fetch_count": jwksAfter.blockingFetchCount,
+          "jwks.fetch_failure_count": jwksAfter.fetchFailureCount,
+          ...(jwksAfter.lastFetchDurationMs === null
+            ? {}
+            : { "jwks.last_fetch_ms": jwksAfter.lastFetchDurationMs }),
+          // Splits the ~3.4s that sits inside jwt_verify with zero upstream
+          // fetches: the cross-isolate store read (I/O) vs WebCrypto key
+          // import vs the signature check itself.
+          ...(jwksAfter.lastStoreReadMs === null
+            ? {}
+            : { "jwks.store_read_ms": jwksAfter.lastStoreReadMs }),
+          ...(jwksAfter.lastResolveMs === null
+            ? {}
+            : { "jwks.key_resolve_ms": jwksAfter.lastResolveMs }),
+        });
+      }),
+    );
     if (!verified) return { _tag: "Refresh" };
 
     const claims = Option.getOrNull(decodeJwtClaims(decodeJwt(session.accessToken)));
@@ -338,11 +421,25 @@ const make = Effect.gen(function* () {
   // exception had one (all its typed exceptions do), so consumers can tell a
   // definitive WorkOS denial (401/403/404 — fail closed) from a transient
   // failure (429/5xx/network — retryable).
-  const use = <A>(fn: (wos: WorkOS) => Promise<A>) =>
+  // `op` names the SDK call (mirroring its `namespace.method` path) so every
+  // span reads `workos.<operation>` instead of one undifferentiated "workos"
+  // bucket, and failures log which call actually failed.
+  const use = <A>(op: string, fn: (wos: WorkOS) => Promise<A>) =>
     withServiceLogging(
-      "workos",
+      `workos.${op}`,
       workosErrorFromFailure,
       tryPromiseService(() => fn(workos)),
+    );
+
+  // MFA SDK errors can contain response details. Keep only the status before
+  // logging, so enrollment secrets and submitted codes cannot enter a cause.
+  const useMfa = <A>(op: string, fn: (wos: WorkOS) => Promise<A>) =>
+    tryPromiseService(() => fn(workos)).pipe(
+      Effect.mapError(workosErrorFromFailure),
+      Effect.tapError((error) =>
+        Effect.logWarning(`workos.${op} failed`, { status: error.status }),
+      ),
+      Effect.withSpan(`workos.${op}`),
     );
 
   const authenticateSealedSession = (sessionData: string) =>
@@ -376,7 +473,7 @@ const make = Effect.gen(function* () {
       if (isLocalSessionInvalidCookie(local)) return null;
 
       // Try refreshing
-      const refreshed = yield* use(() => session.refresh()).pipe(
+      const refreshed = yield* use("session.refresh", () => session.refresh()).pipe(
         Effect.orElseSucceed(() => ({ authenticated: false as const })),
       );
 
@@ -396,6 +493,31 @@ const make = Effect.gen(function* () {
     });
 
   return {
+    /** List factors belonging to this user; callers cannot supply another user's factor. */
+    listMfaFactors: (userId: string) =>
+      useMfa("userManagement.listAuthFactors", (wos) =>
+        wos.userManagement
+          .listAuthFactors({ userId, limit: 100 })
+          .then((page) => page.autoPagination()),
+      ),
+    /** Begin AuthKit's user-bound TOTP enrollment. The secret is returned only to that user. */
+    enrollMfa: (userId: string, email: string) =>
+      useMfa("userManagement.enrollAuthFactor", (wos) =>
+        wos.userManagement.enrollAuthFactor({
+          userId,
+          type: "totp",
+          totpIssuer: "Executor",
+          totpUser: email,
+        }),
+      ),
+    /** Challenge an already resolved factor. */
+    challengeMfa: (authenticationFactorId: string) =>
+      useMfa("mfa.challengeFactor", (wos) => wos.mfa.challengeFactor({ authenticationFactorId })),
+    /** Verify a TOTP code with WorkOS; never log the code or factor secret. */
+    verifyMfa: (authenticationChallengeId: string, code: string) =>
+      useMfa("mfa.verifyChallenge", (wos) =>
+        wos.mfa.verifyChallenge({ authenticationChallengeId, code }),
+      ),
     getAuthorizationUrl: (redirectUri: string, state?: string) =>
       workos.userManagement.getAuthorizationUrl({
         provider: "authkit",
@@ -405,7 +527,7 @@ const make = Effect.gen(function* () {
       }),
 
     authenticateWithCode: (code: string) =>
-      use((wos) =>
+      use("userManagement.authenticateWithCode", (wos) =>
         wos.userManagement.authenticateWithCode({
           code,
           clientId,
@@ -415,11 +537,13 @@ const make = Effect.gen(function* () {
 
     /** Create a new organization in WorkOS. */
     createOrganization: (name: string) =>
-      use((wos) => wos.organizations.createOrganization({ name })),
+      use("organizations.createOrganization", (wos) =>
+        wos.organizations.createOrganization({ name }),
+      ),
 
     /** Add a user to an organization. */
     createMembership: (organizationId: string, userId: string, roleSlug?: string) =>
-      use((wos) =>
+      use("userManagement.createOrganizationMembership", (wos) =>
         wos.userManagement.createOrganizationMembership({
           organizationId,
           userId,
@@ -429,7 +553,7 @@ const make = Effect.gen(function* () {
 
     /** List organization memberships for a user. */
     listUserMemberships: (userId: string) =>
-      use(async (wos) =>
+      use("userManagement.listOrganizationMemberships", async (wos) =>
         collectWorkOSList(
           await wos.userManagement.listOrganizationMemberships({
             userId,
@@ -448,7 +572,7 @@ const make = Effect.gen(function* () {
           sessionData,
           cookiePassword,
         });
-        const refreshed = yield* use(() =>
+        const refreshed = yield* use("session.refresh", () =>
           session.refresh(organizationId ? { organizationId } : undefined),
         );
         if (!refreshed.authenticated || !("sealedSession" in refreshed)) return null;
@@ -517,10 +641,13 @@ const make = Effect.gen(function* () {
      * auth/api-keys.ts.
      */
     validateApiKey: (value: string) =>
-      use((wos) => wos.apiKeys.validateApiKey({ value }) as Promise<unknown>),
+      use(
+        "apiKeys.validateApiKey",
+        (wos) => wos.apiKeys.validateApiKey({ value }) as Promise<unknown>,
+      ),
 
     listUserApiKeys: (userId: string, organizationId: string) =>
-      use(async (wos) => {
+      use("userManagement.listUserApiKeys", async (wos) => {
         const raw = wos as RawWorkOS;
         return collectRawWorkOSList(async (after) => {
           const response = await raw.get(`/user_management/users/${userId}/api_keys`, {
@@ -535,7 +662,7 @@ const make = Effect.gen(function* () {
       }),
 
     createUserApiKey: (params: { userId: string; organizationId: string; name: string }) =>
-      use(async (wos) => {
+      use("userManagement.createUserApiKey", async (wos) => {
         const raw = wos as RawWorkOS;
         const response = await raw.post(`/user_management/users/${params.userId}/api_keys`, {
           name: params.name,
@@ -552,7 +679,7 @@ const make = Effect.gen(function* () {
      * other key response.
      */
     listOrgApiKeys: (organizationId: string) =>
-      use(async (wos) =>
+      use("organizations.listOrganizationApiKeys", async (wos) =>
         collectWorkOSList(await wos.organizations.listOrganizationApiKeys({ organizationId })),
       ),
 
@@ -564,6 +691,7 @@ const make = Effect.gen(function* () {
      */
     createOrgApiKey: (params: { organizationId: string; name: string }) =>
       use(
+        "organizations.createOrganizationApiKey",
         (wos) =>
           wos.organizations.createOrganizationApiKey({
             organizationId: params.organizationId,
@@ -571,47 +699,51 @@ const make = Effect.gen(function* () {
           }) as Promise<unknown>,
       ),
 
-    deleteApiKey: (id: string) => use((wos) => wos.apiKeys.deleteApiKey(id)),
+    deleteApiKey: (id: string) =>
+      use("apiKeys.deleteApiKey", (wos) => wos.apiKeys.deleteApiKey(id)),
 
-    /** List organization memberships with user details. */
-    listOrgMembers: (organizationId: string) =>
-      use(async (wos) =>
+    /**
+     * An organization's memberships, all pages. Defaults to active + pending
+     * (the seat-occupying set); pass `statuses` to narrow — the invite
+     * write-through lists only `pending` to find the membership WorkOS
+     * created for the invitee.
+     */
+    listOrgMembers: (
+      organizationId: string,
+      statuses: readonly OrganizationMembershipStatus[] = ["active", "pending"],
+    ) =>
+      use("userManagement.listOrganizationMemberships", async (wos) =>
         collectWorkOSList(
           await wos.userManagement.listOrganizationMemberships({
             organizationId,
-            statuses: ["active", "pending"],
+            statuses: [...statuses],
           }),
         ),
       ),
 
-    /** Get a user's membership in an organization. */
+    /**
+     * A user's membership in an organization (active or pending), or `null`
+     * when WorkOS lists none: the user is not a member, or the organization
+     * is gone.
+     */
     getUserOrgMembership: (organizationId: string, userId: string) =>
-      use(async (wos) => {
+      use("userManagement.listOrganizationMemberships", async (wos) => {
         const response = await wos.userManagement.listOrganizationMemberships({
           organizationId,
           userId,
           statuses: ["active", "pending"],
         });
-        return response.data[0] ?? null;
+        const [membership] = response.data;
+        return membership === undefined ? null : membership;
       }),
 
     /** Get a user by ID. */
-    getUser: (userId: string) => use((wos) => wos.userManagement.getUser(userId)),
-
-    /** List users matching an email within one organization. */
-    listUsers: (params: { email: string; organizationId: string }) =>
-      use(async (wos) =>
-        collectWorkOSList(
-          await wos.userManagement.listUsers({
-            email: params.email,
-            organizationId: params.organizationId,
-          }),
-        ),
-      ),
+    getUser: (userId: string) =>
+      use("userManagement.getUser", (wos) => wos.userManagement.getUser(userId)),
 
     /** Send an organization invitation. */
     sendInvitation: (params: { email: string; organizationId: string; roleSlug?: string }) =>
-      use((wos) =>
+      use("userManagement.sendInvitation", (wos) =>
         wos.userManagement.sendInvitation({
           email: params.email,
           organizationId: params.organizationId,
@@ -625,7 +757,7 @@ const make = Effect.gen(function* () {
      * API level, so we filter after.
      */
     listPendingInvitations: (organizationId: string) =>
-      use(async (wos) =>
+      use("userManagement.listInvitations", async (wos) =>
         collectWorkOSList(
           await wos.userManagement.listInvitations({
             organizationId,
@@ -640,7 +772,7 @@ const make = Effect.gen(function* () {
 
     /** List invitations for an email address (across all orgs). */
     listInvitationsByEmail: (email: string) =>
-      use(async (wos) =>
+      use("userManagement.listInvitations", async (wos) =>
         collectWorkOSList(
           await wos.userManagement.listInvitations({
             email,
@@ -650,19 +782,19 @@ const make = Effect.gen(function* () {
 
     /** Accept an invitation; returns the (now accepted) invitation. */
     acceptInvitation: (invitationId: string) =>
-      use((wos) => wos.userManagement.acceptInvitation(invitationId)),
+      use("userManagement.acceptInvitation", (wos) =>
+        wos.userManagement.acceptInvitation(invitationId),
+      ),
 
     /** Remove an organization membership. */
     deleteOrgMembership: (membershipId: string) =>
-      use((wos) => wos.userManagement.deleteOrganizationMembership(membershipId)),
-
-    /** Get the role for a membership. */
-    getOrgMembership: (membershipId: string) =>
-      use((wos) => wos.userManagement.getOrganizationMembership(membershipId)),
+      use("userManagement.deleteOrganizationMembership", (wos) =>
+        wos.userManagement.deleteOrganizationMembership(membershipId),
+      ),
 
     /** Update a membership's role. */
     updateOrgMembershipRole: (membershipId: string, roleSlug: string) =>
-      use((wos) =>
+      use("userManagement.updateOrganizationMembership", (wos) =>
         wos.userManagement.updateOrganizationMembership(membershipId, {
           roleSlug,
         }),
@@ -670,15 +802,61 @@ const make = Effect.gen(function* () {
 
     /** List available roles for an organization. */
     listOrgRoles: (organizationId: string) =>
-      use((wos) => wos.organizations.listOrganizationRoles({ organizationId })),
+      use("organizations.listOrganizationRoles", (wos) =>
+        wos.organizations.listOrganizationRoles({ organizationId }),
+      ),
+
+    /**
+     * One page of the Events API stream, oldest first when `order` is `asc`.
+     * The reconciler (`workos-events-sync.ts`) is the only consumer: it pages
+     * by `after` = the last event id it applied, so the stream is replayable
+     * from the persisted cursor. Returns the SDK page as-is (`data` +
+     * `listMetadata.after`); paging is the caller's loop, not
+     * `collectWorkOSList`, because each page is committed before the next is
+     * read.
+     */
+    listEvents: (options: WorkOSListEventsOptions) =>
+      use("events.listEvents", (wos) =>
+        wos.events.listEvents({
+          events: [...options.events],
+          ...(options.after === undefined ? {} : { after: options.after }),
+          ...(options.rangeStart === undefined ? {} : { rangeStart: options.rangeStart }),
+          ...(options.limit === undefined ? {} : { limit: options.limit }),
+          ...(options.order === undefined ? {} : { order: options.order }),
+        }),
+      ),
+
+    /**
+     * Verify a webhook delivery against `secret` (the endpoint's signing
+     * secret from the WorkOS dashboard) and decode its event. A local HMAC
+     * check, no network: it fails with a status-less `WorkOSError` when the
+     * `WorkOS-Signature` header is missing its parts, older than the SDK's
+     * tolerance, or does not match `payload`. The decoded event is returned
+     * for the caller to inspect; the webhook route deliberately does NOT
+     * apply it (the Events API is the only source the mirror replays from).
+     */
+    constructWebhookEvent: (params: {
+      readonly payload: Record<string, unknown>;
+      readonly sigHeader: string;
+      readonly secret: string;
+    }): Effect.Effect<WorkOSEvent, WorkOSError> =>
+      use("webhooks.constructEvent", (wos) =>
+        wos.webhooks.constructEvent({
+          payload: params.payload,
+          sigHeader: params.sigHeader,
+          secret: params.secret,
+        }),
+      ),
 
     /** Get an organization (includes domains). */
     getOrganization: (organizationId: string) =>
-      use((wos) => wos.organizations.getOrganization(organizationId)),
+      use("organizations.getOrganization", (wos) =>
+        wos.organizations.getOrganization(organizationId),
+      ),
 
     /** Update an organization. */
     updateOrganization: (organizationId: string, name: string) =>
-      use((wos) =>
+      use("organizations.updateOrganization", (wos) =>
         wos.organizations.updateOrganization({
           organization: organizationId,
           name,
@@ -690,11 +868,13 @@ const make = Effect.gen(function* () {
      * invitations, and domains go with it, so every member loses access.
      */
     deleteOrganization: (organizationId: string) =>
-      use((wos) => wos.organizations.deleteOrganization(organizationId)),
+      use("organizations.deleteOrganization", (wos) =>
+        wos.organizations.deleteOrganization(organizationId),
+      ),
 
     /** Generate an Admin Portal link for domain verification. */
     generateDomainVerificationPortalLink: (organizationId: string, returnUrl: string) =>
-      use((wos) =>
+      use("portal.generateLink", (wos) =>
         wos.portal.generateLink({
           organization: organizationId,
           intent: GeneratePortalLinkIntent.DomainVerification,
@@ -704,11 +884,11 @@ const make = Effect.gen(function* () {
 
     /** Get a domain by ID. */
     getOrganizationDomain: (domainId: string) =>
-      use((wos) => wos.organizationDomains.get(domainId)),
+      use("organizationDomains.get", (wos) => wos.organizationDomains.get(domainId)),
 
     /** Delete a domain claim. */
     deleteOrganizationDomain: (domainId: string) =>
-      use((wos) => wos.organizationDomains.delete(domainId)),
+      use("organizationDomains.delete", (wos) => wos.organizationDomains.delete(domainId)),
   };
 });
 
@@ -717,9 +897,10 @@ export type WorkOSClientService = Effect.Success<typeof make>;
 export class WorkOSClient extends Context.Service<WorkOSClient, WorkOSClientService>()(
   "@executor-js/cloud/WorkOSClient",
 ) {
-  static Default = Layer.effect(this)(make).pipe(
-    Layer.withSpan("WorkOSClient", { attributes: { module: "WorkOSClient" } }),
-  );
+  // Deliberately unspanned: client construction is synchronous and ran per
+  // layer build, which produced one of the highest-volume zero-duration span
+  // names in the whole trace corpus while telling us nothing.
+  static Default = Layer.effect(this)(make);
 }
 
 // The boot-scoped WorkOS client root — the one neutral service the stateless

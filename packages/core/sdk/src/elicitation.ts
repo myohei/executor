@@ -6,11 +6,48 @@ import { ElicitationId, ToolAddress } from "./ids";
  * handler (executor-level, overridable per `execute`) answers. Tools that never
  * elicit never trigger it. Schema-tagged so requests/responses cross the wire. */
 
+/** Implementation-defined context an upstream attached to the request.
+ *
+ *  Opaque and never interpreted here — it is carried so a host can SHOW the
+ *  terms of an approval it would otherwise hide. The case that forced it: a
+ *  Codex plugin's per-site browser approval sends an empty `requestedSchema`
+ *  and puts `persist: "always"` and the `origin` in its metadata, so
+ *  accepting grants a permanent allow for that site. Without this the user is
+ *  asked to consent to strictly more than the prompt tells them. */
+export const ElicitationMeta = Schema.Record(Schema.String, Schema.Unknown);
+export type ElicitationMeta = typeof ElicitationMeta.Type;
+
+/** The persistence scopes an approval OFFERS, when its terms leave that to
+ *  the answer. Codex Computer Use sends `persist: ["session", "always"]` and
+ *  remembers the app only if the reply names one; a bare accept is a
+ *  one-time approval and the very next call asks again. Chrome's per-site
+ *  approval sends `persist: "always"` — a statement of what accepting
+ *  means, not a choice — and contributes nothing here. */
+export const offeredPersistence = (meta: ElicitationMeta | undefined): readonly string[] => {
+  const persist = meta?.["persist"];
+  return Array.isArray(persist) && persist.every((scope) => typeof scope === "string")
+    ? persist
+    : [];
+};
+
+/** What an accepted approval carries back, in the request's own vocabulary.
+ *
+ *  Closed on purpose, the mirror of the request-side projection: an answer
+ *  can only state terms this contract names, so no host can grant something
+ *  the prompt never offered. `persist` is the one term that is a choice —
+ *  one of `offeredPersistence(request.meta)`, or absent for a one-time
+ *  approval. */
+export const ElicitationResponseMeta = Schema.Struct({
+  persist: Schema.optional(Schema.String),
+});
+export type ElicitationResponseMeta = typeof ElicitationResponseMeta.Type;
+
 /** Tool needs structured input from the user (render a form). */
 export const FormElicitation = Schema.TaggedStruct("FormElicitation", {
   message: Schema.String,
   /** JSON Schema describing the fields to collect. */
   requestedSchema: Schema.Record(Schema.String, Schema.Unknown),
+  meta: Schema.optional(ElicitationMeta),
 });
 export type FormElicitation = typeof FormElicitation.Type;
 
@@ -20,6 +57,7 @@ export const UrlElicitation = Schema.TaggedStruct("UrlElicitation", {
   url: Schema.String,
   /** Unique id so the host can correlate the callback. */
   elicitationId: ElicitationId,
+  meta: Schema.optional(ElicitationMeta),
 });
 export type UrlElicitation = typeof UrlElicitation.Type;
 
@@ -32,14 +70,26 @@ export const ElicitationResponse = Schema.Struct({
   action: ElicitationAction,
   /** Present when `action` is "accept" — the data the user provided. */
   content: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  /** The answer's own terms, meaningful only with "accept". */
+  meta: Schema.optional(ElicitationResponseMeta),
 });
 export type ElicitationResponse = typeof ElicitationResponse.Type;
+
+/** Who raised an elicitation. `"policy"` is the executor's own approval gate
+ *  (`enforceApproval`): a consent-only form whose terms are exactly "run this
+ *  tool with these arguments". `"tool"` is anything the tool itself asked for
+ *  mid-call, which may carry its own terms (a permanent site grant, a scope
+ *  choice) even when the schema is empty. A host that has already obtained
+ *  consent for the tool call may auto-accept the former and must never
+ *  auto-accept the latter. Absent means unknown, which reads as `"tool"`. */
+export type ElicitationSource = "policy" | "tool";
 
 /** Handler input — the tool address being invoked, its args, and the request. */
 export interface ElicitationContext {
   readonly address: ToolAddress;
   readonly args: unknown;
   readonly request: ElicitationRequest;
+  readonly source?: ElicitationSource;
 }
 
 /** Host-provided handler the SDK calls when a tool suspends for input. */

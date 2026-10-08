@@ -21,6 +21,7 @@ import { serveOAuthTestServer } from "@executor-js/sdk/testing";
 
 import { scenario } from "../src/scenario";
 import { Api, Browser, Target } from "../src/services";
+import { visit, settle } from "../src/surfaces/browser";
 
 const api = composePluginApi([openApiHttpPlugin()] as const);
 
@@ -98,11 +99,15 @@ scenario(
         const connecting = dialog.getByRole("button", { name: "Connecting…" });
 
         await step("Open the integration and start a new connection", async () => {
-          await page.goto(`/integrations/${integration}`, { waitUntil: "networkidle" });
+          await visit(page, `/integrations/${integration}`);
           await addConnection.click();
           // The registered app is auto-selected, so the OAuth connect button is
-          // present and enabled.
+          // present and enabled. Auto-selection resolves asynchronously after
+          // the modal opens, so the button legitimately renders disabled for a
+          // beat first — wait for actionability (trial click waits for
+          // enabled + stable) rather than reading that transient first paint.
           await connectWithOAuth.waitFor({ state: "visible", timeout: 15_000 });
+          await connectWithOAuth.click({ trial: true, timeout: 15_000 });
           expect(
             await connectWithOAuth.isDisabled(),
             "the auto-selected app makes Connect with OAuth actionable",
@@ -133,7 +138,7 @@ scenario(
           async () => {
             await addConnection.click();
             await dialog.waitFor({ state: "visible", timeout: 15_000 });
-            await page.waitForLoadState("networkidle");
+            await settle(page);
 
             // The guarantee: the reopened modal is reset. Before the fix it stays
             // wedged on "Connecting…" (the abandoned flow's busy state survived the

@@ -24,6 +24,7 @@
     "packages/*/*",
     "packages/react",
     "packages/app",
+    "packages/onboarding-demo",
     "apps/*",
     "examples/*",
     "e2e"
@@ -118,8 +119,8 @@
     "vite": "^8.0.0",
     "@vitejs/plugin-react": "^6.0.1",
     "@tailwindcss/vite": "^4.2.2",
-    "@tanstack/react-router": "^1.168.10",
-    "@tanstack/react-start": "^1.167.16",
+    "@tanstack/react-router": "^1.170.41",
+    "@tanstack/react-start": "^1.168.60",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "@types/react": "^19.1.0",
@@ -137,6 +138,7 @@
     "@cloudflare/vite-plugin@1.31.2": "patches/@cloudflare%2Fvite-plugin@1.31.2.patch",
     "agents@0.17.3": "patches/agents@0.17.3.patch",
     "libsql@0.5.29": "patches/libsql@0.5.29.patch",
-    "@electric-sql/pglite-socket@0.1.4": "patches/@electric-sql%2Fpglite-socket@0.1.4.patch"
+    "@electric-sql/pglite-socket@0.1.4": "patches/@electric-sql%2Fpglite-socket@0.1.4.patch",
+    "@modelcontextprotocol/client@2.0.0": "patches/@modelcontextprotocol%2Fclient@2.0.0.patch"
   }
 }

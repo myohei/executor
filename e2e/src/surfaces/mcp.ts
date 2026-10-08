@@ -100,6 +100,11 @@ export interface McpCallResult {
 export interface McpToolDef {
   readonly name: string;
   readonly description: string;
+  /** The advertised MCP annotations (`readOnlyHint`, `destructiveHint`, …),
+   *  for scenarios that assert on what a harness's native approval reads. */
+  readonly annotations?: Record<string, unknown>;
+  /** The advertised input JSON Schema, verbatim. */
+  readonly inputSchema?: unknown;
 }
 
 /** How a connection surfaces a paused (approval-gated) execution. `browser` is
@@ -168,6 +173,13 @@ export interface McpSurface {
        *  (`?artifacts=false`). Omitted means the product default: the full
        *  artifact surface. */
       readonly artifacts?: boolean;
+      /** Set `true` to opt this session into the per-integration
+       *  `search_<integration>` tools (`?search_tools=true`). Omitted means
+       *  the product default: none. */
+      readonly searchTools?: boolean;
+      /** `passthrough` serves search and invoke for the visible catalog
+       *  (`?mode=passthrough`). Omitted means the product default: codemode. */
+      readonly mode?: "codemode" | "passthrough";
       readonly url?: string;
     },
   ) => McpSession;
@@ -303,12 +315,15 @@ export const makeMcpSurface = (target: Target, runDir?: string): McpSurface => (
     const serverName = `${target.name}-${randomUUID().slice(0, 8)}`;
     // Per-connection settings ride the MCP endpoint query, the ecosystem
     // convention: `elicitation_mode` so a paused execution yields an approvalUrl
-    // instead of letting the model resume inline, and `artifacts=false` to opt
-    // the session out of the artifact surface. Both are non-defaults, so a
-    // plain session's URL carries no query at all.
+    // instead of letting the model resume inline, `artifacts=false` to opt the
+    // session out of the artifact surface, and `search_tools=true` to opt into
+    // the per-integration search tools. All are non-defaults, so a plain
+    // session's URL carries no query at all.
     const sessionQuery = [
       ...(options?.elicitationMode ? [`elicitation_mode=${options.elicitationMode}`] : []),
       ...(options?.artifacts === false ? ["artifacts=false"] : []),
+      ...(options?.searchTools === true ? ["search_tools=true"] : []),
+      ...(options?.mode === "passthrough" ? ["mode=passthrough"] : []),
     ].join("&");
     const sessionUrl = sessionQuery ? `${mcpUrl}?${sessionQuery}` : mcpUrl;
 
@@ -352,6 +367,10 @@ export const makeMcpSurface = (target: Target, runDir?: string): McpSurface => (
             return listed.tools.map((tool) => ({
               name: tool.name,
               description: tool.description ?? "",
+              ...(tool.annotations
+                ? { annotations: tool.annotations as Record<string, unknown> }
+                : {}),
+              inputSchema: tool.inputSchema,
             }));
           }),
         call,
@@ -402,14 +421,37 @@ export const makeMcpSurface = (target: Target, runDir?: string): McpSurface => (
         return defs.map((tool: { name: string }) => tool.name);
       });
 
+    // mcporter's `listTools` projects annotations away, so read the raw
+    // client it holds: the same connection (and cached OAuth), the full tool
+    // definition.
     const describeTools = () =>
       Effect.promise(async (): Promise<ReadonlyArray<McpToolDef>> => {
-        const defs = await (await runtime()).listTools(serverName, callOptions);
-        connected = true;
-        return defs.map((tool: { name: string; description?: string }) => ({
-          name: tool.name,
-          description: tool.description ?? "",
-        }));
+        const rt = await runtime();
+        if (!connected) {
+          await rt.listTools(serverName, callOptions);
+          connected = true;
+        }
+        const context = await rt.connect(serverName, {
+          allowCachedAuth: true,
+          oauthSessionOptions: callOptions.oauthSessionOptions,
+        });
+        const out: McpToolDef[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await context.client.listTools(cursor ? { cursor } : undefined);
+          for (const tool of page.tools) {
+            out.push({
+              name: tool.name,
+              description: tool.description ?? "",
+              ...(tool.annotations
+                ? { annotations: tool.annotations as Record<string, unknown> }
+                : {}),
+              inputSchema: tool.inputSchema,
+            });
+          }
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        return out;
       });
 
     const call = (name: string, args: Record<string, unknown> = {}) =>

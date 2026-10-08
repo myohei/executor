@@ -7,11 +7,17 @@
 // drift apart.
 
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
-import { RegistryContext, useAtomSet } from "@effect/atom-react";
+import { RegistryContext } from "@effect/atom-react";
+import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as AtomRegistry from "effect/unstable/reactivity/AtomRegistry";
 import type { Connection, HealthCheckResult, HealthStatus, Owner } from "@executor-js/sdk/shared";
 
-import { checkConnectionHealth, connectionsOptimisticAtom } from "../api/atoms";
+import {
+  checkConnectionHealthFor,
+  connectionsOptimisticAtom,
+  type CheckConnectionHealthArgs,
+} from "../api/atoms";
 import { connectionCheckKeys } from "../api/reactivity-keys";
 
 /** Freshness window for automatic revalidation: a HEALTHY verdict younger
@@ -36,8 +42,20 @@ const healthyAndFresh = (last: HealthCheckResult | null | undefined): boolean =>
 
 /** The revalidation query: a healthy (but stale) verdict defers to the
  *  server-enforced window so N open tabs can't stampede the upstream; a
- *  missing or non-healthy verdict forces a fresh probe. */
-const revalidateQuery = (
+ *  missing or non-healthy verdict forces a fresh probe.
+ *
+ *  A non-healthy verdict deliberately sends NO window. Suppressing its probe
+ *  would suppress the only thing that can discover recovery: the verdict is
+ *  persisted, so a gated request would answer "still expired" from the row
+ *  the previous probe wrote, and the dot could not turn green until the window
+ *  elapsed. Recovery visibility is the contract these surfaces are built on
+ *  (see the health-checks-ui, graphql-introspection-health and
+ *  mcp-oauth-reconnect-health scenarios), so the upstream cost of re-probing a
+ *  broken connection is paid on purpose. What must NOT happen — one broken
+ *  connection raising a server error on every probe — is fixed where it
+ *  belongs, in the server folding a credential-resolution failure into a
+ *  persisted verdict rather than into the failure channel. */
+export const revalidateQuery = (
   last: HealthCheckResult | null | undefined,
 ): { readonly ifStaleMs?: number } =>
   last?.status === "healthy" ? { ifStaleMs: HEALTH_REVALIDATE_MS } : {};
@@ -86,6 +104,32 @@ function useInvalidateConnections(): (owner: Owner) => void {
 }
 
 /**
+ * Run one probe against its OWN per-connection atom and await that atom's
+ * result. The shared `checkConnectionHealth` mutation cannot be awaited from a
+ * loop: every `set` interrupts the previous call and every waiter resolves
+ * with whichever call settled last, so a list of N rows would hand N-1 rows a
+ * verdict for a connection that is not theirs (see `checkConnectionHealthFor`).
+ * This is the same set-then-await that `useAtomSet` performs in promise mode,
+ * addressed at the connection's atom, and usable from a loop.
+ */
+function useProbeConnection(): (
+  connection: Connection,
+  args: CheckConnectionHealthArgs,
+) => Promise<Exit.Exit<HealthCheckResult, unknown>> {
+  const registry = useContext(RegistryContext);
+  return useCallback(
+    (connection: Connection, args: CheckConnectionHealthArgs) => {
+      const atom = checkConnectionHealthFor(connection.address);
+      registry.set(atom, args);
+      return Effect.runPromiseExit(
+        AtomRegistry.getResult(registry, atom, { suspendOnWaiting: true }),
+      );
+    },
+    [registry],
+  );
+}
+
+/**
  * Health for ONE connection, stale-while-revalidate. The persisted verdict
  * renders instantly; a background probe on mount corrects it in place (once
  * per mount, quiet on failure: the persisted verdict is still the best known
@@ -100,7 +144,7 @@ export function useConnectionHealth(connection: Connection): {
   // A live probe result, once a check has run; merged with the persisted
   // verdict by freshness (see freshestVerdict for why not live-always-wins).
   const [liveProbe, setLiveProbe] = useState<HealthCheckResult | null>(null);
-  const doCheck = useAtomSet(checkConnectionHealth, { mode: "promiseExit" });
+  const doCheck = useProbeConnection();
   const invalidateConnections = useInvalidateConnections();
 
   const probe = freshestVerdict(liveProbe, connection.lastHealth);
@@ -125,7 +169,7 @@ export function useConnectionHealth(connection: Connection): {
     seenEpoch.current = epoch;
     if (!firstSight && !cleared) return;
     if (healthyAndFresh(last)) return;
-    void doCheck({
+    void doCheck(connection, {
       params: connectionParams(connection),
       query: revalidateQuery(last),
     }).then((exit) => {
@@ -148,7 +192,7 @@ export function useConnectionHealth(connection: Connection): {
     // Manual "Check now": invalidate the connections cache unconditionally so
     // every surface picks up the freshly persisted verdict. Adopting the
     // result's epoch keeps the resulting refetch from re-probing.
-    const exit = await doCheck({
+    const exit = await doCheck(connection, {
       params: connectionParams(connection),
       query: {},
       reactivityKeys: connectionCheckKeys,
@@ -178,7 +222,7 @@ export function useConnectionsHealth(
   connections: readonly Connection[],
 ): (connection: Connection) => HealthCheckResult | null {
   const [liveProbes, setLiveProbes] = useState<ReadonlyMap<string, HealthCheckResult>>(new Map());
-  const doCheck = useAtomSet(checkConnectionHealth, { mode: "promiseExit" });
+  const doCheck = useProbeConnection();
   const invalidateConnections = useInvalidateConnections();
 
   // Once per VERDICT per connection (same epoch guard as the single-connection
@@ -194,7 +238,7 @@ export function useConnectionsHealth(
       if (revalidated.current.has(key) && revalidated.current.get(key) === epoch) continue;
       revalidated.current.set(key, epoch);
       if (healthyAndFresh(last)) continue;
-      void doCheck({
+      void doCheck(connection, {
         params: connectionParams(connection),
         query: revalidateQuery(last),
       }).then((exit) => {

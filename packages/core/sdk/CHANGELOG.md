@@ -1,5 +1,210 @@
 # @executor-js/sdk
 
+## 1.6.10
+
+## 1.6.9
+
+### Patch Changes
+
+- [#1976](https://github.com/UsefulSoftwareCo/executor/pull/1976) [`40b2f2e`](https://github.com/UsefulSoftwareCo/executor/commit/40b2f2e38d642843eb7c984c020117e0db52acfc) Thanks [@SunkenInTime](https://github.com/SunkenInTime)! - Carry an approval's persistence choice through elicitation, so Codex Computer Use stops asking to use the same app on every call.
+
+  Computer Use offers `persist: ["session", "always"]` in the prompt's terms and remembers the app only when the answer names one. Executor dropped the offer on the way in (the terms projection kept strings only) and the choice on the way out (every adapter rebuilt the reply from `action` and `content`), so each accept was one-time. `ElicitationResponse` now has `meta.persist`; the MCP plugin, the app-server bridge, and the MCP host pass it through; the model-mode `resume` tool and the browser approval page let the approver pick from the offered scopes. Nothing is chosen automatically: a bare accept still approves once.
+
+- [#1898](https://github.com/UsefulSoftwareCo/executor/pull/1898) [`65d939e`](https://github.com/UsefulSoftwareCo/executor/commit/65d939ebab6f77a00a3435fe3575399cd1cd3b7f) Thanks [@LloydVickeryASI](https://github.com/LloydVickeryASI)! - Send HubSpot optional permissions in `optional_scope` for workspace OAuth clients so accounts can connect without optional product features.
+
+- [#1942](https://github.com/UsefulSoftwareCo/executor/pull/1942) [`3c263d7`](https://github.com/UsefulSoftwareCo/executor/commit/3c263d7580d1d9302a1dc5d63f2fab253fd409c2) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Add a search and invoke MCP mode (`?mode=passthrough`, `executor mcp --mode passthrough`). Search returns bounded pages of matching tool IDs and input schemas. Invoke validates arguments and runs the selected tool, with native client approval and workspace blocks enforced. The MCP catalog stays at two tools regardless of integration count.
+
+- [#2025](https://github.com/UsefulSoftwareCo/executor/pull/2025) [`be77521`](https://github.com/UsefulSoftwareCo/executor/commit/be775216cccddac6002b1f9442b3c8151e4f6063) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Member lists, the admin users page, and seat counts on cloud now read from the local membership mirror through the shared `MemberDirectory` seam instead of fanning out one WorkOS read per member. The admin users page gains an email/name search.
+
+  **Deploy prerequisite (cloud):** `bun run --cwd apps/cloud db:backfill-workos-mirror:prod` must complete before this build is deployed, and its printed membership count should match WorkOS. Until the backfill has stamped the mirror's marker, seat reporting to Autumn is skipped with a warning (never a partial count) and member lists show only members who have signed in since the mirror shipped.
+
+- [#1982](https://github.com/UsefulSoftwareCo/executor/pull/1982) [`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa) Thanks [@mmarabel](https://github.com/mmarabel)! - Retry a refresh-token grant without `scope` when the authorization server refuses the echoed grant with `invalid_scope`. Railway answers a scope-bearing refresh with "refresh token missing requested scope" even though echoing the granted scope is legal under RFC 6749 §6, so a connection whose refresh token was still live failed every call as `oauth_refresh_failed` and only a hand re-authorization recovered it.
+
+- [#1991](https://github.com/UsefulSoftwareCo/executor/pull/1991) [`85cf428`](https://github.com/UsefulSoftwareCo/executor/commit/85cf428905bbd73257fb3c3be5c89e762bf79377) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Removing an integration now drops every member's connections and tools under it, not only the remover's own. Tool and connection listings no longer serve rows whose integration is gone from the catalog, invoking such a tool reports the missing integration, and `oauth.start` refuses an unknown integration before creating a session.
+
+- [#2032](https://github.com/UsefulSoftwareCo/executor/pull/2032) [`38a7725`](https://github.com/UsefulSoftwareCo/executor/commit/38a7725876bcc9c8adeea9c7efbd190c121d3b86) Thanks [@SwedishChef1](https://github.com/SwedishChef1)! - Treat an explicit dynamic-client redirect URI as authoritative when selecting a reusable OAuth client. Legacy clients with no recorded redirect now remain available to existing connections while a new client is registered for the explicit callback; callers that rely on Executor's configured default retain the previous compatibility behavior.
+
+- [#2000](https://github.com/UsefulSoftwareCo/executor/pull/2000) [`3fd28a5`](https://github.com/UsefulSoftwareCo/executor/commit/3fd28a51fabb0fc96d0bf83408021e7cbca70bfe) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Redact redirect, referrer, trace-state, and MCP session headers from outbound HTTP traces.
+
+  Allow hosts to require HTTPS for outbound requests and reject redirects to plaintext endpoints. Executor Cloud enables this policy. Explicit private-network development access remains available.
+
+- [#1951](https://github.com/UsefulSoftwareCo/executor/pull/1951) [`929b233`](https://github.com/UsefulSoftwareCo/executor/commit/929b2338f225b3f80190ac7a6fe1f2473650c58c) Thanks [@nidhi-singh02](https://github.com/nidhi-singh02)! - Keep Vercel MCP connections renewable by requesting the provider's `offline_access` lifecycle scope during registration and authorization.
+
+## 1.6.8
+
+### Patch Changes
+
+- [#1947](https://github.com/UsefulSoftwareCo/executor/pull/1947) [`31a8042`](https://github.com/UsefulSoftwareCo/executor/commit/31a8042450475fd86ea580f4dbd5dcc3c290c008) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Allow hosts to control first-party OAuth app listings for each acting user without disrupting existing connections.
+
+- [#1907](https://github.com/UsefulSoftwareCo/executor/pull/1907) [`b5271a6`](https://github.com/UsefulSoftwareCo/executor/commit/b5271a6f0cb6d0c42a6b9fbcdffe70fc2aad8bc6) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Add a raw HTTP Basic compatibility mode for OAuth providers that reject form-encoded client credentials.
+
+- [#1919](https://github.com/UsefulSoftwareCo/executor/pull/1919) [`caa0391`](https://github.com/UsefulSoftwareCo/executor/commit/caa03919a8f2a5c82ed13bc4ea9060e964af3a79) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Workspace writes now require an administrator**
+
+  Executor bindings accept `orgWrites: "allowed" | "denied" | "request"`.
+  Request-aware hosts use `"request"` and bind `CurrentOrgWriteAccess` from the
+  authenticated principal for each request. An approval, decline, cancellation,
+  or form response also rebinds the paused execution to the resumer's current
+  access. Browser approvals derive access from the authenticated browser user's
+  live organization membership when that user posts the decision, rather than
+  from the earlier MCP request waiting for it or the user's global role. Self-host
+  uses the same Better Auth membership lookup for ordinary requests and browser
+  decisions. A demotion before either kind of resume therefore takes effect
+  before the paused execution can reach a workspace-write sink.
+
+  `Principal` now declares its role model explicitly: organization-backed hosts
+  carry `orgRoleModel: "organization"` and an optional normalized admin/member
+  role, while hosts without roles carry `orgRoleModel: "none"` and cannot also
+  carry an organization role. Missing role data under the organization model
+  fails closed, including legacy persisted MCP session metadata. Cloud derives
+  roles from WorkOS memberships and self-host derives them from Better Auth.
+
+  Members may still read and execute shared workspace resources and perform
+  operational maintenance such as token refresh and tool-catalog synchronization.
+  User-requested workspace mutations now return `OrgWriteDeniedError` (HTTP 403):
+  workspace connections and reconnects, organization OAuth clients and connect
+  flows, tool policies, and integration add/update/replace/remove/health-check
+  operations. Personal connection management remains available.
+
+  Pasted connection credentials, OAuth client secrets, OAuth connection tokens,
+  and dependent tool discovery run only after the outermost transaction commits
+  their row, including when a plugin wraps creation in `ctx.transaction`. Each
+  committed row records unique provider item references owned by that write
+  attempt. Reads resolve only those recorded references, so the post-commit
+  window fails closed with a retryable incomplete-write error and can never
+  resolve a predecessor's credential. A process crash leaves detectable missing
+  references; a later executor incarnation can atomically replace and retry a
+  stranded pasted connection, while OAuth client and connection retries replace
+  their rows through their existing update paths.
+
+  If credential persistence fails while the process remains alive, row and
+  provider compensation restore the prior state where possible and surface
+  incomplete cleanup explicitly. Best-effort cleanup can leave inert orphaned
+  attempt items, but an attempt never shares an item reference with a successor,
+  eliminating the former successor-clobber interval without requiring provider
+  compare-and-set support.
+
+## 1.6.7
+
+### Patch Changes
+
+- [#1867](https://github.com/UsefulSoftwareCo/executor/pull/1867) [`98d6c6a`](https://github.com/UsefulSoftwareCo/executor/commit/98d6c6ad3272fca371fc2d8b14b2e332100d8322) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Faster dynamic tool calls: independent storage reads run concurrently**
+
+  Every dynamic tool call paid for its bookkeeping reads one at a time: first the tool row, then the active policy rules, then the connection row, and later the credential resolution followed by the integration row. Each read is a separate storage round-trip, so the serial chain added tens of milliseconds per call locally and more against a remote database. The reads are mutually independent, so they now run concurrently: the tool, policy, and connection reads overlap before approval, and credential resolution overlaps the integration read after approval. Approval enforcement still completes before credential resolution starts — a declined call never triggers a token refresh — and each read's failure still surfaces at the same point with the same error as before.
+
+## 1.6.6
+
+## 1.6.5
+
+## 1.6.4
+
+### Patch Changes
+
+- [#1858](https://github.com/UsefulSoftwareCo/executor/pull/1858) [`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Add locally installed OpenAI Codex plugins as one-click integrations: Messages
+  (iMessage/SMS), Chrome, Computer Use, Computer History, and OpenAI Developer
+  Docs. They appear in the connect dialog with their own icons, and a card that
+  cannot run yet says what to install and links to it.
+
+  Tool calls reach the plugins through `codex app-server` rather than a plugin's
+  own MCP server, because their services only honour calls from a Codex host
+  session. Computer Use and Chrome ship no MCP server at all, so their APIs are
+  projected as typed tools — `list_apps`, `click`, `read_page`, `navigate` — that
+  compile to a single call each. No model turn is involved; nothing is bundled or
+  downloaded, and a machine without Codex simply sees the setup steps.
+
+  A plugin's own approval prompt now reaches the caller, and states the terms it
+  carries: a browser prompt that persists for a site says so. Approvals are asked
+  once per session rather than per call.
+
+  Elicitation requests can carry implementation-defined metadata through
+  `FormElicitation` / `UrlElicitation`, and a paused execution reports it. Both
+  fields are optional and additive.
+
+- [#1346](https://github.com/UsefulSoftwareCo/executor/pull/1346) [`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Creating a connection over an existing one is rejected instead of silently overwriting it**
+
+  `connections.create` used to upsert: a create with the same (owner, integration, name) replaced the saved connection and, for a pasted value, overwrote the stored secret itself. It now fails with the new `ConnectionAlreadyExistsError` and leaves the existing connection untouched. Remove the connection first, or pick a different name.
+
+  This adds one error to the wire contract: the `POST /connections` endpoint can answer **HTTP 409** with tag `ConnectionAlreadyExistsError`, and the `connections.create` core tool resolves the same case as `{ ok: false, error: { code: "connection_already_exists" } }`. The core tool now also resolves the other expected input failures the same way instead of as opaque internal errors: `integration_not_found` for an unknown integration and `invalid_connection_input` for an invalid input. The change is additive — no existing status, field, or success shape moves.
+
+  OAuth is unaffected. Fresh OAuth connects already resolve a taken name to the next free suffix through `newConnection`, and reconnect still re-mints the same connection on purpose.
+
+- [#1708](https://github.com/UsefulSoftwareCo/executor/pull/1708) [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Stale "unhealthy" verdicts no longer wait for a manual "Check now"**
+
+  A connection's persisted health verdict was only ever re-checked from the web UI, so after one bad probe (a transient upstream error, a refresh that failed once) agents reading `connections.list` kept reporting "unhealthy, reconnect" for a connection that worked fine — invocation auto-refreshes OAuth tokens — until a human opened the page and clicked "Check now".
+
+  Two repair paths make the verdict track reality on its own. The agent-facing `connections.list` now re-runs the same probe as "Check now" before reporting a non-healthy verdict older than a minute, so recovery shows on the next read while repeated lists collapse to one probe per window. And a successful tool invocation through a connection wearing a non-healthy verdict flips it back to healthy — real traffic is stronger evidence than any probe. Tool-sync failure verdicts and grants the authorization server has rejected as `invalid_grant` are deliberately left alone: the first is cleared only by a successful sync, and the second genuinely requires a reconnect. A call whose credential no longer resolves is left alone too — a rendered request omits the missing placement, so an upstream that answers unauthenticated proves nothing about a credential that is gone.
+
+  `PluginCtx.connections` gains `checkHealth`, the same probe-with-freshness-window the executor surface already exposed.
+
+- [#1818](https://github.com/UsefulSoftwareCo/executor/pull/1818) [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84) Thanks [@ramarivera](https://github.com/ramarivera)! - **Rejected MCP OAuth grants now request reconnect without registering a disposable client**
+
+  Remote MCP catalog discovery used the MCP SDK's interactive OAuth fallback when an upstream rejected Executor's stored bearer with `401`. A background refresh cannot finish that browser authorization, but the SDK first fetched OAuth metadata and dynamically registered another client. Executor then preserved the old catalog under a generic degraded health verdict, so clients saw zero or stale tools without a reliable reconnect signal.
+
+  Executor now stops at the authenticated HTTP boundary for OAuth-backed MCP transports. A rejected stored bearer becomes a structured reauthorization result before OAuth discovery or Dynamic Client Registration runs. Catalog refresh still preserves the last authoritative tools, but records the connection as expired with a reconnect-required detail so the UI and API can direct the user through authorization again.
+
+  API-key and unauthenticated MCP transports keep their existing `401` behavior, and ordinary incomplete discovery results remain degraded.
+
+## 1.6.3
+
+### Patch Changes
+
+- [#1537](https://github.com/UsefulSoftwareCo/executor/pull/1537) [`c1f51b7`](https://github.com/UsefulSoftwareCo/executor/commit/c1f51b7f96328b795669bb3d241667660dc2b060) Thanks [@Rish-it](https://github.com/Rish-it)! - Share the OAuth refresh gate across execution stacks so a rotating refresh token is redeemed once.
+
+  The in-flight refresh gate was built inside `createExecutor`, so it only covered one execution stack. A host builds a fresh stack per MCP session, and now per request, so two sessions resolving the same connection each read the same stored refresh token and each believed they were the refresh winner. Against a provider that rotates refresh tokens, the loser redeems a token the winner already spent, and a provider that detects reuse revokes the whole token family: the connection dies and the user has to reauthorize. The first refresh always succeeds, so the fault stayed invisible until a later expiry.
+
+  The gate now hangs off the root database handle, which is the object hosts already share across sessions and requests, so every stack over one handle converges on one gate. Its key includes the tenant, because a gate that spans tenants would otherwise let two tenants collide on one entry.
+
+  The grant also runs on its own detached fiber that callers await, rather than on whichever caller registered it. Sharing an entry across stacks would otherwise share the first caller's cancellation: a disconnected MCP client or an execution deadline would fail every peer waiting on that entry, and would abandon a refresh token the authorization server had already rotated, which is itself a dead connection. A cancelled peer now detaches without touching the grant, and a grant nobody is left waiting on still settles and still persists the rotated token.
+
+  Deduplication covers one database handle in one process. A host that builds a fresh handle per request or per session, and any multi-instance or multi-replica deployment, is out of scope here and still needs database-backed coordination, such as a compare-and-swap on the stored refresh token.
+
+- [#1098](https://github.com/UsefulSoftwareCo/executor/pull/1098) [`02b52cd`](https://github.com/UsefulSoftwareCo/executor/commit/02b52cd01b09d3601ffe88d1f9c0b777f26e76ae) Thanks [@aryasaatvik](https://github.com/aryasaatvik)! - Add a FumaDB bulk upsert query path and route plugin-storage bulk writes through
+  it so existing rows are updated without delete/reinsert churn.
+- Updated dependencies [[`02b52cd`](https://github.com/UsefulSoftwareCo/executor/commit/02b52cd01b09d3601ffe88d1f9c0b777f26e76ae)]:
+  - @executor-js/fumadb@1.5.8
+
+## 1.6.2
+
+## 1.6.1
+
+### Patch Changes
+
+- [#1784](https://github.com/UsefulSoftwareCo/executor/pull/1784) [`55180cb`](https://github.com/UsefulSoftwareCo/executor/commit/55180cb1487f9a3a28ddc0ee0bedfab8464c1f72) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Build `StorageError.message` from the call-site label plus the driver's error code instead of the driver's raw text. The driver text is drizzle's `Failed query: <sql>\nparams: <bound values>`, so error reporting grouped one storage defect by statement shape and printed bound parameters into issue titles. The full driver error stays on `cause`.
+
+  Add `StorageConnectionError`, a `StorageFailure` variant for postgres.js connection faults (`CONNECTION_ENDED`, `CONNECTION_CLOSED`, `CONNECTION_DESTROYED`, `CONNECT_TIMEOUT`, `ECONNREFUSED`, `ECONNRESET`) and workerd's cross-request I/O rejection. It carries the fault `code` and a `retryable` flag so a lost socket can be told apart from a pool-lifetime bug.
+
+## 1.6.0
+
+### Patch Changes
+
+- [#1648](https://github.com/UsefulSoftwareCo/executor/pull/1648) [`a2d1417`](https://github.com/UsefulSoftwareCo/executor/commit/a2d141758e478274813c8c24d354e1fd0f66af49) Thanks [@baggiiiie](https://github.com/baggiiiie)! - Keep `connections.list` health output compact unless callers opt into diagnostics with `verbose: true`. Default list responses now retain only the health status, identity, and check timestamp; verbose responses continue to include HTTP status, diagnostic detail, and bounded upstream response samples.
+
+## 1.5.42
+
+### Patch Changes
+
+- [#1626](https://github.com/UsefulSoftwareCo/executor/pull/1626) [`d3f0617`](https://github.com/UsefulSoftwareCo/executor/commit/d3f0617deec06c57e0d6e1479fe668f79daf977d) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Redact every span header attribute outside a safe allowlist on the hosted HTTP client. The tracer's default four-name blocklist let provider-specific credential headers reach the trace backend verbatim; the hosted client now inverts the model and masks everything except structurally safe negotiation, caching, and tracing headers.
+
+## 1.5.41
+
+### Patch Changes
+
+- [#1580](https://github.com/UsefulSoftwareCo/executor/pull/1580) [`d572658`](https://github.com/UsefulSoftwareCo/executor/commit/d572658d74097917412256f10a3ea2e3974f44dd) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Fix: the admin joined user view no longer issues one connection query per subject**
+
+  `admin.listSubjectsWithConnections` read a page of subjects and then queried
+  connections once per subject, sequentially. A default page therefore cost 100
+  round trips inside a single request, which on a per-request socket dominated
+  the response. It now reads the page and then batches every subject's
+  connections into one query, so the cost is two queries regardless of page size.
+  A subject with no connections still reports an empty array rather than dropping
+  out of the page, and the batched read carries the same `owner: "user"` and
+  tenant scoping the per-subject read did.
+
+  The `?email=` filter on the admin users endpoints is also applied before the
+  read rather than after it: the address resolves to a principal id and that id is
+  read directly, instead of paging the tenant and keeping the row that matched.
+  Paging still applies to a filtered response, but to the selected row — one row
+  at `offset: 0`, empty beyond it.
+
 ## 1.5.40
 
 ### Patch Changes

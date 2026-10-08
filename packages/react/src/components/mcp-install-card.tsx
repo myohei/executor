@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Option, Schema } from "effect";
 import { trackEvent } from "../api/analytics";
 import CursorIcon from "@lobehub/icons/es/Cursor/components/Mono";
 import ClaudeIcon from "@lobehub/icons/es/Claude/components/Color";
@@ -19,6 +20,70 @@ import {
 
 type TransportMode = "stdio" | "http";
 export type McpElicitationMode = "browser" | "model" | "native";
+
+const McpInstallPreferencesSchema = Schema.Struct({
+  mode: Schema.Literals(["stdio", "http"]),
+  httpElicitationMode: Schema.Literals(["browser", "model", "native"]),
+  artifacts: Schema.Boolean,
+  searchTools: Schema.Boolean,
+  // Added after v1 shipped; optional so a stored preference from before it
+  // existed still decodes and takes the default (codemode).
+  toolMode: Schema.optional(Schema.Literals(["codemode", "passthrough"])),
+});
+
+type McpInstallPreferences = typeof McpInstallPreferencesSchema.Type;
+
+const MCP_INSTALL_PREFERENCES_STORAGE_PREFIX = "executor.mcpInstallPreferences.v1";
+/** Hosts that are not org-scoped (local, desktop) share this one suffix. */
+const UNSCOPED_ORGANIZATION_SUFFIX = "local";
+
+/**
+ * Storage key for one organization's install preferences.
+ *
+ * `localStorage` is per-origin, not per-account, so a single key would carry
+ * one org's transport and elicitation choices into every other org — and into
+ * every other user — signed in through the same browser. The rendered command
+ * differs per org, so a shared preference is wrong rather than merely
+ * surprising. Scoping by slug keeps each org's choices to itself; hosts with
+ * no org context are a single user by construction and share one bucket.
+ */
+export const mcpInstallPreferencesStorageKey = (organizationSlug: string | null): string =>
+  `${MCP_INSTALL_PREFERENCES_STORAGE_PREFIX}.${organizationSlug ?? UNSCOPED_ORGANIZATION_SUFFIX}`;
+
+const DEFAULT_MCP_INSTALL_PREFERENCES: McpInstallPreferences = {
+  mode: "http",
+  httpElicitationMode: "model",
+  artifacts: true,
+  searchTools: false,
+  toolMode: "codemode",
+};
+const decodeMcpInstallPreferences = Schema.decodeUnknownOption(
+  Schema.fromJsonString(McpInstallPreferencesSchema),
+);
+
+const readMcpInstallPreferences = (storageKey: string): McpInstallPreferences => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: localStorage can throw when browser storage is disabled
+  try {
+    const raw = globalThis.localStorage?.getItem(storageKey);
+    return raw
+      ? Option.getOrElse(decodeMcpInstallPreferences(raw), () => DEFAULT_MCP_INSTALL_PREFERENCES)
+      : DEFAULT_MCP_INSTALL_PREFERENCES;
+  } catch {
+    return DEFAULT_MCP_INSTALL_PREFERENCES;
+  }
+};
+
+const writeMcpInstallPreferences = (
+  storageKey: string,
+  preferences: McpInstallPreferences,
+): void => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: localStorage can throw when browser storage is disabled
+  try {
+    globalThis.localStorage?.setItem(storageKey, JSON.stringify(preferences));
+  } catch {
+    // Best-effort persistence; the options still apply to this rendered command.
+  }
+};
 
 const SUPPORTED_AGENTS = [
   { key: "cursor", label: "Cursor", Icon: CursorIcon },
@@ -52,6 +117,12 @@ export const buildMcpHttpEndpoint = (input: {
   /** Artifacts are on by default, so only the opt-out is spelled out on the
    *  URL (`&artifacts=false`) and a default endpoint stays clean. */
   readonly artifacts?: boolean;
+  /** Per-integration search tools are off by default, so only the opt-in is
+   *  spelled out on the URL (`&search_tools=true`). */
+  readonly searchTools?: boolean;
+  /** Codemode is the default, so only passthrough is spelled out on the URL
+   *  (`&mode=passthrough`). */
+  readonly toolMode?: "codemode" | "passthrough";
   // Cloud only: pins the URL to `/<org-slug>/mcp` (the server also accepts the
   // legacy `/<org_id>/mcp` form). Desktop/local pass nothing and get the bare
   // `/mcp` path.
@@ -73,6 +144,12 @@ export const buildMcpHttpEndpoint = (input: {
     params.push(["elicitation_mode", input.elicitationMode]);
   }
   if (input.artifacts === false) params.push(["artifacts", "false"]);
+  // Per-integration search tools and artifacts are codemode affordances; passthrough serves
+  // neither, so the URL never claims them alongside it.
+  if (input.searchTools === true && input.toolMode !== "passthrough") {
+    params.push(["search_tools", "true"]);
+  }
+  if (input.toolMode === "passthrough") params.push(["mode", "passthrough"]);
   if (params.length === 0) return endpoint;
 
   const query = params.map(([key, value]) => `${key}=${value}`).join("&");
@@ -94,6 +171,8 @@ export const buildMcpInstallCommand = (input: {
   readonly authorizationHeader?: string | null;
   readonly elicitationMode?: McpElicitationMode;
   readonly artifacts?: boolean;
+  readonly searchTools?: boolean;
+  readonly toolMode?: "codemode" | "passthrough";
   readonly devCliCwd?: string;
   readonly organizationSlug?: string | null;
 }): string => {
@@ -103,6 +182,8 @@ export const buildMcpInstallCommand = (input: {
       desktop: input.desktop ? { port: input.desktop.port } : null,
       elicitationMode: input.elicitationMode,
       artifacts: input.artifacts,
+      searchTools: input.searchTools,
+      toolMode: input.toolMode,
       organizationSlug: input.organizationSlug,
     });
     const headerFlags: string[] = [];
@@ -130,14 +211,16 @@ export const buildMcpInstallCommand = (input: {
   if (input.artifacts === false) {
     innerArgs.push("--no-artifacts");
   }
+  if (input.searchTools === true && input.toolMode !== "passthrough") {
+    innerArgs.push("--search-tools");
+  }
+  if (input.toolMode === "passthrough") {
+    innerArgs.push("--mode", "passthrough");
+  }
   return `npx add-mcp ${shellQuoteWord(innerArgs.map(shellQuoteWord).join(" "))} --name executor`;
 };
 
 export function McpInstallCard(props: { className?: string }) {
-  const [mode, setMode] = useState<TransportMode>("http");
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [httpElicitationMode, setHttpElicitationMode] = useState<McpElicitationMode>("model");
-  const [artifacts, setArtifacts] = useState(true);
   const organizationSlug = useOrganizationSlug();
   const serverConnection = useExecutorServerConnection();
   // Desktop hosts ship Electron without putting an `executor` binary on
@@ -145,6 +228,27 @@ export function McpInstallCard(props: { className?: string }) {
   // HTTP path there; it routes through the active sidecar connection.
   const showStdio =
     isLocal && serverConnection.kind !== "desktop-sidecar" && !hasDesktopConnectionBridge();
+  const storageKey = mcpInstallPreferencesStorageKey(organizationSlug);
+  const [preferences, setPreferences] = useState<McpInstallPreferences>(() =>
+    readMcpInstallPreferences(storageKey),
+  );
+  // Switching organizations must load that org's own preferences. Reloading in
+  // an effect would let the save effect below run first and write the previous
+  // org's choices under the new org's key, which is the bleed this scoping
+  // exists to prevent. Adjusting during render re-runs this component before
+  // anything commits, so the save effect only ever sees a matched pair.
+  const [loadedStorageKey, setLoadedStorageKey] = useState(storageKey);
+  if (loadedStorageKey !== storageKey) {
+    setLoadedStorageKey(storageKey);
+    setPreferences(readMcpInstallPreferences(storageKey));
+  }
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const { mode, httpElicitationMode, artifacts, searchTools } = preferences;
+  const toolMode = preferences.toolMode ?? "codemode";
+
+  useEffect(() => {
+    writeMcpInstallPreferences(storageKey, preferences);
+  }, [storageKey, preferences]);
 
   const elicitationMode = mode === "stdio" ? "model" : httpElicitationMode;
 
@@ -181,6 +285,8 @@ export function McpInstallCard(props: { className?: string }) {
     authorizationHeader,
     elicitationMode,
     artifacts,
+    searchTools,
+    toolMode,
     devCliCwd,
     organizationSlug,
   });
@@ -204,6 +310,25 @@ export function McpInstallCard(props: { className?: string }) {
       <CollapsibleContent>
         <div className="mt-3 flex flex-col gap-2 rounded-md border border-border bg-muted/25 p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
+            <div className="text-xs font-medium text-foreground">Search and invoke</div>
+            <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
+              {toolMode === "passthrough"
+                ? "Discover connected accounts with integrations and read the guide with skills. Find tools with search, then call them with invoke. Your client handles approval."
+                : "Disabled: agents write code against your tools through one execute tool."}
+            </div>
+          </div>
+          <Switch
+            checked={toolMode === "passthrough"}
+            onCheckedChange={(next) => {
+              const nextMode = next ? "passthrough" : "codemode";
+              setPreferences((current) => ({ ...current, toolMode: nextMode }));
+              trackEvent("mcp_install_tool_mode_changed", { tool_mode: nextMode });
+            }}
+            aria-label="Search and invoke"
+          />
+        </div>
+        <div className="mt-2 flex flex-col gap-2 rounded-md border border-border bg-muted/25 p-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
             <div className="text-xs font-medium text-foreground">Artifacts</div>
             <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
               {artifacts
@@ -214,10 +339,31 @@ export function McpInstallCard(props: { className?: string }) {
           <Switch
             checked={artifacts}
             onCheckedChange={(next) => {
-              setArtifacts(next);
+              setPreferences((current) => ({ ...current, artifacts: next }));
               trackEvent("mcp_install_artifacts_toggled", { artifacts: next });
             }}
             aria-label="Artifacts"
+          />
+        </div>
+        <div className="mt-2 flex flex-col gap-2 rounded-md border border-border bg-muted/25 p-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="text-xs font-medium text-foreground">Integration search tools</div>
+            <div className="mt-0.5 text-xs leading-5 text-muted-foreground">
+              {toolMode === "passthrough"
+                ? "This mode already provides one search tool for all integrations."
+                : searchTools
+                  ? "One search tool per connected integration, so agents see your integrations as tool names."
+                  : "Disabled: agents discover tools through search inside execute."}
+            </div>
+          </div>
+          <Switch
+            checked={toolMode === "passthrough" ? false : searchTools}
+            disabled={toolMode === "passthrough"}
+            onCheckedChange={(next) => {
+              setPreferences((current) => ({ ...current, searchTools: next }));
+              trackEvent("mcp_install_search_tools_toggled", { search_tools: next });
+            }}
+            aria-label="Integration search tools"
           />
         </div>
         <div className="mt-2 flex flex-col gap-2 rounded-md border border-border bg-muted/25 p-3 sm:flex-row sm:items-center sm:justify-between">
@@ -234,7 +380,7 @@ export function McpInstallCard(props: { className?: string }) {
             value={elicitationMode}
             onChange={(event) => {
               const next = event.target.value as McpElicitationMode;
-              setHttpElicitationMode(next);
+              setPreferences((current) => ({ ...current, httpElicitationMode: next }));
               trackEvent("mcp_install_elicitation_mode_changed", { elicitation_mode: next });
             }}
             aria-label="Elicitation mode"
@@ -323,7 +469,7 @@ export function McpInstallCard(props: { className?: string }) {
           value={mode}
           onValueChange={(v) => {
             const next = v as TransportMode;
-            setMode(next);
+            setPreferences((current) => ({ ...current, mode: next }));
             trackEvent("mcp_install_transport_switched", { transport: next });
           }}
         >

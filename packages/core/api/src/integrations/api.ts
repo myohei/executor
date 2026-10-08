@@ -11,6 +11,7 @@
 import { HttpApiEndpoint, HttpApiGroup } from "effect/unstable/httpapi";
 import { Schema } from "effect";
 import {
+  EnterpriseIdentityProviderDescriptorSchema,
   HealthCheckCandidate,
   HealthCheckSpec,
   IntegrationDetectionResult,
@@ -18,6 +19,7 @@ import {
   IntegrationRemovalNotAllowedError,
   IntegrationSlug,
   InternalError,
+  OrgWriteDeniedError,
 } from "@executor-js/sdk/shared";
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,11 @@ const OAuthDescriptor = Schema.Struct({
   registrationEndpoint: Schema.optional(Schema.String),
   supportsDynamicRegistration: Schema.optional(Schema.Boolean),
   supportsClientIdMetadataDocument: Schema.optional(Schema.Boolean),
+  /** MCP Enterprise-Managed Authorization: the registered OAuth app that mints
+   *  this integration's identity assertions. Present only when the deployment
+   *  declared one — the client names it on `oauth.start` alongside the
+   *  assertion it holds. The interactive flow stays available regardless. */
+  enterpriseIdentityProvider: Schema.optional(EnterpriseIdentityProviderDescriptorSchema),
 });
 
 /** A single declared auth method — mirrors the SDK's `AuthMethodDescriptor`. */
@@ -132,14 +139,14 @@ export const IntegrationsApi = HttpApiGroup.make("integrations")
       params: IntegrationParams,
       payload: UpdateIntegrationPayload,
       success: IntegrationResponse,
-      error: [InternalError, IntegrationNotFound],
+      error: [InternalError, IntegrationNotFound, OrgWriteDeniedError],
     }),
   )
   .add(
     HttpApiEndpoint.delete("remove", "/integrations/:slug", {
       params: IntegrationParams,
       success: Schema.Struct({ removed: Schema.Boolean }),
-      error: [InternalError, IntegrationRemovalNotAllowed],
+      error: [InternalError, IntegrationRemovalNotAllowed, OrgWriteDeniedError],
     }),
   )
   .add(
@@ -172,6 +179,6 @@ export const IntegrationsApi = HttpApiGroup.make("integrations")
       params: IntegrationParams,
       payload: SetHealthCheckPayload,
       success: Schema.Struct({ ok: Schema.Boolean }),
-      error: [InternalError, IntegrationNotFound],
+      error: [InternalError, IntegrationNotFound, OrgWriteDeniedError],
     }),
   );

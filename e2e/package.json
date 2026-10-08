@@ -1,6 +1,6 @@
 {
   "name": "@executor-js/e2e",
-  "version": "0.0.37",
+  "version": "0.0.50",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "test:selfhost-docker": "vitest run --project selfhost-docker",
     "test:cloudflare": "vitest run --project cloudflare",
     "test:local": "vitest run --project local",
+    "test:ci-shard": "vitest run --config scripts/ci-shard.vitest.config.ts",
     "test:watch": "vitest",
     "ports": "bun scripts/ports.ts",
     "summary": "bun scripts/summary.ts",
@@ -22,7 +23,7 @@
   },
   "dependencies": {
     "@executor-js/api": "workspace:*",
-    "@executor-js/emulate": "^0.13.9",
+    "@executor-js/emulate": "0.14.3-mfa.0",
     "@executor-js/mcporter": "^0.11.4",
     "@executor-js/plugin-graphql": "workspace:*",
     "@executor-js/plugin-mcp": "workspace:*",
@@ -47,6 +48,7 @@
     "@vitejs/plugin-react": "catalog:",
     "graphql": "^16.12.0",
     "iron-webcrypto": "^2.0.0",
+    "otpauth": "^9.5.2",
     "typescript": "catalog:",
     "vite": "catalog:",
     "vitest": "catalog:"

@@ -215,9 +215,11 @@ const waitForShutdownSignal = () =>
     const shutdown = () => resume(Effect.void);
     process.once("SIGINT", shutdown);
     process.once("SIGTERM", shutdown);
+    process.once("SIGHUP", shutdown);
     return Effect.sync(() => {
       process.off("SIGINT", shutdown);
       process.off("SIGTERM", shutdown);
+      process.off("SIGHUP", shutdown);
     });
   });
 
@@ -1360,6 +1362,8 @@ const mcpUrlForActiveLocalServer = (input: {
   readonly connection: ExecutorServerConnection;
   readonly elicitationMode: "browser" | "model";
   readonly artifacts: boolean;
+  readonly searchTools: boolean;
+  readonly toolMode: "codemode" | "passthrough";
 }): URL => {
   const url = new URL("/mcp", input.connection.origin);
   if (input.elicitationMode === "browser") {
@@ -1369,6 +1373,15 @@ const mcpUrlForActiveLocalServer = (input: {
   // default endpoint stays clean.
   if (!input.artifacts) {
     url.searchParams.set("artifacts", "false");
+  }
+  // Per-integration search tools are off by default; only the opt-in is
+  // spelled out.
+  if (input.searchTools) {
+    url.searchParams.set("search_tools", "true");
+  }
+  // Passthrough is the non-default surface; only it is spelled out.
+  if (input.toolMode === "passthrough") {
+    url.searchParams.set("mode", "passthrough");
   }
   return url;
 };
@@ -1385,6 +1398,8 @@ const runMcpHttpBridge = async (input: {
   readonly manifest: ExecutorLocalServerManifest;
   readonly elicitationMode: "browser" | "model";
   readonly artifacts: boolean;
+  readonly searchTools: boolean;
+  readonly toolMode: "codemode" | "passthrough";
 }): Promise<void> => {
   const stdio = new StdioServerTransport();
   const authorization = getExecutorServerAuthorizationHeader(input.manifest.connection);
@@ -1393,6 +1408,8 @@ const runMcpHttpBridge = async (input: {
       connection: input.manifest.connection,
       elicitationMode: input.elicitationMode,
       artifacts: input.artifacts,
+      searchTools: input.searchTools,
+      toolMode: input.toolMode,
     }),
     authorization ? { requestInit: { headers: { Authorization: authorization } } } : undefined,
   );
@@ -1471,6 +1488,8 @@ const runMcpHttpBridge = async (input: {
 const runStdioMcpSession = (input: {
   readonly elicitationMode: "browser" | "model";
   readonly artifacts: boolean;
+  readonly searchTools: boolean;
+  readonly toolMode: "codemode" | "passthrough";
 }) =>
   Effect.gen(function* () {
     // `executor mcp` never owns the local database. If a local server is already
@@ -1487,6 +1506,8 @@ const runStdioMcpSession = (input: {
           manifest: active,
           elicitationMode: input.elicitationMode,
           artifacts: input.artifacts,
+          searchTools: input.searchTools,
+          toolMode: input.toolMode,
         }),
       );
       return;
@@ -1513,6 +1534,8 @@ const runStdioMcpSession = (input: {
         manifest: elected,
         elicitationMode: input.elicitationMode,
         artifacts: input.artifacts,
+        searchTools: input.searchTools,
+        toolMode: input.toolMode,
       }),
     );
   });
@@ -2878,11 +2901,37 @@ const mcpCommand = Command.make(
           "Withhold the artifact surface from this connection: the artifact tools, the app shell resource, and the artifact skills. Served by default.",
         ),
       ),
+    searchTools: Options.boolean("search-tools")
+      .pipe(Options.withDefault(false))
+      .pipe(
+        Options.withDescription(
+          "Serve one search_<integration> tool per connected integration. Off by default; each routes through the same flow as tools.search inside execute.",
+        ),
+      ),
+    toolMode: Options.choice("mode", ["codemode", "passthrough"] as const)
+      .pipe(Options.withDefault("codemode"))
+      .pipe(
+        Options.withDescription(
+          "codemode (default) serves the execute tool; passthrough serves search and invoke, with input schemas in search results and client approval for invoke.",
+        ),
+      ),
   },
-  ({ scope, elicitationMode, noArtifacts }) =>
+  ({ scope, elicitationMode, noArtifacts, searchTools, toolMode }) =>
     Effect.gen(function* () {
       applyScope(scope);
-      yield* runStdioMcpSession({ elicitationMode, artifacts: !noArtifacts });
+      if (toolMode === "passthrough" && searchTools) {
+        return yield* Effect.fail(
+          new Error(
+            "--search-tools is a codemode option; passthrough already provides search. Drop --search-tools or --mode passthrough.",
+          ),
+        );
+      }
+      yield* runStdioMcpSession({
+        elicitationMode,
+        artifacts: !noArtifacts,
+        searchTools,
+        toolMode,
+      });
     }),
 ).pipe(Command.withDescription("Start an MCP server over stdio"));
 

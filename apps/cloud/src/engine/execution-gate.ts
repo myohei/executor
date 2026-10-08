@@ -108,6 +108,9 @@ export const withPreExecutionGate = <E extends Cause.YieldableError>(
   pausedExecutionCount: () => engine.pausedExecutionCount(),
   hasPausedExecutions: () => engine.hasPausedExecutions(),
   getDescription: engine.getDescription,
+  // Forwarded, not re-implemented: the wrapped engine owns the sandbox fibers,
+  // so the host's request-scope teardown has to reach through this decorator.
+  shutdown: engine.shutdown,
 });
 
 // ---------------------------------------------------------------------------
@@ -172,7 +175,7 @@ export const makeExecutionLimitGate = (checkBalance: ExecutionBalanceCheck) => {
         Effect.catch((error: unknown) =>
           Effect.gen(function* () {
             yield* Effect.sync(() => {
-              console.warn("[billing] execution balance check failed open:", error);
+              console.warn("[billing] execution balance check failed open");
             });
             yield* captureCauseEffect(error);
             return { blocked: false } as const satisfies GateDecision;

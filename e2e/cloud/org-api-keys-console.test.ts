@@ -20,6 +20,7 @@ import { Effect } from "effect";
 import { scenario } from "../src/scenario";
 import { Browser, Target } from "../src/services";
 import { forBrowser, joinOrg } from "./support/session";
+import { visit } from "../src/surfaces/browser";
 
 declare global {
   interface Window {
@@ -45,7 +46,7 @@ scenario(
       let slug = "";
 
       await step("Land in the workspace and open the API keys page", async () => {
-        await page.goto("/", { waitUntil: "networkidle" });
+        await visit(page, "/");
         await page.waitForURL((url) => /^\/[a-z0-9-]+\/?$/.test(url.pathname), {
           timeout: 30_000,
         });
@@ -109,7 +110,9 @@ scenario(
           .getByRole("heading", { name: "Revoke organization key" })
           .waitFor({ state: "hidden", timeout: 30_000 });
 
-        // The revoked value no longer authenticates.
+        // The dialog closes when revocation starts. Wait for the confirmed
+        // provider mutation before asserting the key no longer authenticates.
+        await page.getByText("Revoked e2e backend reader", { exact: true }).waitFor();
         const after = await fetch(new URL("/api/admin/users", target.baseUrl), {
           headers: { authorization: `Bearer ${mintedValue}` },
         });
@@ -120,12 +123,12 @@ scenario(
     // ── The plain member's view ───────────────────────────────────────────
     yield* browser.session(forBrowser(member), async ({ page, step }) => {
       await step("A plain member is not shown the Organization keys section", async () => {
-        await page.goto("/", { waitUntil: "networkidle" });
+        await visit(page, "/");
         await page.waitForURL((url) => /^\/[a-z0-9-]+\/?$/.test(url.pathname), {
           timeout: 30_000,
         });
         const slug = new URL(page.url()).pathname.split("/").filter(Boolean)[0] ?? "";
-        await page.goto(`/${slug}/api-keys`, { waitUntil: "networkidle" });
+        await visit(page, `/${slug}/api-keys`);
         // The personal half renders for everyone…
         await page
           .getByRole("heading", { name: "Personal keys" })

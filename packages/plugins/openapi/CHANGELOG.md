@@ -1,5 +1,218 @@
 # @executor-js/plugin-openapi
 
+## 1.6.10
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.10
+  - @executor-js/config@1.6.10
+  - @executor-js/api@1.4.73
+  - @executor-js/react@1.4.73
+
+## 1.6.9
+
+### Patch Changes
+
+- [#1955](https://github.com/UsefulSoftwareCo/executor/pull/1955) [`55a8b5e`](https://github.com/UsefulSoftwareCo/executor/commit/55a8b5eaea88c20fa5c5f1852262db613b8ddb9f) Thanks [@smrht](https://github.com/smrht)! - Fetch Google Analytics Data (`analyticsdata`) Discovery from the service's own
+  host. The central directory does not list the GA4 Data API, so the canonical
+  `https://www.googleapis.com/discovery/v1/apis/analyticsdata/v1beta/rest` answers
+  404 and the source fails to import. Same treatment `forms`, `keep` and
+  `photospicker` already get.
+
+- [#1960](https://github.com/UsefulSoftwareCo/executor/pull/1960) [`d64639b`](https://github.com/UsefulSoftwareCo/executor/commit/d64639b1a50d2d292235aff8f727ca11fe9e43a6) Thanks [@baggiiiie](https://github.com/baggiiiie)! - OpenAPI tools that cannot reach the upstream server now return an `upstream_unreachable` error instead of `Internal tool error [id]`. The message names the integration and origin that could not be reached, `details` carries the sanitized `host` and errno-style `code` (`ECONNREFUSED`, `ENOTFOUND`, …), and the failure is logged with the same classification.
+
+- [#1937](https://github.com/UsefulSoftwareCo/executor/pull/1937) [`e9055c1`](https://github.com/UsefulSoftwareCo/executor/commit/e9055c13bf73bc1860c8eded542fe566b51c3784) Thanks [@The-AarushiSingh](https://github.com/The-AarushiSingh)! - Preserve vendor +json Content-Type on OpenAPI object request bodies.
+
+- [#1952](https://github.com/UsefulSoftwareCo/executor/pull/1952) [`1f67d83`](https://github.com/UsefulSoftwareCo/executor/commit/1f67d83609b13a73d3dc8d630f48c8f54a02e6ca) Thanks [@Karavil](https://github.com/Karavil)! - Support POST health checks for APIs that expose reads through HTTP RPC. Warn that POST can change data, allow validated JSON request bodies, and display the reason when a configured probe cannot run.
+
+- [#2000](https://github.com/UsefulSoftwareCo/executor/pull/2000) [`3fd28a5`](https://github.com/UsefulSoftwareCo/executor/commit/3fd28a51fabb0fc96d0bf83408021e7cbca70bfe) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Update the YAML parser to include fixes for malformed-input denial of service.
+
+- Updated dependencies [[`d873caf`](https://github.com/UsefulSoftwareCo/executor/commit/d873caf6fb3aa7408270b42aaad77f53cf9ec090), [`40b2f2e`](https://github.com/UsefulSoftwareCo/executor/commit/40b2f2e38d642843eb7c984c020117e0db52acfc), [`65d939e`](https://github.com/UsefulSoftwareCo/executor/commit/65d939ebab6f77a00a3435fe3575399cd1cd3b7f), [`3c263d7`](https://github.com/UsefulSoftwareCo/executor/commit/3c263d7580d1d9302a1dc5d63f2fab253fd409c2), [`61f71c5`](https://github.com/UsefulSoftwareCo/executor/commit/61f71c56fe799b6e0faa2b2f82a91f631bc6a979), [`a6cdcf1`](https://github.com/UsefulSoftwareCo/executor/commit/a6cdcf1ccfae22e7d3378908c095e5c847c70f90), [`be77521`](https://github.com/UsefulSoftwareCo/executor/commit/be775216cccddac6002b1f9442b3c8151e4f6063), [`f8cfa5f`](https://github.com/UsefulSoftwareCo/executor/commit/f8cfa5f5f475c6b9c14143663ed5861bec8f74af), [`1f67d83`](https://github.com/UsefulSoftwareCo/executor/commit/1f67d83609b13a73d3dc8d630f48c8f54a02e6ca), [`905e097`](https://github.com/UsefulSoftwareCo/executor/commit/905e0972614aed5a3bb279b51dc060f87f892d75), [`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa), [`85cf428`](https://github.com/UsefulSoftwareCo/executor/commit/85cf428905bbd73257fb3c3be5c89e762bf79377), [`38a7725`](https://github.com/UsefulSoftwareCo/executor/commit/38a7725876bcc9c8adeea9c7efbd190c121d3b86), [`3fd28a5`](https://github.com/UsefulSoftwareCo/executor/commit/3fd28a51fabb0fc96d0bf83408021e7cbca70bfe), [`929b233`](https://github.com/UsefulSoftwareCo/executor/commit/929b2338f225b3f80190ac7a6fe1f2473650c58c)]:
+  - @executor-js/api@1.4.72
+  - @executor-js/sdk@1.6.9
+  - @executor-js/react@1.4.72
+  - @executor-js/config@1.6.9
+
+## 1.6.8
+
+### Patch Changes
+
+- [#1913](https://github.com/UsefulSoftwareCo/executor/pull/1913) [`6d1f670`](https://github.com/UsefulSoftwareCo/executor/commit/6d1f670ce400ba2a516744a921996f2d1c7dcb68) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Expose OpenAPI spec updates as an approval-gated Executor tool so agents can refresh URL-backed integrations without removing their connections.
+
+- [#1919](https://github.com/UsefulSoftwareCo/executor/pull/1919) [`caa0391`](https://github.com/UsefulSoftwareCo/executor/commit/caa03919a8f2a5c82ed13bc4ea9060e964af3a79) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Workspace writes now require an administrator**
+
+  Executor bindings accept `orgWrites: "allowed" | "denied" | "request"`.
+  Request-aware hosts use `"request"` and bind `CurrentOrgWriteAccess` from the
+  authenticated principal for each request. An approval, decline, cancellation,
+  or form response also rebinds the paused execution to the resumer's current
+  access. Browser approvals derive access from the authenticated browser user's
+  live organization membership when that user posts the decision, rather than
+  from the earlier MCP request waiting for it or the user's global role. Self-host
+  uses the same Better Auth membership lookup for ordinary requests and browser
+  decisions. A demotion before either kind of resume therefore takes effect
+  before the paused execution can reach a workspace-write sink.
+
+  `Principal` now declares its role model explicitly: organization-backed hosts
+  carry `orgRoleModel: "organization"` and an optional normalized admin/member
+  role, while hosts without roles carry `orgRoleModel: "none"` and cannot also
+  carry an organization role. Missing role data under the organization model
+  fails closed, including legacy persisted MCP session metadata. Cloud derives
+  roles from WorkOS memberships and self-host derives them from Better Auth.
+
+  Members may still read and execute shared workspace resources and perform
+  operational maintenance such as token refresh and tool-catalog synchronization.
+  User-requested workspace mutations now return `OrgWriteDeniedError` (HTTP 403):
+  workspace connections and reconnects, organization OAuth clients and connect
+  flows, tool policies, and integration add/update/replace/remove/health-check
+  operations. Personal connection management remains available.
+
+  Pasted connection credentials, OAuth client secrets, OAuth connection tokens,
+  and dependent tool discovery run only after the outermost transaction commits
+  their row, including when a plugin wraps creation in `ctx.transaction`. Each
+  committed row records unique provider item references owned by that write
+  attempt. Reads resolve only those recorded references, so the post-commit
+  window fails closed with a retryable incomplete-write error and can never
+  resolve a predecessor's credential. A process crash leaves detectable missing
+  references; a later executor incarnation can atomically replace and retry a
+  stranded pasted connection, while OAuth client and connection retries replace
+  their rows through their existing update paths.
+
+  If credential persistence fails while the process remains alive, row and
+  provider compensation restore the prior state where possible and surface
+  incomplete cleanup explicitly. Best-effort cleanup can leave inert orphaned
+  attempt items, but an attempt never shares an item reference with a successor,
+  eliminating the former successor-clobber interval without requiring provider
+  compare-and-set support.
+
+- Updated dependencies [[`31a8042`](https://github.com/UsefulSoftwareCo/executor/commit/31a8042450475fd86ea580f4dbd5dcc3c290c008), [`b5271a6`](https://github.com/UsefulSoftwareCo/executor/commit/b5271a6f0cb6d0c42a6b9fbcdffe70fc2aad8bc6), [`caa0391`](https://github.com/UsefulSoftwareCo/executor/commit/caa03919a8f2a5c82ed13bc4ea9060e964af3a79)]:
+  - @executor-js/sdk@1.6.8
+  - @executor-js/api@1.4.71
+  - @executor-js/config@1.6.8
+  - @executor-js/react@1.4.71
+
+## 1.6.7
+
+### Patch Changes
+
+- Updated dependencies [[`98d6c6a`](https://github.com/UsefulSoftwareCo/executor/commit/98d6c6ad3272fca371fc2d8b14b2e332100d8322)]:
+  - @executor-js/sdk@1.6.7
+  - @executor-js/api@1.4.70
+  - @executor-js/config@1.6.7
+  - @executor-js/react@1.4.70
+
+## 1.6.6
+
+### Patch Changes
+
+- Updated dependencies [[`9a1fbd5`](https://github.com/UsefulSoftwareCo/executor/commit/9a1fbd5f0de25f622f303c76f998443c1bb72063)]:
+  - @executor-js/react@1.4.69
+  - @executor-js/api@1.4.69
+  - @executor-js/sdk@1.6.6
+  - @executor-js/config@1.6.6
+
+## 1.6.5
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.5
+  - @executor-js/config@1.6.5
+  - @executor-js/api@1.4.68
+  - @executor-js/react@1.4.68
+
+## 1.6.4
+
+### Patch Changes
+
+- Updated dependencies [[`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c), [`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242), [`9dcfaa5`](https://github.com/UsefulSoftwareCo/executor/commit/9dcfaa5ee8ad2ebc17407caf94d8d4dcf55e3562), [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a), [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84)]:
+  - @executor-js/sdk@1.6.4
+  - @executor-js/react@1.4.67
+  - @executor-js/api@1.4.67
+  - @executor-js/config@1.6.4
+
+## 1.6.3
+
+### Patch Changes
+
+- [#1530](https://github.com/UsefulSoftwareCo/executor/pull/1530) [`85b1955`](https://github.com/UsefulSoftwareCo/executor/commit/85b1955b4d24c332e637e15a025d64455e28a626) Thanks [@BittuBarnwal7479](https://github.com/BittuBarnwal7479)! - Multipart file fields in an OpenAPI spec now accept and send real files. A `multipart/form-data` property typed as a binary or byte string is rewritten into the SDK's tool-file schema when the tool is extracted, so an agent supplies a file the same way it does everywhere else. On invocation those values are decoded back into `File`/`Blob` parts — as bare properties and inside arrays, with a per-property `encoding.contentType` applied to each file part — instead of being JSON-stringified into the form body, which is what upstreams were previously rejecting. A file whose base64 payload does not decode now fails the invocation and names the field, rather than sending the file envelope as JSON.
+
+  The rewrite advertises only the shapes the request encoder can deliver. Two are deliberately left alone:
+  - A binary field nested inside an object property. Only top-level multipart properties and direct items of a top-level array property become form parts.
+  - A multipart body schema, or one of its properties, behind a `$ref`. Component schemas are carried through unresolved by design — the streaming compile path never materializes `components.schemas` — so a `$ref`'d file field keeps its declared binary string type.
+
+  The rewrite reads the request schema's own `properties` map rather than walking every object key, so a `default`, `example`, or vendor extension that happens to look like a binary string schema is untouched. Descriptions, titles, and nullability on the replaced field are carried onto the file schema.
+
+- Updated dependencies [[`66fb1a4`](https://github.com/UsefulSoftwareCo/executor/commit/66fb1a4154226d28691ca83bdf6f3daa417ef0ce), [`c1f51b7`](https://github.com/UsefulSoftwareCo/executor/commit/c1f51b7f96328b795669bb3d241667660dc2b060), [`d7e4b73`](https://github.com/UsefulSoftwareCo/executor/commit/d7e4b73a86b8e413af70e0fcb26f38a35a3f4546), [`02b52cd`](https://github.com/UsefulSoftwareCo/executor/commit/02b52cd01b09d3601ffe88d1f9c0b777f26e76ae)]:
+  - @executor-js/react@1.4.66
+  - @executor-js/sdk@1.6.3
+  - @executor-js/api@1.4.66
+  - @executor-js/config@1.6.3
+
+## 1.6.2
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.2
+  - @executor-js/config@1.6.2
+  - @executor-js/api@1.4.65
+  - @executor-js/react@1.4.65
+
+## 1.6.1
+
+### Patch Changes
+
+- [#1755](https://github.com/UsefulSoftwareCo/executor/pull/1755) [`7c12aee`](https://github.com/UsefulSoftwareCo/executor/commit/7c12aeea390225291ce4c97865b392237ee7934d) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Make Microsoft Graph slice URLs first-class spec sources instead of a hidden substitution. Catalog tiles now point directly at the slice release assets, the stored specUrl is exactly what gets fetched, and selection narrowing travels visibly in the URL fragment; requesting the upstream monolith URL fetches the monolith, never a silently swapped slice.
+
+- [#1753](https://github.com/UsefulSoftwareCo/executor/pull/1753) [`ddbf0fe`](https://github.com/UsefulSoftwareCo/executor/commit/ddbf0feba38c8502d78fa20c3081391b8ba3d112) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Serve Microsoft Graph preset selections from precomputed slice release assets instead of the 43MB upstream monolith. The monolith fetch almost never survives a 128MB Workers isolate (production traces show one completion in 30 days), so covered selections — every catalog preset, plus any combination within the default bundle — now read a 4–19MB filtered document built offline by the graph-slices workflow, with the monolith path kept only as a fallback and for full-graph/custom-scope selections.
+
+- [#1751](https://github.com/UsefulSoftwareCo/executor/pull/1751) [`0007474`](https://github.com/UsefulSoftwareCo/executor/commit/0007474602d8da3642648f216bfdb0f09eb0914f) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Preview OpenAPI spec-format selections (Microsoft Graph) through the streaming structural-split path instead of a whole-document parse, and guard generic whole-document parses by parsed-tree size (line count for block YAML, text size for JSON). Previewing a Graph preset URL previously parsed the 43MB source whole and killed the 128MB Workers isolate mid-request, surfacing as an empty 503; it now streams within budget, and oversized generic specs fail with an actionable error instead of taking down the isolate.
+
+- Updated dependencies [[`9dff4e8`](https://github.com/UsefulSoftwareCo/executor/commit/9dff4e8e6598e7d3108634a71269245ba9b480bb), [`55180cb`](https://github.com/UsefulSoftwareCo/executor/commit/55180cb1487f9a3a28ddc0ee0bedfab8464c1f72)]:
+  - @executor-js/react@1.4.64
+  - @executor-js/sdk@1.6.1
+  - @executor-js/api@1.4.64
+  - @executor-js/config@1.6.1
+
+## 1.6.0
+
+### Patch Changes
+
+- [#1660](https://github.com/UsefulSoftwareCo/executor/pull/1660) [`c11bef2`](https://github.com/UsefulSoftwareCo/executor/commit/c11bef2cd049db7bbf51b15e18761b14acccb534) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Cloudflare ships as MCP-only, with code mode opted out**
+
+  The Cloudflare OpenAPI preset is gone from the default catalog; the MCP preset is the one Cloudflare entry. Its endpoint now pins `?codemode=false` because Cloudflare's MCP server otherwise hides the tool catalog behind a single code-execution tool, and executor already provides the code-execution surface. Hand-entered `mcp.cloudflare.com` URLs missing the opt-out get an inline warning in the add flow telling the user to append `?codemode=false`.
+
+- [#1669](https://github.com/UsefulSoftwareCo/executor/pull/1669) [`46cea2c`](https://github.com/UsefulSoftwareCo/executor/commit/46cea2cbb1f414ae58ac876819a51b11967909a6) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Request Gmail's basic-settings scope alongside full mailbox access so Google integrations can create and manage Gmail filters without including domain-admin-only sharing settings.
+
+- Updated dependencies [[`a2d1417`](https://github.com/UsefulSoftwareCo/executor/commit/a2d141758e478274813c8c24d354e1fd0f66af49), [`2bdbedf`](https://github.com/UsefulSoftwareCo/executor/commit/2bdbedf257f54d7c209e8c856c618174c10d6bb3)]:
+  - @executor-js/sdk@1.6.0
+  - @executor-js/react@1.4.63
+  - @executor-js/api@1.4.63
+  - @executor-js/config@1.6.0
+
+## 1.5.42
+
+### Patch Changes
+
+- [#1642](https://github.com/UsefulSoftwareCo/executor/pull/1642) [`32206c7`](https://github.com/UsefulSoftwareCo/executor/commit/32206c7f78654f638bfd27c25c71c30c3d6354be) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Preserve an integration's selected OAuth consent scopes when refreshing converted API specifications, so Google Gmail refreshes do not restore operations that require broader scopes.
+
+- Updated dependencies [[`d3f0617`](https://github.com/UsefulSoftwareCo/executor/commit/d3f0617deec06c57e0d6e1479fe668f79daf977d)]:
+  - @executor-js/sdk@1.5.42
+  - @executor-js/api@1.4.62
+  - @executor-js/config@1.5.42
+  - @executor-js/react@1.4.62
+
+## 1.5.41
+
+### Patch Changes
+
+- Updated dependencies [[`d572658`](https://github.com/UsefulSoftwareCo/executor/commit/d572658d74097917412256f10a3ea2e3974f44dd)]:
+  - @executor-js/sdk@1.5.41
+  - @executor-js/api@1.4.61
+  - @executor-js/config@1.5.41
+  - @executor-js/react@1.4.61
+
 ## 1.5.40
 
 ### Patch Changes

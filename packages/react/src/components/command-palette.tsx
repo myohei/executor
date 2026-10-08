@@ -6,8 +6,10 @@ import { PlusIcon } from "lucide-react";
 import { trackEvent } from "../api/analytics";
 import type { Integration } from "@executor-js/sdk/shared";
 import { IntegrationFavicon, integrationPresetIconUrl } from "./integration-favicon";
+import { PresetIcon } from "./preset-icon";
 import { integrationsOptimisticAtom } from "../api/atoms";
 import { useIntegrationPlugins } from "@executor-js/sdk/client";
+import { useCanCreateWorkspaceConnections } from "../multiplayer/use-admin-nav";
 import {
   CommandDialog,
   CommandEmpty,
@@ -33,6 +35,7 @@ export function CommandPalette(props: { open: boolean; onOpenChange: (open: bool
   const integrationPlugins = useIntegrationPlugins();
   const navigate = useNavigate();
   const integrationsResult = useAtomValue(integrationsOptimisticAtom);
+  const canCreateIntegration = useCanCreateWorkspaceConnections();
 
   // Toggle with ⌘K / Ctrl+K
   useEffect(() => {
@@ -71,6 +74,7 @@ export function CommandPalette(props: { open: boolean; onOpenChange: (open: bool
       presetSummary?: string;
       presetUrl?: string;
       presetIcon?: string;
+      presetFallbackIcon?: string;
     }> = [];
     for (const plugin of integrationPlugins) {
       for (const preset of plugin.presets ?? []) {
@@ -82,6 +86,7 @@ export function CommandPalette(props: { open: boolean; onOpenChange: (open: bool
           presetSummary: preset.summary,
           presetUrl: preset.url,
           presetIcon: preset.icon,
+          presetFallbackIcon: preset.fallbackIcon,
         });
       }
     }
@@ -173,11 +178,13 @@ export function CommandPalette(props: { open: boolean; onOpenChange: (open: bool
             {integrationPlugins.map((plugin) => (
               <CommandItem
                 key={`add-${plugin.key}`}
+                disabled={!canCreateIntegration}
                 value={`add ${plugin.label} ${plugin.key}`}
                 onSelect={() => goToAdd(plugin.key)}
               >
                 <PlusIcon />
                 <span className="flex-1 truncate">Add {plugin.label}</span>
+                {!canCreateIntegration && <CommandShortcut>Admin only</CommandShortcut>}
               </CommandItem>
             ))}
           </CommandGroup>
@@ -190,21 +197,25 @@ export function CommandPalette(props: { open: boolean; onOpenChange: (open: bool
             {presetEntries.map((e) => (
               <CommandItem
                 key={`preset-${e.pluginKey}-${e.presetId}`}
+                disabled={!canCreateIntegration}
                 value={`preset ${e.presetName} ${e.presetSummary ?? ""} ${e.pluginLabel}`}
                 onSelect={() => goToPreset(e.pluginKey, e.presetId, e.presetUrl)}
               >
-                {e.presetIcon ? (
-                  <img
-                    src={e.presetIcon}
-                    alt=""
-                    className="size-4 shrink-0 object-contain"
-                    loading="lazy"
-                  />
-                ) : (
-                  <span aria-hidden className="size-4 shrink-0 rounded-sm bg-muted-foreground/20" />
-                )}
+                <PresetIcon
+                  {...(e.presetIcon ? { icon: e.presetIcon } : {})}
+                  {...(e.presetFallbackIcon ? { fallbackSrc: e.presetFallbackIcon } : {})}
+                  className="size-4 shrink-0 object-contain"
+                  fallback={
+                    <span
+                      aria-hidden
+                      className="size-4 shrink-0 rounded-sm bg-muted-foreground/20"
+                    />
+                  }
+                />
                 <span className="flex-1 truncate">{e.presetName}</span>
-                <CommandShortcut>{e.pluginLabel}</CommandShortcut>
+                <CommandShortcut>
+                  {canCreateIntegration ? e.pluginLabel : "Admin only"}
+                </CommandShortcut>
               </CommandItem>
             ))}
           </CommandGroup>

@@ -67,6 +67,34 @@ export const readArtifactsEnabled = (request: Request): boolean => {
 };
 
 /**
+ * Read the per-integration search tools opt-IN off an MCP request's
+ * `?search_tools=` query. OFF by default: a clean endpoint URL serves only the
+ * core surface, and only an accepted truthy spelling (`?search_tools=true`)
+ * adds one `search_<integration>` tool per connected integration. Any other
+ * explicit value reads as the default (disabled).
+ */
+export const readSearchToolsEnabled = (request: Request): boolean => {
+  const value = new URL(request.url).searchParams.get("search_tools");
+  if (value === null) return false;
+  return TRUE_QUERY_VALUES.has(value.toLowerCase());
+};
+
+export type McpToolMode = "codemode" | "passthrough";
+
+/**
+ * Read the tool surface mode off an MCP request's `?mode=` query. The default,
+ * `codemode`, serves `execute` (the model writes sandboxed TypeScript against
+ * `tools.*`). `?mode=passthrough` instead serves search and invoke, with no
+ * `execute`, `skills`, or `resume`. Invoke is marked destructive for native
+ * client approval. Any other value
+ * reads as the default.
+ */
+export const readToolMode = (request: Request): McpToolMode => {
+  const value = new URL(request.url).searchParams.get("mode");
+  return value === "passthrough" ? "passthrough" : "codemode";
+};
+
+/**
  * Build the console approval URL for a paused execution:
  * `<origin>/<organizationSlug>/resume/<executionId>?mcp_session_id=<sessionId>`
  * when the host knows the org slug, otherwise
@@ -97,13 +125,22 @@ export const approvalUrlForRequest = (
 export const ResumeResponsePayload = Schema.Struct({
   action: Schema.Literals(["accept", "decline", "cancel"]),
   content: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+  persist: Schema.optional(Schema.String),
 });
 
 const decodeResumeResponsePayload = Schema.decodeUnknownOption(ResumeResponsePayload);
 
 /** Decode an untrusted resume payload, or `null` if it doesn't match the contract. */
-export const decodeResumeResponse = (raw: unknown): ResumeResponse | null =>
-  Option.getOrNull(decodeResumeResponsePayload(raw));
+export const decodeResumeResponse = (raw: unknown): ResumeResponse | null => {
+  const decoded = decodeResumeResponsePayload(raw);
+  if (Option.isNone(decoded)) return null;
+  const { action, content, persist } = decoded.value;
+  return {
+    action,
+    ...(content === undefined ? {} : { content }),
+    ...(action === "accept" && persist !== undefined ? { meta: { persist } } : {}),
+  };
+};
 
 const ACKNOWLEDGEMENT_TEXT = {
   accept: "I've approved it",

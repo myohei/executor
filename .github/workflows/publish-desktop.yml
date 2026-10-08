@@ -13,6 +13,19 @@ on:
         description: Git tag to publish (e.g. v1.4.1)
         required: true
         type: string
+      dry_run:
+        description: Build all distributables but do not touch the GitHub release
+        required: false
+        default: false
+        type: boolean
+      executor_run_id:
+        description: >-
+          Publish Executor run id for this tag. Set by the automatic trigger;
+          the promote gate waits for exactly this run. Leave empty for manual
+          dispatches.
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -20,6 +33,18 @@ permissions:
 concurrency:
   group: publish-desktop-${{ github.ref }}
   cancel-in-progress: false
+
+# CI is not a user. Without this, executor's own product telemetry reports to the
+# production PostHog project from every e2e shard: the analytics layer
+# (integration_added, execution_completed, artifact_*) and the
+# integrations-registry fetch, which lands as a `hit` event. Each shard is a
+# fresh container, so it mints a fresh anonymous id and arrives on a fresh
+# runner IP — inflating machine and user counts by roughly an order of
+# magnitude. Both opt-outs are the packages' documented CI/test hooks.
+env:
+  DO_NOT_TRACK: "1"
+  EXECUTOR_DISABLE_ANALYTICS: "1"
+  EXECUTOR_DISABLE_INTEGRATIONS_FETCH: "1"
 
 jobs:
   build:
@@ -32,22 +57,22 @@ jobs:
           # smoke: run the compiled-sidecar smoke test on legs whose target
           # matches the runner (the mac x64 leg cross-compiles on an arm64
           # runner, so its binary can't be executed natively there).
-          - os: macos-latest
+          - os: blacksmith-6vcpu-macos-latest
             arch: arm64
             platform: mac
             bun-target: bun-darwin-arm64
             smoke: true
-          - os: macos-latest
+          - os: blacksmith-6vcpu-macos-latest
             arch: x64
             platform: mac
             bun-target: bun-darwin-x64
             smoke: false
-          - os: ubuntu-latest
+          - os: blacksmith-4vcpu-ubuntu-2404
             arch: x64
             platform: linux
             bun-target: bun-linux-x64
             smoke: true
-          - os: windows-latest
+          - os: blacksmith-8vcpu-windows-2025
             arch: x64
             platform: win
             bun-target: bun-windows-x64
@@ -91,8 +116,24 @@ jobs:
         with:
           node-version: 24
 
+      # No package/electron caches here on purpose: on Blacksmith's NVMe
+      # runners a cold `bun install` (8-55s) is as fast as a cache
+      # restore + warm install, and bun.lock changes on every release
+      # (Version Packages), so each publish would pay the cache-save tail
+      # (~45s on the mac critical path) for nothing.
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      # apps/desktop/build/ holds committed static inputs (icon, entitlements)
+      # that no module imports, so a sweep can delete them without breaking a
+      # build or a test. v1.6.1 was tagged without them: both mac legs ran ~8
+      # minutes, then died inside codesign with "build/entitlements.mac.plist:
+      # cannot read entitlement data" against an arbitrary locale.pak, while
+      # the missing icon only ever produced a "default Electron icon is used"
+      # notice. Check the tag's own tree here so the failure names the cause.
+      - name: Check desktop build resources
+        run: bun ./scripts/check-build-resources.ts
+        working-directory: apps/desktop
 
       - name: Build web app
         run: bun run --filter @executor-js/local build
@@ -143,13 +184,58 @@ jobs:
           #     → notarytool authentication for the notarization upload
           # When the secrets aren't set (forks, local), electron-builder
           # silently produces an unsigned build.
-          CSC_LINK: ${{ secrets.CSC_LINK }}
-          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          #
+          # CSC_LINK / CSC_KEY_PASSWORD MUST stay scoped to the mac legs.
+          # Despite the name used here, CSC_LINK is electron-builder's
+          # cross-platform certificate variable: WinPackager falls back to it
+          # whenever WIN_CSC_LINK is unset, via
+          # platformPackager.getCscLink("WIN_CSC_LINK"). Handing the Apple
+          # Developer ID .p12 to the windows leg made electron-builder read its
+          # subject and write `publisherName: Developer ID Application: ...`
+          # into app-update.yml, so every Windows client rejected the update it
+          # had just downloaded with "New version is not signed by the
+          # application owner". Empty string is the documented "no certificate"
+          # value — WindowsSignToolManager treats `cscLink === ""` exactly like
+          # unset. The APPLE_* vars below need no such guard: they are only
+          # read by notarytool on darwin and are inert elsewhere.
+          CSC_LINK: ${{ matrix.platform == 'mac' && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && secrets.CSC_KEY_PASSWORD || '' }}
           APPLE_API_KEY: ${{ env.APPLE_API_KEY_PATH }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: bunx --bun electron-builder --${{ matrix.platform }} --${{ matrix.arch }} --publish never --config electron-builder.config.ts
         working-directory: apps/desktop
+
+      # electron-updater installs from the zip, not the DMG, and Squirrel.Mac
+      # rejects it unless the extracted app passes codesign. 1.6.9 shipped a
+      # zip whose framework symlinks (Versions/Current -> A) had been expanded
+      # into copies by a 7-Zip upgrade inside electron-builder; the DMG was
+      # fine, every auto-update silently failed. Extract the zip the way
+      # Squirrel does and verify it before anything is uploaded.
+      - name: Verify mac update zip
+        if: matrix.platform == 'mac'
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+        run: |
+          set -euo pipefail
+          zip="apps/desktop/dist/executor-desktop-mac-${{ matrix.arch }}.zip"
+          links=$(unzip -Z "$zip" | grep -c '^l' || true)
+          echo "symlink entries in $zip: $links"
+          if [ "$links" -eq 0 ]; then
+            echo "::error::$zip has no symlink entries; framework bundles were flattened and Squirrel.Mac will reject the update"
+            exit 1
+          fi
+          # Unsigned builds (forks, no CSC_LINK) cannot pass codesign; the
+          # symlink check above still catches the flattening on its own.
+          if [ -z "${CSC_LINK:-}" ]; then
+            echo "no signing certificate configured; skipping codesign verification"
+            exit 0
+          fi
+          tmp=$(mktemp -d)
+          ditto -x -k "$zip" "$tmp"
+          codesign --verify --deep --strict --verbose=1 "$tmp/Executor.app"
+          rm -rf "$tmp"
 
       # The two mac legs each emit a latest-mac.yml listing only their own
       # arch. Rename per-arch here; the release job merges them back into the
@@ -178,9 +264,14 @@ jobs:
 
   release:
     needs: build
+    # dry_run builds and uploads workflow artifacts but never touches the
+    # GitHub release — used to rehearse workflow changes against a real tag.
+    if: ${{ !inputs.dry_run }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     permissions:
       contents: write
+      # Read Publish Executor run state for the promote gate below.
+      actions: read
 
     steps:
       - name: Checkout validation script
@@ -218,14 +309,61 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          while IFS= read -r file; do
-            echo "Uploading: $file"
-            gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
-          done < <(find artifacts -type f \
+          # Parallel uploads; xargs exits non-zero if any single upload fails,
+          # which keeps the promote step below from running on a partial set.
+          find artifacts -type f \
             \( -name "*.dmg" -o -name "*.zip" -o -name "*.exe" \
             -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" \
             -o -name "*.blockmap" \
-            -o -name "latest*.yml" \))
+            -o -name "latest*.yml" \) -print0 \
+            | xargs -0 -n1 -P8 -I{} sh -c \
+              'echo "Uploading: $1"; exec gh release upload "$RELEASE_TAG" "$1" --repo "$GITHUB_REPOSITORY" --clobber' _ {}
+
+      # A published release must imply the npm packages for this tag exist.
+      # Publish Executor triggers this workflow before its npm publishes (to
+      # overlap them with the desktop build) and hands over its own run id,
+      # so wait for exactly that run to conclude successfully before going
+      # public. A run-name search would fail open whenever the run fell
+      # outside the listing window, so only an explicitly empty run id (a
+      # manual dispatch) skips the gate — the operator owns the invariant
+      # then.
+      - name: Wait for executor package publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXECUTOR_RUN_ID: ${{ inputs.executor_run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXECUTOR_RUN_ID" ]; then
+            echo "No executor_run_id given (manual dispatch); skipping the publish gate."
+            exit 0
+          fi
+          deadline=$((SECONDS + 1200))
+          while :; do
+            run=$(gh run view "$EXECUTOR_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+              --json status,conclusion,url,displayTitle)
+            title=$(echo "$run" | jq -r .displayTitle)
+            if [ "$title" != "publish executor $RELEASE_TAG" ]; then
+              echo "Run $EXECUTOR_RUN_ID is '$title', not 'publish executor $RELEASE_TAG' — refusing to promote."
+              exit 1
+            fi
+            status=$(echo "$run" | jq -r .status)
+            if [ "$status" = "completed" ]; then
+              conclusion=$(echo "$run" | jq -r .conclusion)
+              if [ "$conclusion" = "success" ]; then
+                echo "Publish Executor succeeded."
+                break
+              fi
+              echo "Publish Executor concluded '$conclusion' — leaving the release in draft."
+              echo "$run" | jq -r .url
+              exit 1
+            fi
+            if [ "$SECONDS" -ge "$deadline" ]; then
+              echo "Timed out waiting for Publish Executor — leaving the release in draft."
+              exit 1
+            fi
+            echo "Publish Executor status: $status; waiting..."
+            sleep 15
+          done
 
       # Flip draft → published only after every desktop asset is uploaded —
       # this is the atomic point where the new tag becomes "latest".

@@ -14,7 +14,6 @@ import {
   AuthTemplateSlug,
   ConnectionName,
   IntegrationSlug,
-  NO_AUTH_TEMPLATE,
   OAuthClientSlug,
   OAuthState,
   ProviderItemId,
@@ -22,9 +21,10 @@ import {
   type Owner,
 } from "./ids";
 import { definePlugin, tool, type StaticToolSchema } from "./plugin";
-import { HealthCheckResult } from "./health-check";
+import { HealthCheckResult, isToolSyncHealth } from "./health-check";
 import { ToolPolicyActionSchema } from "./policies";
 import type { Tool } from "./tool";
+import { ToolResult } from "./tool-result";
 
 const schemaToStandard = <A, I>(schema: Schema.Decoder<A, I>): StaticToolSchema<A, I> =>
   Schema.toStandardSchemaV1(Schema.toStandardJSONSchemaV1(schema) as never) as StaticToolSchema<
@@ -50,6 +50,8 @@ const IntegrationOutput = Schema.Struct({
 const IntegrationsListOutput = Schema.Struct({
   integrations: Schema.Array(IntegrationOutput),
 });
+
+const IntegrationRemoveInput = Schema.Struct({ slug: Schema.String });
 
 const DetectInput = Schema.Struct({ url: Schema.String });
 const DetectOutput = Schema.Struct({
@@ -86,10 +88,10 @@ const ConnectionsListInput = Schema.Struct({
   verbose: Schema.optional(Schema.Boolean),
 });
 
-/** Lean per-connection shape for list scans. Omits the full `oauthScope`
- *  grant string (a single connection's scope list can run to thousands of
- *  characters and dominates the payload) in favor of `oauthScopeCount`. The
- *  full scope is included only when the caller passes `verbose: true`. */
+/** Lean per-connection shape for list scans. The default projection summarizes
+ *  the full `oauthScope` grant string as `oauthScopeCount` and trims health
+ *  probe diagnostics. Those optional fields are populated only for `verbose:
+ *  true`. */
 const ConnectionListItem = Schema.Struct({
   owner: OwnerSchema,
   name: Schema.String,
@@ -138,18 +140,11 @@ const ConnectionCreateInput = Schema.Struct({
   Schema.makeFilter((payload) => {
     const originCount =
       (payload.from === undefined ? 0 : 1) + (payload.inputs === undefined ? 0 : 1);
-    // The no-auth template ("none") binds zero credentials — both `from` and
-    // `inputs` are legitimately absent (public MCP servers, public REST APIs).
-    // Mirror the engine, which accepts an empty input set only for this
-    // template; a stray origin would wire a credential the connection can't
-    // hold, so reject any. Every other template needs exactly one origin.
-    const isNoAuth = String(payload.template) === String(NO_AUTH_TEMPLATE);
-    if (isNoAuth) {
-      if (originCount > 0) {
-        return 'A no-auth connection (template "none") takes no provider credential origin';
-      }
-    } else if (originCount !== 1) {
-      return "Expected exactly one provider credential origin";
+    // Auth meaning belongs to the integration's resolved method descriptor,
+    // which the engine evaluates with catalog context. This boundary only
+    // rejects an ambiguous shape that supplies two competing origins.
+    if (originCount > 1) {
+      return "Expected at most one provider credential origin";
     }
     if (payload.inputs !== undefined && Object.keys(payload.inputs).length === 0) {
       return "Expected at least one provider credential input";
@@ -331,6 +326,7 @@ const OAuthCancelInput = Schema.Struct({
 
 // Standard-schema versions for the tool() builder.
 const IntegrationsListOutputStd = schemaToStandard(IntegrationsListOutput);
+const IntegrationRemoveInputStd = schemaToStandard(IntegrationRemoveInput);
 const DetectInputStd = schemaToStandard(DetectInput);
 const DetectOutputStd = schemaToStandard(DetectOutput);
 const ConnectionsListInputStd = schemaToStandard(ConnectionsListInput);
@@ -386,8 +382,8 @@ const connectionToOutput = (connection: Connection) => ({
 const oauthScopeCount = (scope: string | null | undefined): number | null =>
   scope == null ? null : scope.split(/\s+/).filter(Boolean).length;
 
-/** Lean projection for `connections.list`. Summarizes `oauthScope` to a count
- *  unless `verbose`, where the full grant string is included too. */
+/** Lean projection for `connections.list`. Summarizes `oauthScope` and health
+ * diagnostics unless `verbose`, where the full grant string is included too. */
 const connectionToListItem = (connection: Connection, verbose: boolean) => ({
   owner: connection.owner,
   name: String(connection.name),
@@ -401,9 +397,39 @@ const connectionToListItem = (connection: Connection, verbose: boolean) => ({
   oauthClient: connection.oauthClient == null ? null : String(connection.oauthClient),
   oauthClientOwner: connection.oauthClientOwner ?? null,
   oauthScopeCount: oauthScopeCount(connection.oauthScope),
-  lastHealth: connection.lastHealth ?? null,
+  // Keep full probe diagnostics behind the explicit verbose opt-in.
+  lastHealth:
+    connection.lastHealth == null || verbose
+      ? (connection.lastHealth ?? null)
+      : {
+          status: connection.lastHealth.status,
+          ...(connection.lastHealth.identity !== undefined
+            ? { identity: connection.lastHealth.identity }
+            : {}),
+          checkedAt: connection.lastHealth.checkedAt,
+        },
   ...(verbose ? { oauthScope: connection.oauthScope ?? null } : {}),
 });
+
+/** How long a non-healthy persisted verdict may be served to an agent before
+ *  it is re-verified. Verdicts are sticky — nothing re-probes them between UI
+ *  visits — so without read-time revalidation an agent keeps reporting
+ *  "unhealthy, reconnect" for a connection that recovered long ago (or was
+ *  never really down: invocation auto-refreshes OAuth tokens, so a stale
+ *  "expired" verdict often describes a working connection). The window is
+ *  short so recovery shows on the next read, but bounds repeated lists from
+ *  hammering a genuinely-down upstream. Healthy verdicts are deliberately
+ *  served as-is: they mislead no one into reconnect guidance, and the UI
+ *  owns their background revalidation. */
+const NON_HEALTHY_REVALIDATE_MS = 60 * 1000;
+
+/** Whether an agent read must re-verify a persisted verdict before reporting
+ *  it. Only probe-refutable non-healthy verdicts qualify: `unknown` and
+ *  missing verdicts carry no reconnect implication, and a tool-sync failure
+ *  verdict cannot be refuted by a credential probe (a successful sync clears
+ *  it instead). */
+const needsAgentReadRevalidation = (last: HealthCheckResult | null | undefined): boolean =>
+  (last?.status === "expired" || last?.status === "degraded") && !isToolSyncHealth(last);
 
 const toolToOutput = (toolRow: Tool) => ({
   address: String(toolRow.address),
@@ -560,31 +586,84 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
             })),
         }),
         tool({
+          name: "integrations.remove",
+          description:
+            "Remove an integration from the workspace catalog by slug, dropping every connection under it and every tool those produced. `removed: false` means no catalog row matched: the slug was already gone, or it names a built-in namespace that is not catalog-backed. Integrations whose `canRemove` is false are refused.",
+          inputSchema: IntegrationRemoveInputStd,
+          outputSchema: RemovedOutputStd,
+          // Strictly more destructive than `connections.remove`, which is
+          // already approval-gated: this cascades to every connection under the
+          // integration and takes the catalog row with it, so re-adding means
+          // re-importing the definition, not just reconnecting an account.
+          annotations: { requiresApproval: true },
+          execute: (input: typeof IntegrationRemoveInput.Type, { ctx }) =>
+            Effect.gen(function* () {
+              const slug = IntegrationSlug.make(input.slug);
+              // `core.integrations.get` reads catalog ROWS only, so a built-in
+              // static namespace reports absent here. Checking first is what
+              // keeps `removed` honest — the underlying remove is a silent
+              // no-op for a slug it can't find.
+              const existing = yield* ctx.core.integrations.get(slug);
+              if (existing === null) return { removed: false };
+              yield* ctx.core.integrations.remove(slug);
+              return { removed: true };
+            }),
+        }),
+        tool({
           name: "connections.list",
           description:
             "List saved connections and their last health verdict. Never returns credential values. Optionally filter by integration or owner. OAuth scopes are summarized as `oauthScopeCount` by default; pass `verbose: true` to include the full `oauthScope` grant string per connection.",
           inputSchema: ConnectionsListInputStd,
           outputSchema: ConnectionsListOutputStd,
           execute: (input: typeof ConnectionsListInput.Type, { ctx }) =>
-            Effect.map(
-              ctx.connections.list({
+            Effect.gen(function* () {
+              const connections = yield* ctx.connections.list({
                 integration:
                   input.integration === undefined
                     ? undefined
                     : IntegrationSlug.make(input.integration),
                 owner: input.owner === undefined ? undefined : (input.owner as Owner),
-              }),
-              (connections) => ({
-                connections: connections.map((connection) =>
+              });
+              // Re-verify sticky non-healthy verdicts before reporting them
+              // (the same probe as the UI's "Check now"). The server owns the
+              // stampede control: `ifStaleMs` caches settled verdicts per
+              // window, and concurrent readers past that gate coalesce onto
+              // one in-flight probe per connection. A grant the AS recorded
+              // dead is never re-probed there — only an explicit reconnect
+              // clears that verdict. Quiet on probe failure: the persisted
+              // verdict is still the best known state, exactly like the UI
+              // surfaces.
+              const revalidated = yield* Effect.forEach(
+                connections,
+                (connection) =>
+                  needsAgentReadRevalidation(connection.lastHealth)
+                    ? ctx.connections
+                        .checkHealth(
+                          {
+                            owner: connection.owner,
+                            integration: connection.integration,
+                            name: connection.name,
+                          },
+                          { ifStaleMs: NON_HEALTHY_REVALIDATE_MS },
+                        )
+                        .pipe(
+                          Effect.map((health) => ({ ...connection, lastHealth: health })),
+                          Effect.catch(() => Effect.succeed(connection)),
+                        )
+                    : Effect.succeed(connection),
+                { concurrency: 4 },
+              );
+              return {
+                connections: revalidated.map((connection) =>
                   connectionToListItem(connection, input.verbose === true),
                 ),
-              }),
-            ),
+              };
+            }),
         }),
         tool({
           name: "connections.create",
           description:
-            'Low-level create or replace for a saved connection from provider item references. For a no-auth integration (public MCP server, public REST API), pass `template: "none"` with no `from`/`inputs` to wire it up directly. For normal API keys/tokens, use `connections.createHandoff` so the user enters the credential in the web UI. OAuth credentials should use `oauth.start`.',
+            'Low-level create for a saved connection from provider item references. Fails if a connection with the same owner, integration, and name already exists (remove it first, or pick a different name). For a no-auth integration (public MCP server, public REST API), pass `template: "none"` with no `from`/`inputs` to wire it up directly. For normal API keys/tokens, use `connections.createHandoff` so the user enters the credential in the web UI. OAuth credentials should use `oauth.start`.',
           inputSchema: ConnectionCreateInputStd,
           outputSchema: ConnectionOutputStd,
           // Creating a connection binds a credential reference and roots a new
@@ -595,9 +674,25 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
           // approval-gated (the v1 `sources.configure` carried the same guard).
           annotations: { requiresApproval: true },
           execute: (input: typeof ConnectionCreateInput.Type, { ctx }) =>
-            Effect.map(
-              ctx.connections.create(createConnectionInputFromTool(input)),
-              connectionToOutput,
+            ctx.connections.create(createConnectionInputFromTool(input)).pipe(
+              Effect.map(connectionToOutput),
+              // Expected, caller-actionable failures resolve as ToolResult.fail
+              // (the sandbox sees `{ ok: false, error }`); anything else stays
+              // a defect and surfaces as the opaque internal-error generic.
+              Effect.catchTags({
+                ConnectionAlreadyExistsError: (error) =>
+                  Effect.succeed(
+                    ToolResult.fail({ code: "connection_already_exists", message: error.message }),
+                  ),
+                IntegrationNotFoundError: (error) =>
+                  Effect.succeed(
+                    ToolResult.fail({ code: "integration_not_found", message: error.message }),
+                  ),
+                InvalidConnectionInputError: (error) =>
+                  Effect.succeed(
+                    ToolResult.fail({ code: "invalid_connection_input", message: error.message }),
+                  ),
+              }),
             ),
         }),
         tool({
@@ -792,7 +887,7 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
         tool({
           name: "oauth.clients.remove",
           description:
-            "Remove an owner-scoped OAuth client by owner and slug. Existing connections are not cascaded.",
+            "Remove an owner-scoped OAuth client by owner and slug. `removed: false` means no client matched that owner and slug — clients are keyed by BOTH, so the same slug can exist separately under `org` and `user`. Existing connections are not cascaded.",
           inputSchema: OAuthRemoveClientInputStd,
           outputSchema: RemovedOutputStd,
           // Removing a client breaks token refresh for every connection that
@@ -801,10 +896,22 @@ export const coreToolsPlugin = definePlugin((options: CoreToolsPluginOptions = {
           // `sources.bindings.remove`.
           annotations: { requiresApproval: true },
           execute: (input: typeof OAuthRemoveClientInput.Type, { ctx }) =>
-            Effect.map(
-              ctx.oauth.removeClient(input.owner as Owner, OAuthClientSlug.make(input.slug)),
-              () => ({ removed: true }),
-            ),
+            Effect.gen(function* () {
+              const owner = input.owner as Owner;
+              const slug = OAuthClientSlug.make(input.slug);
+              // `removeClient` is idempotent by design at the storage layer, so
+              // on its own it cannot distinguish a real deletion from a typo'd
+              // slug or the wrong owner — and a caller sweeping a list of slugs
+              // under one hardcoded owner would read every no-op as success.
+              // Checking the visible set first is what keeps `removed` honest.
+              const clients = yield* ctx.oauth.listClients();
+              const matched = clients.some(
+                (client) => client.owner === owner && String(client.slug) === String(slug),
+              );
+              if (!matched) return { removed: false };
+              yield* ctx.oauth.removeClient(owner, slug);
+              return { removed: true };
+            }),
         }),
         tool({
           name: "oauth.probe",

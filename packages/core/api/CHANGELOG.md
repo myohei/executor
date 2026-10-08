@@ -1,5 +1,200 @@
 # @executor-js/api
 
+## 1.4.73
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.10
+  - @executor-js/execution@1.6.10
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.72
+
+### Patch Changes
+
+- [#1974](https://github.com/UsefulSoftwareCo/executor/pull/1974) [`d873caf`](https://github.com/UsefulSoftwareCo/executor/commit/d873caf6fb3aa7408270b42aaad77f53cf9ec090) Thanks [@baggiiiie](https://github.com/baggiiiie)! - Advertise refresh-token support in OAuth client ID metadata documents.
+
+  OAuth providers may reject the `offline_access` scope when the client's
+  metadata declares only the authorization-code grant. Hosted and local client
+  metadata now declare both `authorization_code` and `refresh_token`, matching
+  Executor's dynamic client registration behavior.
+
+- [#1976](https://github.com/UsefulSoftwareCo/executor/pull/1976) [`40b2f2e`](https://github.com/UsefulSoftwareCo/executor/commit/40b2f2e38d642843eb7c984c020117e0db52acfc) Thanks [@SunkenInTime](https://github.com/SunkenInTime)! - Carry an approval's persistence choice through elicitation, so Codex Computer Use stops asking to use the same app on every call.
+
+  Computer Use offers `persist: ["session", "always"]` in the prompt's terms and remembers the app only when the answer names one. Executor dropped the offer on the way in (the terms projection kept strings only) and the choice on the way out (every adapter rebuilt the reply from `action` and `content`), so each accept was one-time. `ElicitationResponse` now has `meta.persist`; the MCP plugin, the app-server bridge, and the MCP host pass it through; the model-mode `resume` tool and the browser approval page let the approver pick from the offered scopes. Nothing is chosen automatically: a bare accept still approves once.
+
+- [#1971](https://github.com/UsefulSoftwareCo/executor/pull/1971) [`61f71c5`](https://github.com/UsefulSoftwareCo/executor/commit/61f71c56fe799b6e0faa2b2f82a91f631bc6a979) Thanks [@Adityakk9031](https://github.com/Adityakk9031)! - Shut down scoped executors and tool subprocess resources upon MCP session eviction and disposal in the in-process session store.
+
+- [#2026](https://github.com/UsefulSoftwareCo/executor/pull/2026) [`a6cdcf1`](https://github.com/UsefulSoftwareCo/executor/commit/a6cdcf1ccfae22e7d3378908c095e5c847c70f90) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Cloud now authorizes every protected request against the local membership mirror through the shared `MemberDirectory` seam: the per-request org membership check, the admin gates on the account and admin planes, the org switcher's organization list, and the free-organization limit all read the mirror instead of calling WorkOS. WorkOS is now a write target and an event source only. The seam gains `membershipsOf(accountId)` and `membershipById(organizationId, membershipId)` on both hosts.
+
+  The mirror is trusted only while it is **ready**: the backfill has written every organization and the Events reconciler has drained the stream within the last ten minutes (both recorded on the `workos_sync` row). Until then the membership check falls back to WorkOS, exactly as before, so a member the backfill has not written yet is not locked out and a member revoked while the reconciler was down is not let in. The deploy runs `scripts/ensure-workos-mirror-ready.ts` after the migrations: it runs the backfill if needed, drains the events stream itself if the reconciler has not recently (so the gate never waits on a cron this same deploy ships), and fails the deploy if the mirror is still not ready. An organization the mirror does not hold at all (one that predates the mirror and nobody has signed in to since) is resolved from WorkOS on demand for a caller WorkOS confirms as its member, so CLI and MCP tokens naming such an organization are not refused. Deleting an organization now cancels billing before deleting the WorkOS organization, and a retry after a partial deletion is admitted from the mirror even while the mirror is not ready.
+
+  **Ops step (cloud):** add the `WORKOS_API_KEY` secret to the `production` GitHub environment so the deploy gate can run the backfill.
+
+- [#2025](https://github.com/UsefulSoftwareCo/executor/pull/2025) [`be77521`](https://github.com/UsefulSoftwareCo/executor/commit/be775216cccddac6002b1f9442b3c8151e4f6063) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Member lists, the admin users page, and seat counts on cloud now read from the local membership mirror through the shared `MemberDirectory` seam instead of fanning out one WorkOS read per member. The admin users page gains an email/name search.
+
+  **Deploy prerequisite (cloud):** `bun run --cwd apps/cloud db:backfill-workos-mirror:prod` must complete before this build is deployed, and its printed membership count should match WorkOS. Until the backfill has stamped the mirror's marker, seat reporting to Autumn is skipped with a warning (never a partial count) and member lists show only members who have signed in since the mirror shipped.
+
+- [#2028](https://github.com/UsefulSoftwareCo/executor/pull/2028) [`f8cfa5f`](https://github.com/UsefulSoftwareCo/executor/commit/f8cfa5f5f475c6b9c14143663ed5861bec8f74af) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Keep request resources alive until background OAuth tool discovery finishes, so slow cloud connections can publish their tools after the callback returns.
+
+- [#2000](https://github.com/UsefulSoftwareCo/executor/pull/2000) [`3fd28a5`](https://github.com/UsefulSoftwareCo/executor/commit/3fd28a51fabb0fc96d0bf83408021e7cbca70bfe) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Redact redirect, referrer, trace-state, and MCP session headers from outbound HTTP traces.
+
+  Allow hosts to require HTTPS for outbound requests and reject redirects to plaintext endpoints. Executor Cloud enables this policy. Explicit private-network development access remains available.
+
+- Updated dependencies [[`89b0f8d`](https://github.com/UsefulSoftwareCo/executor/commit/89b0f8d74cfb7d6a839bf08a267d892fb0cc676e), [`40b2f2e`](https://github.com/UsefulSoftwareCo/executor/commit/40b2f2e38d642843eb7c984c020117e0db52acfc), [`65d939e`](https://github.com/UsefulSoftwareCo/executor/commit/65d939ebab6f77a00a3435fe3575399cd1cd3b7f), [`3c263d7`](https://github.com/UsefulSoftwareCo/executor/commit/3c263d7580d1d9302a1dc5d63f2fab253fd409c2), [`be77521`](https://github.com/UsefulSoftwareCo/executor/commit/be775216cccddac6002b1f9442b3c8151e4f6063), [`cc0fd8f`](https://github.com/UsefulSoftwareCo/executor/commit/cc0fd8f6099f3d05c73a285ef14932c01ac212fa), [`85cf428`](https://github.com/UsefulSoftwareCo/executor/commit/85cf428905bbd73257fb3c3be5c89e762bf79377), [`38a7725`](https://github.com/UsefulSoftwareCo/executor/commit/38a7725876bcc9c8adeea9c7efbd190c121d3b86), [`3fd28a5`](https://github.com/UsefulSoftwareCo/executor/commit/3fd28a51fabb0fc96d0bf83408021e7cbca70bfe), [`929b233`](https://github.com/UsefulSoftwareCo/executor/commit/929b2338f225b3f80190ac7a6fe1f2473650c58c)]:
+  - @executor-js/execution@1.6.9
+  - @executor-js/sdk@1.6.9
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.71
+
+### Patch Changes
+
+- [#1919](https://github.com/UsefulSoftwareCo/executor/pull/1919) [`caa0391`](https://github.com/UsefulSoftwareCo/executor/commit/caa03919a8f2a5c82ed13bc4ea9060e964af3a79) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - **Workspace writes now require an administrator**
+
+  Executor bindings accept `orgWrites: "allowed" | "denied" | "request"`.
+  Request-aware hosts use `"request"` and bind `CurrentOrgWriteAccess` from the
+  authenticated principal for each request. An approval, decline, cancellation,
+  or form response also rebinds the paused execution to the resumer's current
+  access. Browser approvals derive access from the authenticated browser user's
+  live organization membership when that user posts the decision, rather than
+  from the earlier MCP request waiting for it or the user's global role. Self-host
+  uses the same Better Auth membership lookup for ordinary requests and browser
+  decisions. A demotion before either kind of resume therefore takes effect
+  before the paused execution can reach a workspace-write sink.
+
+  `Principal` now declares its role model explicitly: organization-backed hosts
+  carry `orgRoleModel: "organization"` and an optional normalized admin/member
+  role, while hosts without roles carry `orgRoleModel: "none"` and cannot also
+  carry an organization role. Missing role data under the organization model
+  fails closed, including legacy persisted MCP session metadata. Cloud derives
+  roles from WorkOS memberships and self-host derives them from Better Auth.
+
+  Members may still read and execute shared workspace resources and perform
+  operational maintenance such as token refresh and tool-catalog synchronization.
+  User-requested workspace mutations now return `OrgWriteDeniedError` (HTTP 403):
+  workspace connections and reconnects, organization OAuth clients and connect
+  flows, tool policies, and integration add/update/replace/remove/health-check
+  operations. Personal connection management remains available.
+
+  Pasted connection credentials, OAuth client secrets, OAuth connection tokens,
+  and dependent tool discovery run only after the outermost transaction commits
+  their row, including when a plugin wraps creation in `ctx.transaction`. Each
+  committed row records unique provider item references owned by that write
+  attempt. Reads resolve only those recorded references, so the post-commit
+  window fails closed with a retryable incomplete-write error and can never
+  resolve a predecessor's credential. A process crash leaves detectable missing
+  references; a later executor incarnation can atomically replace and retry a
+  stranded pasted connection, while OAuth client and connection retries replace
+  their rows through their existing update paths.
+
+  If credential persistence fails while the process remains alive, row and
+  provider compensation restore the prior state where possible and surface
+  incomplete cleanup explicitly. Best-effort cleanup can leave inert orphaned
+  attempt items, but an attempt never shares an item reference with a successor,
+  eliminating the former successor-clobber interval without requiring provider
+  compare-and-set support.
+
+- Updated dependencies [[`31a8042`](https://github.com/UsefulSoftwareCo/executor/commit/31a8042450475fd86ea580f4dbd5dcc3c290c008), [`b5271a6`](https://github.com/UsefulSoftwareCo/executor/commit/b5271a6f0cb6d0c42a6b9fbcdffe70fc2aad8bc6), [`caa0391`](https://github.com/UsefulSoftwareCo/executor/commit/caa03919a8f2a5c82ed13bc4ea9060e964af3a79)]:
+  - @executor-js/sdk@1.6.8
+  - @executor-js/execution@1.6.8
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.70
+
+### Patch Changes
+
+- Updated dependencies [[`98d6c6a`](https://github.com/UsefulSoftwareCo/executor/commit/98d6c6ad3272fca371fc2d8b14b2e332100d8322)]:
+  - @executor-js/sdk@1.6.7
+  - @executor-js/execution@1.6.7
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.69
+
+### Patch Changes
+
+- Updated dependencies [[`21119da`](https://github.com/UsefulSoftwareCo/executor/commit/21119da662d2d225b033b3532e1f17d97311a39d)]:
+  - @executor-js/execution@1.6.6
+  - @executor-js/host-mcp@1.4.4
+  - @executor-js/sdk@1.6.6
+
+## 1.4.68
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.5
+  - @executor-js/execution@1.6.5
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.67
+
+### Patch Changes
+
+- Updated dependencies [[`ffcfbc0`](https://github.com/UsefulSoftwareCo/executor/commit/ffcfbc0de27d0ae55215839fb70395b0b7d9a65c), [`10e16a5`](https://github.com/UsefulSoftwareCo/executor/commit/10e16a5baa2648657b70038e7d11429c58e4d242), [`515d6aa`](https://github.com/UsefulSoftwareCo/executor/commit/515d6aa391a04a3579a7b10f974ec316a563cf7a), [`06bf742`](https://github.com/UsefulSoftwareCo/executor/commit/06bf74254f3432e8d75fd8b493ef7a435ea4bc84)]:
+  - @executor-js/sdk@1.6.4
+  - @executor-js/execution@1.6.4
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.66
+
+### Patch Changes
+
+- Updated dependencies [[`c1f51b7`](https://github.com/UsefulSoftwareCo/executor/commit/c1f51b7f96328b795669bb3d241667660dc2b060), [`02b52cd`](https://github.com/UsefulSoftwareCo/executor/commit/02b52cd01b09d3601ffe88d1f9c0b777f26e76ae)]:
+  - @executor-js/sdk@1.6.3
+  - @executor-js/execution@1.6.3
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.65
+
+### Patch Changes
+
+- Updated dependencies []:
+  - @executor-js/sdk@1.6.2
+  - @executor-js/execution@1.6.2
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.64
+
+### Patch Changes
+
+- [#1784](https://github.com/UsefulSoftwareCo/executor/pull/1784) [`55180cb`](https://github.com/UsefulSoftwareCo/executor/commit/55180cb1487f9a3a28ddc0ee0bedfab8464c1f72) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Build `StorageError.message` from the call-site label plus the driver's error code instead of the driver's raw text. The driver text is drizzle's `Failed query: <sql>\nparams: <bound values>`, so error reporting grouped one storage defect by statement shape and printed bound parameters into issue titles. The full driver error stays on `cause`.
+
+  Add `StorageConnectionError`, a `StorageFailure` variant for postgres.js connection faults (`CONNECTION_ENDED`, `CONNECTION_CLOSED`, `CONNECTION_DESTROYED`, `CONNECT_TIMEOUT`, `ECONNREFUSED`, `ECONNRESET`) and workerd's cross-request I/O rejection. It carries the fault `code` and a `retryable` flag so a lost socket can be told apart from a pool-lifetime bug.
+
+- Updated dependencies [[`62748e8`](https://github.com/UsefulSoftwareCo/executor/commit/62748e86122b747226c76c2e112c5c4d2b4f7095), [`d4afe0c`](https://github.com/UsefulSoftwareCo/executor/commit/d4afe0c79f146dd169a00988a2d5d0469297be19), [`55180cb`](https://github.com/UsefulSoftwareCo/executor/commit/55180cb1487f9a3a28ddc0ee0bedfab8464c1f72)]:
+  - @executor-js/execution@1.6.1
+  - @executor-js/sdk@1.6.1
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.63
+
+### Patch Changes
+
+- Updated dependencies [[`a2d1417`](https://github.com/UsefulSoftwareCo/executor/commit/a2d141758e478274813c8c24d354e1fd0f66af49)]:
+  - @executor-js/sdk@1.6.0
+  - @executor-js/execution@1.6.0
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.62
+
+### Patch Changes
+
+- Updated dependencies [[`d3f0617`](https://github.com/UsefulSoftwareCo/executor/commit/d3f0617deec06c57e0d6e1479fe668f79daf977d)]:
+  - @executor-js/sdk@1.5.42
+  - @executor-js/execution@1.5.42
+  - @executor-js/host-mcp@1.4.4
+
+## 1.4.61
+
+### Patch Changes
+
+- Updated dependencies [[`d572658`](https://github.com/UsefulSoftwareCo/executor/commit/d572658d74097917412256f10a3ea2e3974f44dd)]:
+  - @executor-js/sdk@1.5.41
+  - @executor-js/execution@1.5.41
+  - @executor-js/host-mcp@1.4.4
+
 ## 1.4.60
 
 ### Patch Changes

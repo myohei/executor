@@ -56,6 +56,8 @@ const makeStubEngine = <E extends Cause.YieldableError = never>(overrides: {
   pausedExecutionCount: () => Effect.succeed(0),
   hasPausedExecutions: () => Effect.succeed(false),
   getDescription: Effect.succeed(overrides.description ?? "test executor"),
+  // The fake forks nothing, so there is no sandbox fiber to end.
+  shutdown: Effect.void,
 });
 
 type TestServerConfig<E extends Cause.YieldableError> = Pick<
@@ -195,9 +197,11 @@ const toolFile = (input: {
 /** Build an engine whose execute triggers one elicitation and returns the handler's result. */
 const makeElicitingEngine = (
   request: FormElicitation | UrlElicitation,
-  formatResult: (response: { action: string; content?: Record<string, unknown> }) => unknown = (
-    r,
-  ) => r.action,
+  formatResult: (response: {
+    action: string;
+    content?: Record<string, unknown>;
+    meta?: { readonly persist?: string };
+  }) => unknown = (r) => r.action,
 ): ExecutionEngine =>
   makeStubEngine({
     execute: (_code, { onElicitation }) =>
@@ -1037,12 +1041,15 @@ describe("MCP host server — native form-only elicitation", () => {
 // ---------------------------------------------------------------------------
 
 describe("MCP host server — client without elicitation (pause/resume)", () => {
-  it("completed execution returns result directly", async () => {
+  it("completed execution returns result and connected-tool metadata directly", async () => {
     const engine = makeStubEngine({
       executeWithPause: () =>
         Effect.succeed({
           status: "completed",
-          result: { result: "done" },
+          result: {
+            result: "done",
+            toolPaths: ["linear.org.work.issues.list"],
+          },
         }),
     });
 
@@ -1052,6 +1059,10 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
         arguments: { code: "ok" },
       });
       expect(result.content).toEqual([{ type: "text", text: "done" }]);
+      expect(result.structuredContent).toMatchObject({
+        status: "completed",
+        toolName: "linear.org.work.issues.list",
+      });
       expect(result.isError).toBeFalsy();
     });
   });
@@ -1109,9 +1120,18 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
   });
 
   it("browser approval mode consumes a user-approved response and returns the resumed result", async () => {
-    const approved = new Map<string, { action: "accept"; content?: Record<string, unknown> }>();
+    const approved = new Map<
+      string,
+      {
+        response: { action: "accept"; content?: Record<string, unknown> };
+        orgWriteAccess: "allowed";
+      }
+    >();
     const waiter = await Effect.runPromise(
-      Deferred.make<{ action: "accept"; content?: Record<string, unknown> }>(),
+      Deferred.make<{
+        response: { action: "accept"; content?: Record<string, unknown> };
+        orgWriteAccess: "allowed";
+      }>(),
     );
     const engine = makeStubEngine({
       resume: (executionId, response) =>
@@ -1130,9 +1150,12 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
           name: "resume",
           arguments: { executionId: "exec_1" },
         });
-        const response = { action: "accept" as const, content: {} };
-        approved.set("exec_1", response);
-        await Effect.runPromise(Deferred.succeed(waiter, response));
+        const decision = {
+          response: { action: "accept" as const, content: {} },
+          orgWriteAccess: "allowed" as const,
+        };
+        approved.set("exec_1", decision);
+        await Effect.runPromise(Deferred.succeed(waiter, decision));
         const resumed = await waiting;
         expect(resumed.content).toEqual([{ type: "text", text: "resumed-after-browser" }]);
         expect(resumed.structuredContent).toMatchObject({
@@ -1640,6 +1663,88 @@ describe("MCP host server — client without elicitation (pause/resume)", () => 
 });
 
 // ---------------------------------------------------------------------------
+// Approval terms — the request's ride out as `_meta`, the answer's ride back
+// ---------------------------------------------------------------------------
+
+describe("MCP host server — approval terms", () => {
+  const appApproval = FormElicitation.make({
+    message: 'Allow Computer Use to use "Finder"?',
+    requestedSchema: {},
+    meta: { persist: ["session", "always"], connector_name: "Computer Use" },
+  });
+
+  // The engine hands the response back as the execution's result, so the
+  // structured output carries it verbatim.
+  const responseOf = (structuredContent: unknown): unknown =>
+    (structuredContent as { readonly result: unknown }).result;
+
+  it("native mode shows the client the offered scopes and returns the one it chose", async () => {
+    const engine = makeElicitingEngine(appApproval, (r) => r);
+    let seen: unknown;
+
+    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
+      client.setRequestHandler(ElicitRequestSchema, async (request) => {
+        seen = request.params._meta;
+        return { action: "accept" as const, content: {}, _meta: { persist: "always" } };
+      });
+
+      const result = await client.callTool({ name: "execute", arguments: { code: "finder" } });
+      expect(seen).toEqual({ persist: ["session", "always"], connector_name: "Computer Use" });
+      expect(responseOf(result.structuredContent)).toEqual({
+        action: "accept",
+        content: {},
+        meta: { persist: "always" },
+      });
+    });
+  });
+
+  it("native mode invents no terms when the client states none", async () => {
+    const engine = makeElicitingEngine(appApproval, (r) => r);
+
+    await withNativeClient(engine, ELICITATION_CAPS, async (client) => {
+      client.setRequestHandler(ElicitRequestSchema, async () => ({
+        action: "accept" as const,
+        content: {},
+      }));
+
+      const result = await client.callTool({ name: "execute", arguments: { code: "finder" } });
+      expect(responseOf(result.structuredContent)).toEqual({ action: "accept", content: {} });
+    });
+  });
+
+  it("model mode passes the resume tool's persist choice to the engine", async () => {
+    const received: unknown[] = [];
+    const engine = makeStubEngine({
+      resume: (_id, response) =>
+        Effect.sync(() => {
+          received.push(response);
+          return { status: "completed", result: { result: "ok" } };
+        }),
+    });
+
+    await withClient(
+      engine,
+      NO_CAPS,
+      async (client) => {
+        await client.callTool({
+          name: "resume",
+          arguments: { executionId: "exec_1", action: "accept", persist: "session" },
+        });
+        await client.callTool({
+          name: "resume",
+          arguments: { executionId: "exec_2", action: "accept" },
+        });
+        expect(received).toEqual([
+          { action: "accept", content: undefined, meta: { persist: "session" } },
+          { action: "accept", content: undefined },
+        ]);
+      },
+      { elicitationMode: { mode: "model" } },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Elicitation error handling
 // ---------------------------------------------------------------------------
 
@@ -1807,6 +1912,19 @@ describe("MCP host server — skills tool", () => {
     });
   });
 
+  // pi and other hosts that ship no skill tool of their own read
+  // `executor_skills` as the general skill reader they are missing, so the
+  // description has to scope itself to this server before a model tries to
+  // read a SKILL.md through it.
+  it("scopes the skills tool description to this server's own docs", async () => {
+    await withClient(makeStubEngine({}), NO_CAPS, async (client) => {
+      const { tools } = await client.listTools();
+      const description = tools.find((t) => t.name === "skills")?.description ?? "";
+      expect(description).toContain("Not a general skill reader");
+      expect(description).toContain("SKILL.md");
+    });
+  });
+
   it("returns the execute skill body by name", async () => {
     await withClient(makeStubEngine({}), NO_CAPS, async (client) => {
       const result = await client.callTool({
@@ -1866,6 +1984,9 @@ describe("MCP host server — skills tool", () => {
       });
       expect(result.isError).toBe(true);
       expect(textOf(result)).toContain('No skill named "nope"');
+      // The miss is where a model that asked for an outside skill lands, so the
+      // note names the boundary instead of only reporting the bad name.
+      expect(textOf(result)).toContain("only Executor's own docs");
       expect(textOf(result)).toContain("`execute`");
       expect(result.structuredContent).toBeUndefined();
     });
@@ -1949,9 +2070,74 @@ describe("MCP host server — hang-visibility tracing", () => {
       {
         elicitationMode: { mode: "browser", approvalUrl: (id) => `/approve/${id}` },
         browserApprovalStore: {
-          takeResponse: () => Effect.succeed({ action: "accept" as const }),
+          takeResponse: () =>
+            Effect.succeed({
+              response: { action: "accept" as const },
+              orgWriteAccess: "allowed" as const,
+            }),
         },
       },
     );
+  });
+});
+
+// Pins that formatting a completed execution for MCP walks the result value
+// exactly once (`formatExecuteResult`'s pretty print), with or without emit()
+// output — the with-output and without-output branches are alternatives, never
+// stacked. A `toJSON` probe counts full `JSON.stringify` walks of the value.
+describe("formatMcpExecutionOutcome serialization cost", () => {
+  const instrumented = () => {
+    let walks = 0;
+    const probe = {
+      toJSON: () => {
+        walks += 1;
+        return "probe";
+      },
+    };
+    return { value: { data: [1, 2, 3], probe }, walks: () => walks };
+  };
+
+  it("stringifies the result value once for a plain completed outcome", () => {
+    const fixture = instrumented();
+    const outcome: ExecutionResult = {
+      status: "completed",
+      result: { result: fixture.value, logs: [] },
+    };
+
+    const result = formatMcpExecutionOutcome(outcome);
+
+    expect(fixture.walks()).toBe(1);
+    const first = result.content[0];
+    expectDefined(first);
+    expect(first).toEqual({
+      type: "text",
+      text: JSON.stringify(fixture.value, null, 2),
+    });
+    expectDefined(result.structuredContent);
+    expect(result.structuredContent["result"]).toBe(fixture.value);
+    // The identity probe above walked the value once more; discount it.
+    expect(fixture.walks()).toBe(2);
+  });
+
+  it("stringifies the result value once when emit() output is present", () => {
+    const fixture = instrumented();
+    const outcome: ExecutionResult = {
+      status: "completed",
+      result: {
+        result: fixture.value,
+        logs: [],
+        output: [{ type: "content", content: { type: "text", text: "emitted" } }],
+      },
+    };
+
+    const result = formatMcpExecutionOutcome(outcome);
+
+    expect(fixture.walks()).toBe(1);
+    expect(result.content[0]).toEqual({ type: "text", text: "emitted" });
+    const returned = result.content[1];
+    expectDefined(returned);
+    expect(returned.type).toBe("text");
+    if (returned.type !== "text") return;
+    expect(returned.text).toContain('"data"');
   });
 });

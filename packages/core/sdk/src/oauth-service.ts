@@ -14,13 +14,25 @@
 // redeems the session, exchanges the code, and mints the connection.
 // ---------------------------------------------------------------------------
 
-import { Duration, Effect, Layer, Option, Schema } from "effect";
+import { Cause, Duration, Effect, Exit, Layer, Match, Option, Predicate, Schema } from "effect";
 import { FetchHttpClient, type HttpClient } from "effect/unstable/http";
 
 import { connectionIdentifier } from "./connection-name-identifier";
 import type { Connection } from "./connection";
+import type { OrgWriteDeniedError } from "./errors";
 import type { IFumaClient, StorageFailure } from "./fuma-runtime";
-import { StorageError } from "./fuma-runtime";
+import {
+  afterCommit,
+  afterCommitRequired,
+  CredentialWriteIncompleteError,
+  StorageError,
+} from "./fuma-runtime";
+import {
+  credentialAttemptItemId,
+  makeCredentialWriteAttempt,
+  parseCredentialWriteAttempt,
+  type CredentialWriteAttempt,
+} from "./credential-item-reference";
 import {
   AuthTemplateSlug,
   ConnectionName,
@@ -31,25 +43,40 @@ import {
   ProviderItemId,
 } from "./ids";
 import {
+  DEFAULT_SUBJECT_TOKEN_TYPE,
   OAuthCompleteError,
   OAuthProbeError,
   OAuthRegisterDynamicError,
   OAuthSessionNotFoundError,
   OAuthStartError,
+  firstPartyOAuthClientAllowsScopes,
+  firstPartyOAuthClientSlug,
+  isFirstPartyOAuthClientSlug,
+  parseStoredTokenEndpointAuthMethod,
   type ConnectResult,
   type CreateOAuthClientInput,
+  type EnterpriseManagedStartInput,
+  type FirstPartyOAuthClientConfig,
   type OAuthClientOrigin,
   type OAuthClientSummary,
   type OAuthCompleteInput,
+  type OAuthCompleteOptions,
   type OAuthGrant,
   type OAuthProbeInput,
   type OAuthProbeResult,
   type OAuthService,
   type OAuthStartInput,
   type RegisterDynamicClientInput,
+  type SubjectTokenType,
+  type TokenEndpointAuthMethod,
 } from "./oauth-client";
 import type { OwnerBinding } from "./plugin";
 import type { CredentialProvider } from "./provider";
+import {
+  restoreCredentialSnapshotsWithRecheck,
+  snapshotCredentialWrites,
+  type CredentialWriteSnapshot,
+} from "./credential-compensation";
 import {
   discoverAuthorizationServerMetadata,
   discoverProtectedResourceMetadata,
@@ -57,6 +84,17 @@ import {
   registerDynamicClient as registerDynamicClientDcr,
   type OAuthAuthorizationServerMetadata,
 } from "./oauth-discovery";
+import {
+  ENTERPRISE_MANAGED_ROLLOUT_ENABLED,
+  runEnterpriseManagedAuthorization,
+  type EnterpriseManagedConnectionState,
+  type EnterpriseManagedGrant,
+  type EnterpriseManagedMintError,
+  type EnterpriseManagedRollout,
+  type EnterpriseManagedRolloutContext,
+  type EnterpriseManagedRolloutDecision,
+  type EnterpriseManagedRolloutEvent,
+} from "./oauth-ema";
 import {
   assertSupportedOAuthEndpointUrl,
   buildAuthorizationUrl,
@@ -91,6 +129,12 @@ export interface MintOAuthConnectionInput {
   /** Credential provider key + item id the access token is stored under. */
   readonly provider: string;
   readonly itemId: string;
+  /** Credential material to persist only after the row transaction commits.
+   * Values remain internal to the executor/provider boundary. */
+  readonly credentialValues: readonly {
+    readonly itemId: string;
+    readonly value: string;
+  }[];
   readonly oauthClient: OAuthClientSlug;
   /** The owner of `oauthClient` (persisted so refresh loads it by explicit owner). */
   readonly oauthClientOwner: Owner;
@@ -98,20 +142,79 @@ export interface MintOAuthConnectionInput {
   readonly expiresAt: number | null;
   readonly oauthScope: string | null;
   readonly missingOAuthScopes?: readonly string[];
+  /** Enterprise-managed authorization wiring, for connections minted through
+   *  the ID-JAG grant profile. Persisted on the connection so token renewal can
+   *  re-run the exchange without the user. Omitted for every other grant. */
+  readonly enterpriseManaged?: EnterpriseManagedConnectionState;
   /** Per-connection override for the token endpoint, persisted only when the
    *  code was redeemed at a region other than the client's configured token
    *  host (Datadog multi-site). Null means refresh uses the client's token URL. */
   readonly oauthTokenUrl?: string | null;
+  /** Whether connection tool discovery must finish before the mint returns.
+   *  Interactive authorization-code callbacks persist the fresh grant first,
+   *  then synchronize the remote catalog in host-kept background work so a
+   *  slow MCP server cannot strand the browser popup. Non-interactive grants
+   *  keep the explicit behavior because their caller has no callback window. */
+  readonly toolSync?: "explicit" | "background";
 }
+
+/** Project an enterprise-managed mint failure onto the connect boundary,
+ *  KEEPING the taxonomy structural. `EmaPolicyDenied` is the one verdict a
+ *  console must treat differently from every other start failure: it means the
+ *  administrator declined, so re-authenticating cannot help and the ordinary
+ *  per-server flow must not be offered as a way around it. That decision has to
+ *  be readable as a field — a UI cannot branch on a sentence. */
+const startErrorFromEnterpriseManaged = (cause: EnterpriseManagedMintError): OAuthStartError => {
+  const rendered = (failure: EnterpriseManagedMintError): string =>
+    // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: every EMA error declares `message` as a getter over its own typed fields, so this is a projection of a typed failure, not a read off an unknown throwable
+    failure.message;
+  return Match.value(cause).pipe(
+    Match.tag(
+      "EmaPolicyDenied",
+      (denied) =>
+        new OAuthStartError({
+          message: rendered(denied),
+          blockedByAdmin: true,
+          oauthErrorCode: denied.error,
+        }),
+    ),
+    Match.tag(
+      "EmaRedemptionRejected",
+      (rejected) =>
+        new OAuthStartError({
+          message: rendered(rejected),
+          ...(rejected.error === undefined ? {} : { oauthErrorCode: rejected.error }),
+        }),
+    ),
+    Match.tag(
+      "EmaSubjectTokenRejected",
+      "EmaUpstreamUnavailable",
+      (failure) => new OAuthStartError({ message: rendered(failure) }),
+    ),
+    Match.exhaustive,
+  );
+};
 
 /** The OAuth scope policy for a `(integration, template)`. Either the
  *  integration declares the scopes to request (`scopes`, possibly empty — an
  *  empty set requests no scopes), or it declares none and the request scopes
  *  are discovered from the server's metadata at connect (`discover`, used by
- *  MCP). The two are mutually exclusive by construction. */
+ *  MCP). The two are mutually exclusive by construction.
+ *
+ *  `discover` carries the integration's own discovery URL (the MCP endpoint)
+ *  so scope discovery does not depend on the CLIENT having a persisted RFC
+ *  8707 resource: a user may clear the client's resource (Entra v2 rejects
+ *  the parameter, #1789) without losing scope discovery. */
 export type OAuthScopePolicy =
-  | { readonly kind: "scopes"; readonly scopes: readonly string[] }
-  | { readonly kind: "discover" };
+  | {
+      readonly kind: "scopes";
+      readonly scopes: readonly string[];
+      /** Provider-specific scopes declared on the integration's authorization
+       *  endpoint (HubSpot `optional_scope`). These must not also be sent in
+       *  the RFC `scope` parameter. */
+      readonly optionalScopes?: readonly string[];
+    }
+  | { readonly kind: "discover"; readonly discoveryUrl: string };
 
 /** Everything the OAuth service needs from the executor: fuma access for the
  *  owned `oauth_client` / `oauth_session` tables, the default credential
@@ -122,16 +225,27 @@ export interface OAuthServiceDeps {
   readonly owner: OwnerBinding;
   readonly tenant: string;
   readonly subject: string | null;
+  /** Executor incarnation recorded beside attempt-owned provider references. */
+  readonly credentialWriteRuntimeId: string;
   readonly ownedKeys: (owner: Owner) => {
     readonly tenant: string;
     readonly owner: Owner;
     readonly subject: string;
   };
+  /** Workspace-settings gate from the executor binding
+   *  (`ExecutorConfig.orgWrites`): refuses `owner: "org"` targets on the
+   *  user-intent client/connect surfaces. */
+  readonly guardOrgWrite: (owner: Owner) => Effect.Effect<void, OrgWriteDeniedError>;
   readonly defaultWritableProvider: () => CredentialProvider | null;
   /** Write the connection row with OAuth lifecycle fields + produce its tools. */
   readonly mintOAuthConnection: (
     input: MintOAuthConnectionInput,
   ) => Effect.Effect<Connection, StorageFailure>;
+  /** Whether `slug` is in the tenant's integration catalog. `start` refuses a
+   *  flow for a missing integration up front — otherwise the user authorizes
+   *  at the provider and only the mint at `complete` discovers there is
+   *  nothing to mint against (the reconnect-an-orphan failure). */
+  readonly integrationExists: (slug: IntegrationSlug) => Effect.Effect<boolean, StorageFailure>;
   /** Whether a connection row exists under `(owner, integration, name)`: the
    *  raw row, not the policy-filtered list, so `start` can resolve a free
    *  name for `newConnection` flows against what is actually stored. */
@@ -146,10 +260,12 @@ export interface OAuthServiceDeps {
    *    DECLARES (e.g. an OpenAPI bundle's authentication-template scope union),
    *    NOT the scopes frozen on a specific `oauth_client` row. These are
    *    requested verbatim at connect (`start`); an empty set requests none.
-   *  - `{ kind: "discover" }`: the integration declares no scopes, so `start`
-   *    discovers the request scopes from the server's RFC 9728 / RFC 8414
-   *    metadata. Used by server-targeting integrations (MCP) whose scopes live
-   *    on the server rather than in a template.
+   *  - `{ kind: "discover", discoveryUrl }`: the integration declares no
+   *    scopes, so `start` discovers the request scopes from the server's RFC
+   *    9728 / RFC 8414 metadata. Used by server-targeting integrations (MCP)
+   *    whose scopes live on the server rather than in a template.
+   *    `discoveryUrl` is the integration's protected-resource URL (the MCP
+   *    endpoint), used when the client persists no resource.
    */
   readonly resolveOAuthScopePolicy: (
     integration: IntegrationSlug,
@@ -158,6 +274,18 @@ export interface OAuthServiceDeps {
   readonly httpClientLayer?: Layer.Layer<HttpClient.HttpClient>;
   readonly fetch?: typeof globalThis.fetch;
   readonly endpointUrlPolicy?: OAuthEndpointUrlPolicy;
+  /**
+   * Host-owned rollout gate for enterprise-managed authorization (see
+   * {@link EnterpriseManagedRollout}). Consulted ONCE per `id_jag` connect,
+   * before discovery, and never again — not after the IdP has ruled, and not on
+   * the credential-refresh path, which follows the state persisted on the
+   * connection instead.
+   *
+   * OMITTED means enterprise-managed authorization is attempted, which is what
+   * every host did before this seam existed. Only a host that actually operates
+   * a flag service supplies one; core takes no dependency on any.
+   */
+  readonly enterpriseManagedRollout?: EnterpriseManagedRollout;
   /**
    * The OAuth callback URL (`${webBaseUrl}${mountPrefix}/oauth/callback`) the host
    * serves and sends to providers on every authorization request + DCR registration.
@@ -174,6 +302,12 @@ export interface OAuthServiceDeps {
   readonly redirectUri: string | null;
   /** URL selected organization slug to round-trip through OAuth `state`. */
   readonly callbackStateOrgSlug?: string | null;
+  /** Host-operated apps declared at composition time (`first-party:<name>`
+   *  slugs). Resolved from config, never from storage: `loadClient` intercepts
+   *  the prefix ahead of the DB, `listClients` appends their summaries, and the
+   *  client CRUD surface rejects the namespace. Empty/omitted on hosts that
+   *  ship no first-party apps. */
+  readonly firstPartyClients?: readonly FirstPartyOAuthClientConfig[];
 }
 
 type LooseDb = {
@@ -192,6 +326,34 @@ const looseDb = (db: unknown): LooseDb => db as LooseDb;
 const accessItemId = (owner: Owner, integration: IntegrationSlug, name: ConnectionName): string =>
   `oauth:${owner}:${integration}:${name}`;
 const refreshItemIdFor = (accessId: string): string => `${accessId}:refresh`;
+
+/** The item a refresh writes to prove the credential store will ACCEPT a write,
+ *  before the grant spends the single-use refresh token. It holds no credential
+ *  and never has.
+ *
+ *  It has to be its own item. The cheaper-looking probe — rewriting the refresh
+ *  token with the value just read — is a read-then-write with no
+ *  compare-and-set, and two refreshers of one connection on different instances
+ *  lose the newer token to it: A reads R0, B consumes R0 and stores the rotated
+ *  R1, then A's probe puts R0 back over R1 and the connection is dead the next
+ *  time anything needs it. The in-memory single-flight gate spans one instance
+ *  only, and a backing store whose own write path is read-latest-then-write
+ *  cannot catch it either.
+ *
+ *  The id is the refresh item's id plus a fixed suffix, rather than one
+ *  rebuilt from the connection's parts, so it carries the same prefix and
+ *  therefore the same embedded owner — the same store partition, the same
+ *  encryption context, the same object-name head. A store that would refuse
+ *  the refresh token's write refuses this one. Per connection rather than one
+ *  per partition, so the only writers that can contend on it are the
+ *  concurrent refreshers of a single connection, and they all write the same
+ *  constant. */
+export const storeWritabilityProbeItemIdFor = (refreshItemId: string): string =>
+  `${refreshItemId}:store-probe`;
+
+/** What the writability probe stores. A constant, because the item exists to
+ *  prove a write lands and carries no information of its own. */
+export const STORE_WRITABILITY_PROBE_VALUE = "writable";
 
 /** Order-preserving de-duplication of a scope list. */
 const dedupeScopes = (scopes: readonly string[]): readonly string[] => [...new Set(scopes)];
@@ -299,7 +461,9 @@ const clientOwnerFromPayload = (payload: unknown): Owner | null => {
  *  `authorization_code`; an unknown grant means a corrupt row and callers that
  *  drive token exchange (`loadClient`) must fail loudly rather than guessing. */
 const parseGrant = (grant: unknown): OAuthGrant | null =>
-  grant === "client_credentials" || grant === "authorization_code" ? grant : null;
+  grant === "client_credentials" || grant === "authorization_code" || grant === "id_jag"
+    ? grant
+    : null;
 
 const canonicalDcrIssuer = (
   issuer: string | null | undefined,
@@ -402,7 +566,26 @@ interface LoadedOAuthClient {
   /** Resolved literal secret (read from the provider via the stored item id). */
   readonly clientSecret: string;
   readonly resource: string | null;
+  readonly tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
+  readonly tokenRequestFormat?: "form" | "json";
 }
+
+/** Provider lifecycle scopes that are required to keep an authorization-code
+ *  connection renewable but are omitted from the protected resource's API
+ *  scope list. Vercel's MCP resource advertises only `openid`, while its
+ *  authorization server issues a refresh token only when `offline_access` is
+ *  requested. Keep the exception bound to Vercel's exact official authorize
+ *  endpoint so an unrelated OAuth server never receives a broader request. */
+const additionalAuthorizationLifecycleScopes = (client: {
+  readonly authorizationUrl: string;
+}): readonly string[] => {
+  if (!URL.canParse(client.authorizationUrl)) return [];
+  const authorization = new URL(client.authorizationUrl);
+  return authorization.origin === "https://vercel.com" &&
+    authorization.pathname === "/oauth/authorize"
+    ? ["offline_access"]
+    : [];
+};
 
 /** Where an OAuth app's client secret is stored in the default writable
  *  provider — derived solely from the app's (owner, slug) identity. */
@@ -490,13 +673,89 @@ const validateClientEndpoints = (
     }
   });
 
+/** Resolve a config-declared first-party app to the loaded-client shape the
+ *  flow/refresh paths consume. First-party apps are authorization_code only:
+ *  client_credentials mints machine tokens under the OPERATOR's app identity,
+ *  which must never be shared across tenants. */
+export const loadedFirstPartyClient = (
+  config: FirstPartyOAuthClientConfig,
+): {
+  readonly slug: string;
+  readonly authorizationUrl: string;
+  readonly tokenUrl: string;
+  readonly grant: OAuthGrant;
+  readonly clientId: string;
+  readonly clientSecret: string;
+  readonly resource: string | null;
+  readonly tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
+  readonly tokenRequestFormat?: "form" | "json";
+} => ({
+  slug: String(firstPartyOAuthClientSlug(config.name)),
+  authorizationUrl: config.authorizationUrl,
+  tokenUrl: config.tokenUrl,
+  grant: "authorization_code",
+  clientId: config.clientId,
+  clientSecret: config.clientSecret,
+  resource: config.resource ?? null,
+  ...(config.tokenEndpointAuthMethod === undefined
+    ? {}
+    : { tokenEndpointAuthMethod: config.tokenEndpointAuthMethod }),
+  ...(config.tokenRequestFormat === undefined
+    ? {}
+    : { tokenRequestFormat: config.tokenRequestFormat }),
+});
+
 export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   const httpClientLayer = deps.httpClientLayer ?? FetchHttpClient.layer;
   const fetch = deps.fetch;
+  // Config-declared first-party apps, keyed by their prefixed slug. Config is
+  // the source of truth — no row exists, so every stored-row path (CRUD, GC)
+  // is bypassed by construction, and rotating a secret is an env change.
+  const firstPartyBySlug = new Map(
+    (deps.firstPartyClients ?? []).map((client) => [
+      String(firstPartyOAuthClientSlug(client.name)),
+      client,
+    ]),
+  );
   // EXPLICIT — no localhost default. `null` means this executor has no OAuth
   // callback; redirect-requiring flows fail loudly via `requireRedirectUri`.
   const redirectUri = deps.redirectUri;
   const discoveryOptions = { endpointUrlPolicy: deps.endpointUrlPolicy };
+
+  // -------------------------------------------------------------------------
+  // Enterprise-managed rollout seam.
+  //
+  // ROLLOUT SEMANTIC, stated once here because it is the whole reason the gate
+  // sits where it does: the gate answers "may this connect attempt the
+  // enterprise-managed path", and nothing else. It runs once, before discovery,
+  // so a withheld verdict costs no round trip and spends no identity assertion.
+  // The verdict it produces is then FROZEN onto the connection
+  // (`ENTERPRISE_MANAGED_PROVIDER_STATE_KEY`), and the credential-refresh path
+  // reads that state instead of re-asking. Turning the flag off therefore stops
+  // new enterprise-managed connects and leaves every existing one renewing — no
+  // stranded connections, no silent downgrade, and no third-party network
+  // dependency anywhere in credential resolution.
+  // -------------------------------------------------------------------------
+  const rollout = deps.enterpriseManagedRollout;
+
+  /** The gate's verdict, or "enabled" when no host injected a gate. */
+  const decideEnterpriseManagedRollout = (
+    context: EnterpriseManagedRolloutContext,
+  ): Effect.Effect<EnterpriseManagedRolloutDecision> =>
+    rollout === undefined
+      ? Effect.succeed(ENTERPRISE_MANAGED_ROLLOUT_ENABLED)
+      : rollout.decide(context);
+
+  /** Best-effort rollout observation. Failures AND defects are discarded here,
+   *  so no implementation of `record` can fail a connect or change its outcome;
+   *  keeping it off the critical path is the host's side of the contract.
+   *  Mirrors how `afterCommit` treats `onIntegrationChange`. */
+  const recordEnterpriseManagedRollout = (
+    event: EnterpriseManagedRolloutEvent,
+  ): Effect.Effect<void> =>
+    rollout === undefined
+      ? Effect.void
+      : rollout.record(event).pipe(Effect.ignoreCause({ log: false }));
 
   const filterAuthorizationCodeScopes = (
     client: LoadedOAuthClient,
@@ -523,9 +782,73 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // Caps on server-controlled discovery input — a hostile or buggy server must
   // not be able to hang `oauth.start` or overflow the authorize URL.
   const MAX_DISCOVERY_AUTH_SERVERS = 3; // AS-failover lists are tiny in practice
-  const MAX_DISCOVERED_SCOPES = 100; // far beyond any realistic authorization template
-  const capScopes = (scopes: readonly string[]): readonly string[] =>
-    dedupeScopes(scopes).slice(0, MAX_DISCOVERED_SCOPES);
+  // The cap is on the encoded `scope` parameter's length, not the scope
+  // count: the URL is what overflows, and a real resource can legitimately
+  // advertise well over a hundred fine-grained scopes (PostHog lists 150).
+  // Dropping any advertised scope silently mints a token the resource then
+  // rejects, so the budget is generous — 8 KiB leaves room for the rest of the
+  // authorize URL under the common 8-16 KiB request-line limits — and only an
+  // absurd list is truncated.
+  const MAX_DISCOVERED_SCOPE_CHARS = 8192;
+  const capScopes = (scopes: readonly string[]): readonly string[] => {
+    const unique = dedupeScopes(scopes);
+    let length = 0;
+    let count = 0;
+    for (const scope of unique) {
+      const next = length + scope.length + (count > 0 ? 1 : 0);
+      if (next > MAX_DISCOVERED_SCOPE_CHARS) break;
+      length = next;
+      count += 1;
+    }
+    return unique.slice(0, count);
+  };
+
+  // Bound a whole discovery sequence (PRM + up to MAX_DISCOVERY_AUTH_SERVERS AS
+  // fetches, each with its own request timeout). 30s is larger than a single
+  // request timeout so it bounds the sequence, not a slow-but-valid request.
+  const withDiscoverySequenceTimeout = <A>(
+    sequence: Effect.Effect<A, OAuthDiscoveryError>,
+    message: string,
+  ): Effect.Effect<A, OAuthDiscoveryError> =>
+    sequence.pipe(
+      Effect.timeoutOrElse({
+        duration: Duration.seconds(30),
+        orElse: () => Effect.fail(new OAuthDiscoveryError({ message, cause: "timeout" })),
+      }),
+    );
+
+  /** Probe, in order, the authorization servers a protected resource named, and
+   *  return the first whose RFC 8414 metadata both reads cleanly and satisfies
+   *  `accept`. Any AS we cannot read clean metadata from — unreachable, 404,
+   *  malformed, or issuer-mismatched — contributes nothing and we move on
+   *  (mirroring the dynamic-registration discovery path). We never probe an
+   *  arbitrary URL: only the hosts the resource itself named, already capped by
+   *  the caller because that list is server-controlled. */
+  const firstReadableAuthorizationServer = (
+    issuers: readonly string[],
+    accept: (metadata: OAuthAuthorizationServerMetadata) => boolean,
+  ): Effect.Effect<OAuthAuthorizationServerMetadata | null> =>
+    Effect.gen(function* () {
+      const discoveryOptions = { endpointUrlPolicy: deps.endpointUrlPolicy, httpClientLayer };
+      for (const issuer of issuers) {
+        const authServer = yield* discoverAuthorizationServerMetadata(
+          issuer,
+          discoveryOptions,
+        ).pipe(Effect.catchTag("OAuthDiscoveryError", () => Effect.succeed(null)));
+        if (authServer && accept(authServer.metadata)) return authServer.metadata;
+      }
+      return null;
+    });
+
+  /** The authorization servers a protected resource names, capped: the list is
+   *  server-controlled and a hostile or buggy server must not be able to make
+   *  us walk an unbounded number of hosts. */
+  const authorizationServerIssuersFor = (
+    protectedResource: {
+      readonly metadata: { readonly authorization_servers?: readonly string[] };
+    } | null,
+  ): readonly string[] =>
+    (protectedResource?.metadata.authorization_servers ?? []).slice(0, MAX_DISCOVERY_AUTH_SERVERS);
 
   // Discover the scopes to request when the integration declares none — only
   // reached for integrations that opt in (MCP-style). The resource's own RFC
@@ -555,39 +878,50 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
 
       // The resource is silent on scopes — read them from the authorization
       // servers it names, in order. An advertised list is authoritative even
-      // when empty. Any AS we cannot read clean RFC 8414 metadata from —
-      // unreachable, 404, malformed, or issuer-mismatched — contributes nothing
-      // and we move on (mirroring the dynamic-registration discovery path); if
-      // none advertise scopes we request none and let the AS apply its defaults
-      // (RFC 8414 metadata is optional, so its absence is not a failure). The
-      // list is server-controlled, so cap how many of its hosts we probe.
-      for (const issuer of (protectedResource?.metadata.authorization_servers ?? []).slice(
-        0,
-        MAX_DISCOVERY_AUTH_SERVERS,
-      )) {
-        const authServer = yield* discoverAuthorizationServerMetadata(
-          issuer,
-          discoveryOptions,
-        ).pipe(Effect.catchTag("OAuthDiscoveryError", () => Effect.succeed(null)));
-        const scopes = authServer?.metadata.scopes_supported;
-        if (scopes !== undefined) return capScopes(scopes);
-      }
+      // when empty, so "advertises scopes at all" is the acceptance test. If
+      // none do we request none and let the AS apply its defaults (RFC 8414
+      // metadata is optional, so its absence is not a failure).
+      const authServer = yield* firstReadableAuthorizationServer(
+        authorizationServerIssuersFor(protectedResource),
+        (metadata) => metadata.scopes_supported !== undefined,
+      );
+      return authServer?.scopes_supported === undefined
+        ? []
+        : capScopes(authServer.scopes_supported);
+    }).pipe((sequence) =>
+      withDiscoverySequenceTimeout(sequence, "OAuth scope discovery timed out"),
+    );
 
-      return [];
-    }).pipe(
-      // Bound the whole sequence (PRM + up to MAX_DISCOVERY_AUTH_SERVERS AS
-      // fetches, each with its own request timeout). 30s is larger than a single
-      // request timeout so it bounds the sequence, not a slow-but-valid request.
-      Effect.timeoutOrElse({
-        duration: Duration.seconds(30),
-        orElse: () =>
-          Effect.fail(
-            new OAuthDiscoveryError({
-              message: "OAuth scope discovery timed out",
-              cause: "timeout",
-            }),
-          ),
-      }),
+  /** The RFC 8414 metadata of the authorization server that protects `resource`.
+   *  Enterprise-managed authorization needs two facts that live ONLY here: the
+   *  issuer identifier the ID-JAG must name as its audience, and whether the
+   *  server implements the ID-JAG grant profile at all. Same discovery order as
+   *  scope discovery — the protected resource names its authorization servers;
+   *  we never probe an arbitrary URL. */
+  const discoverResourceAuthorizationServer = (
+    resource: string | null,
+  ): Effect.Effect<OAuthAuthorizationServerMetadata, OAuthDiscoveryError> =>
+    Effect.gen(function* () {
+      if (resource == null) {
+        return yield* new OAuthDiscoveryError({
+          message:
+            "Cannot discover the authorization server: the OAuth app has no resource configured",
+        });
+      }
+      const protectedResource = yield* discoverProtectedResourceMetadata(resource, {
+        endpointUrlPolicy: deps.endpointUrlPolicy,
+        httpClientLayer,
+      });
+      const issuers = authorizationServerIssuersFor(protectedResource);
+      const metadata = yield* firstReadableAuthorizationServer(issuers, () => true);
+      if (metadata) return metadata;
+      return yield* new OAuthDiscoveryError({
+        message: `No authorization-server metadata found for ${resource}${
+          issuers.length > 0 ? ` (tried: ${issuers.join(", ")})` : ""
+        }`,
+      });
+    }).pipe((sequence) =>
+      withDiscoverySequenceTimeout(sequence, "OAuth authorization-server discovery timed out"),
     );
 
   // -----------------------------------------------------------------------
@@ -595,9 +929,29 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // -----------------------------------------------------------------------
   const createClient = (
     input: CreateOAuthClientInput,
-  ): Effect.Effect<OAuthClientSlug, StorageFailure> =>
+  ): Effect.Effect<OAuthClientSlug, OrgWriteDeniedError | StorageFailure> =>
     Effect.gen(function* () {
+      // The `first-party:` namespace is reserved for config-declared apps — a
+      // stored row under it would be shadowed by (or worse, impersonate) the
+      // host's own app.
+      if (isFirstPartyOAuthClientSlug(String(input.slug))) {
+        return yield* new StorageError({
+          message: `OAuth client slug "${String(input.slug)}" uses the reserved first-party namespace.`,
+          cause: undefined,
+        });
+      }
+      yield* deps.guardOrgWrite(input.owner);
       yield* validateClientEndpoints(input, deps.endpointUrlPolicy);
+      if (
+        input.tokenEndpointAuthMethod !== undefined &&
+        input.tokenEndpointAuthMethod !== "body" &&
+        input.clientSecret.length === 0
+      ) {
+        return yield* new StorageError({
+          message: "HTTP Basic token endpoint authentication requires a client secret.",
+          cause: undefined,
+        });
+      }
       const keys = yield* Effect.try({
         try: () => deps.ownedKeys(input.owner),
         catch: (cause) =>
@@ -608,10 +962,11 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       });
       const now = new Date();
 
-      // Store the secret out-of-band in the default writable provider; the row
-      // keeps only its item id. A public/PKCE client (empty secret) stores null
-      // — there is no plaintext column to fall back to (the schema dropped it).
+      // Resolve the out-of-band write up front, but do not mutate the provider
+      // until the database transaction commits.
       let clientSecretItemIdValue: string | null = null;
+      let credentialWrite: CredentialWriteAttempt | null = null;
+      let secretWrite: CredentialWriteSnapshot | undefined;
       if (input.clientSecret.length > 0) {
         const provider = deps.defaultWritableProvider();
         if (!provider || !provider.set) {
@@ -621,48 +976,192 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             cause: undefined,
           });
         }
-        clientSecretItemIdValue = clientSecretItemId(input.owner, input.slug);
-        yield* provider.set(ProviderItemId.make(clientSecretItemIdValue), input.clientSecret);
+        const attemptId = crypto.randomUUID();
+        credentialWrite = makeCredentialWriteAttempt(deps.credentialWriteRuntimeId, attemptId);
+        clientSecretItemIdValue = credentialAttemptItemId(
+          clientSecretItemId(input.owner, input.slug),
+          attemptId,
+        );
+        const itemId = ProviderItemId.make(clientSecretItemIdValue);
+        const [snapshot] = yield* snapshotCredentialWrites(
+          { ...provider, set: provider.set },
+          [{ itemId, value: input.clientSecret }],
+          () =>
+            new StorageError({
+              message:
+                "The default credential provider cannot safely create an OAuth client secret because it does not support compensating deletion.",
+              cause: undefined,
+            }),
+          { requireDeleteForNew: true },
+        );
+        secretWrite = snapshot;
       }
 
-      yield* deps.fuma
-        .use("oauth_client.deleteExisting", (db) =>
-          looseDb(db).deleteMany("oauth_client", {
-            where: (b: any) =>
-              b.and(b("owner", "=", input.owner), b("slug", "=", String(input.slug))),
-          }),
-        )
-        .pipe(Effect.catch(() => Effect.void));
-      yield* deps.fuma.use("oauth_client.create", (db) =>
-        looseDb(db).create("oauth_client", {
-          tenant: keys.tenant,
-          owner: keys.owner,
-          subject: keys.subject,
-          slug: String(input.slug),
-          authorization_url: input.authorizationUrl,
-          token_url: input.tokenUrl,
-          grant: input.grant,
-          client_id: input.clientId,
-          client_secret_item_id: clientSecretItemIdValue,
-          resource: input.resource ?? null,
-          origin_kind: input.origin?.kind ?? "manual",
-          // Recorded intent, kept for BOTH origins: a manual app registered from
-          // an integration's dialog stamps its integration so the picker can
-          // match it exactly, the same way a DCR client records the integration
-          // that requested it.
-          origin_integration:
-            input.origin?.integration == null ? null : String(input.origin.integration),
-          origin_issuer:
-            input.origin?.kind === "dynamic_client_registration"
-              ? (canonicalIssuerUrl(input.originIssuer) ?? null)
-              : null,
-          origin_redirect_uri:
-            input.origin?.kind === "dynamic_client_registration"
-              ? (input.originRedirectUri ?? null)
-              : null,
-          created_at: now,
+      const committed = yield* deps.fuma.transaction(
+        Effect.gen(function* () {
+          const existing = yield* deps.fuma.use("oauth_client.findExisting", (db) =>
+            looseDb(db).findFirst("oauth_client", {
+              where: (b: any) =>
+                b.and(b("owner", "=", input.owner), b("slug", "=", String(input.slug))),
+            }),
+          );
+          yield* deps.fuma
+            .use("oauth_client.deleteExisting", (db) =>
+              looseDb(db).deleteMany("oauth_client", {
+                where: (b: any) =>
+                  b.and(b("owner", "=", input.owner), b("slug", "=", String(input.slug))),
+              }),
+            )
+            .pipe(Effect.catch(() => Effect.void));
+          const inserted = yield* deps.fuma.use("oauth_client.create", (db) =>
+            looseDb(db).create("oauth_client", {
+              tenant: keys.tenant,
+              owner: keys.owner,
+              subject: keys.subject,
+              slug: String(input.slug),
+              authorization_url: input.authorizationUrl,
+              token_url: input.tokenUrl,
+              grant: input.grant,
+              client_id: input.clientId,
+              client_secret_item_id: clientSecretItemIdValue,
+              credential_write: credentialWrite,
+              token_endpoint_auth_method: input.tokenEndpointAuthMethod ?? null,
+              resource: input.resource ?? null,
+              origin_kind: input.origin?.kind ?? "manual",
+              // Recorded intent, kept for BOTH origins: a manual app registered from
+              // an integration's dialog stamps its integration so the picker can
+              // match it exactly, the same way a DCR client records the integration
+              // that requested it.
+              origin_integration:
+                input.origin?.integration == null ? null : String(input.origin.integration),
+              origin_issuer:
+                input.origin?.kind === "dynamic_client_registration"
+                  ? (canonicalIssuerUrl(input.originIssuer) ?? null)
+                  : null,
+              origin_redirect_uri:
+                input.origin?.kind === "dynamic_client_registration"
+                  ? (input.originRedirectUri ?? null)
+                  : null,
+              created_at: now,
+            }),
+          );
+          const rowId = (inserted as Record<string, unknown>)["row_id"];
+          if (typeof rowId !== "string") {
+            return yield* new StorageError({
+              message:
+                "Storage adapter did not return the inserted OAuth client row's row_id; the credential write cannot be compensated safely.",
+              cause: undefined,
+            });
+          }
+          return { existing, rowId };
         }),
       );
+
+      if (secretWrite) {
+        yield* afterCommitRequired(
+          Effect.gen(function* () {
+            const writeExit = yield* secretWrite.write.pipe(Effect.exit);
+            if (Exit.isFailure(writeExit)) {
+              // Restore the row only while it is still the exact row this call
+              // inserted. This attempt owns its provider item id, so cleanup can
+              // never overwrite a concurrent successor's secret.
+              const restoredRow = yield* deps.fuma
+                .transaction(
+                  Effect.gen(function* () {
+                    const current = yield* deps.fuma.use("oauth_client.compensate.find", (db) =>
+                      looseDb(db).findFirst("oauth_client", {
+                        where: (b: any) =>
+                          b.and(b("owner", "=", input.owner), b("slug", "=", String(input.slug))),
+                      }),
+                    );
+                    if (
+                      (current as Record<string, unknown> | null)?.["row_id"] !== committed.rowId
+                    ) {
+                      return false;
+                    }
+                    yield* deps.fuma.use("oauth_client.compensate.delete", (db) =>
+                      looseDb(db).deleteMany("oauth_client", {
+                        where: (b: any) => b("row_id", "=", committed.rowId),
+                      }),
+                    );
+                    if (committed.existing) {
+                      const existing = committed.existing;
+                      yield* deps.fuma.use("oauth_client.compensate.restore", (db) =>
+                        looseDb(db).create("oauth_client", existing),
+                      );
+                    }
+                    return true;
+                  }),
+                )
+                .pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.logError(
+                      "OAuth client credential compensation could not restore its row",
+                      {
+                        owner: input.owner,
+                        client: String(input.slug),
+                        causeKind: Cause.isCause(cause) ? "Cause" : "Error",
+                      },
+                    ).pipe(Effect.as(false)),
+                  ),
+                );
+              if (!restoredRow) {
+                return yield* new StorageError({
+                  message: `Failed to store the OAuth client secret for ${input.owner}/${String(input.slug)}, and the client row could not be safely restored.`,
+                  cause: writeExit.cause,
+                });
+              }
+              // This attempt owns a unique item id. The row recheck keeps the
+              // existing compensation contract, while deleting/restoring this id
+              // cannot touch a successor's credential even if one commits later.
+              const restoredCredential = yield* restoreCredentialSnapshotsWithRecheck(
+                [secretWrite],
+                deps.fuma.transaction(
+                  Effect.gen(function* () {
+                    const current = yield* deps.fuma.use("oauth_client.compensate.recheck", (db) =>
+                      looseDb(db).findFirst("oauth_client", {
+                        where: (b: any) =>
+                          b.and(b("owner", "=", input.owner), b("slug", "=", String(input.slug))),
+                      }),
+                    );
+                    const currentRowId = (current as Record<string, unknown> | null)?.["row_id"];
+                    const expectedRowId = (committed.existing as Record<string, unknown> | null)?.[
+                      "row_id"
+                    ];
+                    return committed.existing === null
+                      ? current === null
+                      : currentRowId === expectedRowId;
+                  }),
+                ),
+              );
+              if (Predicate.isTagged(restoredCredential, "Superseded")) {
+                return yield* new StorageError({
+                  message: `Failed to store the OAuth client secret for ${input.owner}/${String(input.slug)}, and credential cleanup was skipped because the compensated row was superseded.`,
+                  cause: writeExit.cause,
+                });
+              }
+              if (Predicate.isTagged(restoredCredential, "Failed")) {
+                return yield* new StorageError({
+                  message: `Failed to store the OAuth client secret for ${input.owner}/${String(input.slug)}, and credential compensation also failed.`,
+                  cause: restoredCredential.cause,
+                });
+              }
+              return yield* Effect.failCause(writeExit.cause);
+            }
+            const previousItemId = (committed.existing as Record<string, unknown> | null)?.[
+              "client_secret_item_id"
+            ];
+            const provider = deps.defaultWritableProvider();
+            if (
+              typeof previousItemId === "string" &&
+              previousItemId !== clientSecretItemIdValue &&
+              provider?.delete
+            ) {
+              yield* provider.delete(ProviderItemId.make(previousItemId)).pipe(Effect.ignore);
+            }
+          }),
+        );
+      }
       return input.slug;
     });
 
@@ -680,21 +1179,81 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // the next token refresh, prompting a reconnect (graceful degradation; this
   // op never cascades into connections).
   // -----------------------------------------------------------------------
-  const removeClient = (owner: Owner, slug: OAuthClientSlug): Effect.Effect<void, StorageFailure> =>
+  const removeClient = (
+    owner: Owner,
+    slug: OAuthClientSlug,
+  ): Effect.Effect<void, OrgWriteDeniedError | StorageFailure> =>
     Effect.gen(function* () {
-      yield* deps.fuma
-        .use("oauth_client.delete", (db) =>
-          looseDb(db).deleteMany("oauth_client", {
-            where: (b: any) => b.and(b("owner", "=", owner), b("slug", "=", String(slug))),
-          }),
-        )
-        .pipe(Effect.asVoid);
+      // Config-declared apps have no row to remove; removing one is an env
+      // change on the host, not a storage operation. Fail loudly rather than
+      // returning a success that changed nothing.
+      if (isFirstPartyOAuthClientSlug(String(slug))) {
+        return yield* new StorageError({
+          message: `OAuth client "${String(slug)}" is a first-party app declared in host config; it cannot be removed through this surface.`,
+          cause: undefined,
+        });
+      }
+      yield* deps.guardOrgWrite(owner);
+      // "Is there an app at (owner, slug) right now?" — asked twice, for two
+      // different reasons. Before the delete it says whether this call removes
+      // anything at all; after the commit it says whether the secret key still
+      // belongs to the app this call removed.
+      const findClientRow = deps.fuma.use("oauth_client.findFirst", (db) =>
+        looseDb(db).findFirst("oauth_client", {
+          where: (b: any) => b.and(b("owner", "=", owner), b("slug", "=", String(slug))),
+        }),
+      );
+
+      const removedRow = yield* deps.fuma.transaction(
+        Effect.gen(function* () {
+          const existing = yield* findClientRow;
+          yield* deps.fuma
+            .use("oauth_client.delete", (db) =>
+              looseDb(db).deleteMany("oauth_client", {
+                where: (b: any) => b.and(b("owner", "=", owner), b("slug", "=", String(slug))),
+              }),
+            )
+            .pipe(Effect.asVoid);
+          return existing;
+        }),
+      );
+      // Nothing matched, so this call removed nothing and owns no secret. The
+      // idempotent no-op and the cross-subject miss both land here, and both
+      // used to queue a delete of a key they never had a claim on.
+      if (!removedRow) return;
       // Best-effort: drop the secret from the provider so it isn't orphaned.
+      //
+      // Deferred to the outermost commit. This function opens no transaction of
+      // its own, but a caller can wrap it in one — and `provider.delete` reaches
+      // a store that does not roll back with it. An abort would then restore the
+      // client row while its secret stayed destroyed, leaving a client that
+      // looks configured and can never authenticate again. Orphaning a secret is
+      // recoverable; deleting one that is still referenced is not, so the
+      // deletion waits until the row's removal is durable. With no transaction
+      // active `afterCommit` runs it immediately, which is the behaviour this
+      // path already had.
       const provider = deps.defaultWritableProvider();
-      if (provider?.delete) {
-        yield* provider
-          .delete(ProviderItemId.make(clientSecretItemId(owner, slug)))
-          .pipe(Effect.catch(() => Effect.void));
+      const dropSecret = provider?.delete;
+      if (provider && dropSecret) {
+        yield* afterCommit(
+          Effect.gen(function* () {
+            // Deferral alone is not enough: the secret is keyed by (owner, slug)
+            // ALONE, so the key outlives the row it belonged to. If the same
+            // slug is registered again before this hook runs, the key now holds
+            // the NEW app's secret, and deleting it recreates exactly the state
+            // the deferral exists to prevent — a client that looks configured
+            // and can never authenticate. Re-check that the app is still gone
+            // and stand down when it is not. A re-check that FAILS is caught
+            // below and also stands down, which is the deliberate direction:
+            // an orphaned secret is recoverable, a destroyed live one is not.
+            const recreated = yield* findClientRow;
+            if (recreated) return;
+            const removedItemId = removedRow["client_secret_item_id"];
+            if (typeof removedItemId === "string") {
+              yield* dropSecret.call(provider, ProviderItemId.make(removedItemId));
+            }
+          }).pipe(Effect.catch(() => Effect.void)),
+        );
       }
     });
 
@@ -724,7 +1283,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     readonly slug: OAuthClientSlug;
     readonly resource: string | null;
     /** Redirect URI the candidate registered with the AS; null for rows
-     *  predating the column (treated as matching any flow callback). */
+     *  predating the column. */
     readonly redirectUri: string | null;
   };
 
@@ -815,20 +1374,17 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     Effect.gen(function* () {
       const candidates = yield* dcrCandidatesForIssuer(input.owner, issuer);
       const resource = input.resource ?? null;
-      // A candidate is reusable only when the callback it registered with the
-      // AS still matches the current flow's callback — strict servers reject an
-      // authorize request whose redirect_uri differs from the registration
-      // (e.g. the callback origin changed after a sandbox was recreated while
-      // the persisted client survived). A null stored redirect is a legacy row
-      // predating the column: treated as matching so an upgrade doesn't
-      // re-register every client whose callback never changed. A null FLOW
-      // redirect has nothing to compare against, so it also reuses — the only
-      // alternative is a fresh registration, which the missing-redirectUri
-      // guard would fail.
-      const redirectMatches = (candidate: DcrReuseCandidate): boolean =>
-        candidate.redirectUri === null ||
-        flowRedirectUri === null ||
-        candidate.redirectUri === flowRedirectUri;
+      // A caller-supplied redirect is authoritative: only a client registered
+      // with that exact callback can be reused. In particular, a legacy row
+      // with no recorded redirect is not proof of a match. When the caller
+      // relies on the executor's configured default, retain the legacy-null
+      // compatibility behavior so upgrades do not re-register every client.
+      const hasExplicitRedirectUri = input.redirectUri != null;
+      const redirectMatches = (candidate: DcrReuseCandidate): boolean => {
+        if (candidate.redirectUri === flowRedirectUri) return true;
+        if (hasExplicitRedirectUri) return false;
+        return candidate.redirectUri === null || flowRedirectUri === null;
+      };
       // A fresh registration must never take a slug an existing candidate
       // holds: `createClient` deletes any colliding (owner, slug) row first,
       // which would clobber a client that live connections still refresh
@@ -836,9 +1392,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // token grant doesn't involve the redirect URI).
       const takenSlugs = new Set(candidates.map((client) => String(client.slug)));
       if (resource !== null) {
-        const matchingResource = candidates.find((client) => client.resource === resource);
-        if (matchingResource && redirectMatches(matchingResource)) {
-          return { existingSlug: matchingResource.slug, registrationSlug: matchingResource.slug };
+        // Prefer a candidate matching resource AND the current redirect across
+        // ALL candidates (mirroring the resource-less branch below). Candidates
+        // are oldest-first, so after an origin drift the oldest matching-
+        // resource row is the STRANDED one — but the first drift recovery
+        // already minted a client bound to the CURRENT callback, and later
+        // reconnects must reuse that instead of registering another duplicate
+        // each time.
+        const reusable = candidates.find(
+          (client) => client.resource === resource && redirectMatches(client),
+        );
+        if (reusable) {
+          return { existingSlug: reusable.slug, registrationSlug: reusable.slug };
         }
         const slug = uniqueDcrSlug(
           dcrClientSlug(issuer, candidates.length > 0 ? resource : null, input.slug),
@@ -869,8 +1434,12 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
 
   const registerDynamicClient = (
     input: RegisterDynamicClientInput,
-  ): Effect.Effect<OAuthClientSlug, OAuthRegisterDynamicError | StorageFailure> =>
+  ): Effect.Effect<
+    OAuthClientSlug,
+    OAuthRegisterDynamicError | OrgWriteDeniedError | StorageFailure
+  > =>
     Effect.gen(function* () {
+      yield* deps.guardOrgWrite(input.owner);
       const issuer = canonicalDcrIssuer(input.issuer, input.registrationEndpoint);
       // Resolved before the reuse decision: a persisted client registered with
       // a DIFFERENT callback must not be reused (strict servers 400 the
@@ -888,6 +1457,10 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         });
       }
       const authMethod = pickDcrAuthMethod(input.tokenEndpointAuthMethodsSupported);
+      const registrationScopes = dedupeScopes([
+        ...input.scopes,
+        ...additionalAuthorizationLifecycleScopes(input),
+      ]);
       const information = yield* registerDynamicClientDcr(
         {
           registrationEndpoint: input.registrationEndpoint,
@@ -897,7 +1470,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             grant_types: ["authorization_code", "refresh_token"],
             response_types: ["code"],
             token_endpoint_auth_method: authMethod,
-            scope: input.scopes.length > 0 ? input.scopes.join(" ") : undefined,
+            application_type: isLoopbackHttpUrl(flowRedirectUri) ? "native" : "web",
+            scope: registrationScopes.length > 0 ? registrationScopes.join(" ") : undefined,
           },
         },
         { httpClientLayer, endpointUrlPolicy: deps.endpointUrlPolicy },
@@ -954,35 +1528,83 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // needed. The `client_secret` column is deliberately never projected.
   // -----------------------------------------------------------------------
   const listClients = (): Effect.Effect<readonly OAuthClientSummary[], StorageFailure> =>
-    deps.fuma
-      .use("oauth_client.findMany", (db) => looseDb(db).findMany("oauth_client", {}))
-      .pipe(
-        Effect.flatMap((rows) =>
-          Effect.forEach(rows, (row) => {
-            const grant = parseGrant(row.grant);
-            // EXPLICIT — a row with an unknown grant is corrupt; surface it
-            // loudly rather than silently displaying it as authorization_code.
-            if (grant === null) {
-              return Effect.fail(
-                new StorageError({
-                  message: `oauth_client ${String(row.slug)} has an unknown grant: ${String(row.grant)}`,
-                  cause: undefined,
-                }),
-              );
-            }
-            return Effect.succeed({
-              owner: String(row.owner) as Owner,
-              slug: OAuthClientSlug.make(String(row.slug)),
-              grant,
-              authorizationUrl: String(row.authorization_url),
-              tokenUrl: String(row.token_url),
-              resource: row.resource == null ? null : String(row.resource),
-              clientId: String(row.client_id),
-              origin: parseOAuthClientOrigin(row),
-            } satisfies OAuthClientSummary);
-          }),
-        ),
+    Effect.gen(function* () {
+      // First-party apps lead the list: config-resolved, filtered by host policy,
+      // and projected exactly like stored rows — clientId only, never the secret.
+      // Owner is reported as "org" (the widest visibility the summary shape can
+      // express); the flow itself ignores owner for first-party slugs.
+      //
+      // `unlisted` apps are withheld here and ONLY here: listing is what offers an
+      // app for a NEW connection, so this is the whole of "stop offering it".
+      // `loadClient` still resolves them, keeping every existing connection's
+      // refresh and reconnect intact.
+      const listed = yield* Effect.filter([...firstPartyBySlug.values()], (config) =>
+        config.unlisted === true
+          ? Effect.succeed(false)
+          : config.isListed === undefined
+            ? Effect.succeed(true)
+            : config.isListed({ userId: deps.subject, organizationId: deps.tenant }),
       );
+      const firstPartySummaries: readonly OAuthClientSummary[] = listed.map((config) => ({
+        owner: "org",
+        slug: firstPartyOAuthClientSlug(config.name),
+        grant: "authorization_code",
+        authorizationUrl: config.authorizationUrl,
+        tokenUrl: config.tokenUrl,
+        resource: config.resource ?? null,
+        clientId: config.clientId,
+        ...(config.tokenEndpointAuthMethod === undefined
+          ? {}
+          : { tokenEndpointAuthMethod: config.tokenEndpointAuthMethod }),
+        origin: {
+          kind: "first_party",
+          ...(config.integrations !== undefined ? { integrations: config.integrations } : {}),
+          ...(config.allowedScopes !== undefined ? { allowedScopes: config.allowedScopes } : {}),
+        },
+      }));
+      return yield* deps.fuma
+        .use("oauth_client.findMany", (db) => looseDb(db).findMany("oauth_client", {}))
+        .pipe(
+          Effect.flatMap((rows) =>
+            Effect.forEach(rows, (row) => {
+              const grant = parseGrant(row.grant);
+              // EXPLICIT — a row with an unknown grant is corrupt; surface it
+              // loudly rather than silently displaying it as authorization_code.
+              if (grant === null) {
+                return Effect.fail(
+                  new StorageError({
+                    message: `oauth_client ${String(row.slug)} has an unknown grant: ${String(row.grant)}`,
+                    cause: undefined,
+                  }),
+                );
+              }
+              const tokenEndpointAuthMethod = parseStoredTokenEndpointAuthMethod(
+                row.token_endpoint_auth_method,
+              );
+              if (tokenEndpointAuthMethod === null) {
+                return Effect.fail(
+                  new StorageError({
+                    message: `oauth_client ${String(row.slug)} has an unknown token endpoint auth method: ${String(row.token_endpoint_auth_method)}`,
+                    cause: undefined,
+                  }),
+                );
+              }
+              return Effect.succeed({
+                owner: String(row.owner) as Owner,
+                slug: OAuthClientSlug.make(String(row.slug)),
+                grant,
+                authorizationUrl: String(row.authorization_url),
+                tokenUrl: String(row.token_url),
+                resource: row.resource == null ? null : String(row.resource),
+                clientId: String(row.client_id),
+                ...(tokenEndpointAuthMethod === undefined ? {} : { tokenEndpointAuthMethod }),
+                origin: parseOAuthClientOrigin(row),
+              } satisfies OAuthClientSummary);
+            }),
+          ),
+          Effect.map((stored) => [...firstPartySummaries, ...stored]),
+        );
+    });
 
   // -----------------------------------------------------------------------
   // Load an oauth_client row by (owner, slug).
@@ -990,8 +1612,15 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   const loadClient = (
     owner: Owner,
     slug: OAuthClientSlug,
-  ): Effect.Effect<LoadedOAuthClient | null, StorageFailure> =>
-    deps.fuma
+  ): Effect.Effect<LoadedOAuthClient | null, StorageFailure> => {
+    // First-party apps resolve from config, never storage. Owner is irrelevant:
+    // the app belongs to the DEPLOYMENT, and visibility policy has nothing to
+    // narrow — only the minted connection (and its tokens) is owner-scoped.
+    if (isFirstPartyOAuthClientSlug(String(slug))) {
+      const config = firstPartyBySlug.get(String(slug));
+      return Effect.succeed(config ? loadedFirstPartyClient(config) : null);
+    }
+    return deps.fuma
       .use("oauth_client.findFirst", (db) =>
         looseDb(db).findFirst("oauth_client", {
           where: (b: any) => b.and(b("owner", "=", owner), b("slug", "=", String(slug))),
@@ -1012,6 +1641,17 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               }),
             );
           }
+          const tokenEndpointAuthMethod = parseStoredTokenEndpointAuthMethod(
+            row.token_endpoint_auth_method,
+          );
+          if (tokenEndpointAuthMethod === null) {
+            return Effect.fail(
+              new StorageError({
+                message: `oauth_client ${String(slug)} has an unknown token endpoint auth method: ${String(row.token_endpoint_auth_method)}`,
+                cause: undefined,
+              }),
+            );
+          }
           // `client_secret_item_id` is null for DCR-minted / public PKCE clients;
           // the token exchange treats a missing secret as "public client, omit
           // client_secret" (see pickClientAuth). A confidential client persisted
@@ -1021,9 +1661,18 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             if (row.client_secret_item_id != null) {
               const provider = deps.defaultWritableProvider();
               if (provider) {
-                clientSecret =
-                  (yield* provider.get(ProviderItemId.make(String(row.client_secret_item_id)))) ??
-                  "";
+                const itemId = String(row.client_secret_item_id);
+                const resolved = yield* provider.get(ProviderItemId.make(itemId));
+                if (
+                  resolved === null &&
+                  parseCredentialWriteAttempt(row.credential_write) !== null
+                ) {
+                  return yield* new CredentialWriteIncompleteError({
+                    message: `OAuth client credential write for ${owner}/${String(slug)} is incomplete; retry the operation.`,
+                    cause: undefined,
+                  });
+                }
+                clientSecret = resolved ?? "";
               }
             }
             return {
@@ -1034,18 +1683,24 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               clientId: String(row.client_id),
               clientSecret,
               resource: row.resource == null ? null : String(row.resource),
+              ...(tokenEndpointAuthMethod === undefined ? {} : { tokenEndpointAuthMethod }),
             } satisfies LoadedOAuthClient;
           });
         }),
       );
+  };
 
   // -----------------------------------------------------------------------
   // start — begin a flow through a client to mint a connection.
   // -----------------------------------------------------------------------
   const start = (
     input: OAuthStartInput,
-  ): Effect.Effect<ConnectResult, OAuthStartError | StorageFailure> =>
+  ): Effect.Effect<ConnectResult, OAuthStartError | OrgWriteDeniedError | StorageFailure> =>
     Effect.gen(function* () {
+      // Gate before any session row or upstream exchange: minting a Workspace
+      // connection (including a reconnect that would replace its credential)
+      // is a workspace-level change. Personal connections remain member-owned.
+      yield* deps.guardOrgWrite(input.owner);
       const keys = yield* Effect.try({
         try: () => deps.ownedKeys(input.owner),
         catch: (cause) =>
@@ -1054,11 +1709,26 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             cause,
           }),
       });
+      // The integration must exist BEFORE any session or provider round trip.
+      // A stale reference (a connection whose integration was removed, or an
+      // agent replaying an old slug) would otherwise complete authorization at
+      // the provider and fail only at the mint.
+      if (!(yield* deps.integrationExists(input.integration))) {
+        return yield* new OAuthStartError({
+          message: `Integration not found: ${String(input.integration)}`,
+        });
+      }
       // Sharing is one-directional (org → members): a Workspace (org) connection
       // cannot be backed by a member's private (user) app. The connection owner
       // and the app owner are otherwise independent — a Personal connection
       // through a shared Workspace app is the supported cross-owner case.
-      if (input.owner === "org" && input.clientOwner === "user") {
+      // First-party apps are deployment-owned, outside the owner lattice
+      // entirely, so the rule does not apply to them.
+      const firstPartyFlow = isFirstPartyOAuthClientSlug(String(input.client));
+      yield* Effect.annotateCurrentSpan({
+        "executor.oauth.client_first_party": firstPartyFlow,
+      });
+      if (!firstPartyFlow && input.owner === "org" && input.clientOwner === "user") {
         return yield* new OAuthStartError({
           message: "A Workspace connection must use a Workspace app.",
         });
@@ -1116,18 +1786,48 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
               }),
           ),
         );
+      const firstParty = firstPartyFlow ? firstPartyBySlug.get(String(input.client)) : undefined;
       const requestedScopes =
         scopePolicy.kind === "discover"
-          ? yield* discoverScopesForResource(client.resource).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OAuthStartError({
-                    // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuthDiscoveryError carries a typed `message` field
-                    message: `Failed to discover OAuth scopes: ${cause.message}`,
-                  }),
-              ),
-            )
+          ? yield* (() => {
+              // Scope discovery reads protected-resource metadata. The client's
+              // persisted resource is the historical source and stays primary,
+              // but it is a WIRE parameter the user may clear (Entra v2 rejects
+              // `resource`, #1789) — the integration's own discovery URL then
+              // keeps scope discovery working for a resource-less client.
+              const discovered = discoverScopesForResource(
+                client.resource ?? scopePolicy.discoveryUrl,
+              ).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OAuthStartError({
+                      // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuthDiscoveryError carries a typed `message` field
+                      message: `Failed to discover OAuth scopes: ${cause.message}`,
+                    }),
+                ),
+              );
+              if (firstParty?.allowedScopes === undefined) return discovered;
+              const allowed = new Set(firstParty.allowedScopes);
+              return discovered.pipe(
+                Effect.map((scopes) => scopes.filter((scope) => allowed.has(scope))),
+              );
+            })()
           : dedupeScopes(scopePolicy.scopes);
+
+      // An explicitly scope-limited first-party app is an authorization
+      // boundary, not picker decoration. Endpoint matching and provider
+      // discovery can surface capabilities outside the registered app, so
+      // enforce the complete requested set before persisting or redirecting.
+      if (firstPartyFlow) {
+        if (
+          firstParty !== undefined &&
+          !firstPartyOAuthClientAllowsScopes(firstParty, requestedScopes)
+        ) {
+          return yield* new OAuthStartError({
+            message: `The built-in OAuth app is not enabled for integration ${input.integration}.`,
+          });
+        }
+      }
 
       // client_credentials: exchange immediately and mint the connection.
       if (client.grant === "client_credentials") {
@@ -1136,6 +1836,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           clientId: client.clientId,
           clientSecret: client.clientSecret,
           scopes: requestedScopes,
+          clientAuth: client.tokenEndpointAuthMethod,
           resource: client.resource ?? undefined,
           endpointUrlPolicy: deps.endpointUrlPolicy,
           fetch,
@@ -1157,15 +1858,157 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           // client_credentials has no callback, so no regional rebind applies.
           null,
         ).pipe(
-          Effect.mapError(
-            (cause) =>
-              new OAuthStartError({
-                // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-                message: `Failed to mint OAuth connection: ${cause.message}`,
-              }),
+          Effect.mapError((cause) =>
+            Predicate.isTagged(cause, "OrgWriteDeniedError")
+              ? cause
+              : new OAuthStartError({
+                  // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
+                  message: `Failed to mint OAuth connection: ${cause.message}`,
+                }),
           ),
         );
         return { status: "connected", connection } as const;
+      }
+
+      // Enterprise-managed authorization (draft §4): no browser, no per-server
+      // consent — exchange the identity assertion the user already holds. Only
+      // an authorization server that does NOT advertise the grant profile falls
+      // through to the interactive flow below; an IdP refusal is an enterprise
+      // policy decision and stops here, because offering the interactive flow
+      // instead would let the user route straight around it.
+      if (client.grant === "id_jag") {
+        // The rollout gate, consulted ONCE and BEFORE anything else in this
+        // branch: before the IdP registration is loaded, before discovery,
+        // before a single request leaves the process. A withheld verdict must
+        // therefore cost no round trip and spend no identity assertion.
+        //
+        // Its answer is read exactly here and never again. Once the IdP has
+        // ruled, that verdict is final: re-consulting a flag after a denial
+        // would turn the flag into an escape hatch around the enterprise
+        // control this whole profile exists to enforce.
+        const rolloutContext: EnterpriseManagedRolloutContext = {
+          userId: deps.subject,
+          organizationId: deps.tenant,
+          integration: input.integration,
+        };
+        const rolloutDecision = yield* decideEnterpriseManagedRollout(rolloutContext);
+        // Recorded for BOTH arms, so the funnel below it has a denominator.
+        yield* recordEnterpriseManagedRollout({
+          kind: "attempted",
+          context: rolloutContext,
+          decision: rolloutDecision,
+        });
+
+        if (rolloutDecision.kind === "withheld") {
+          // Withheld takes the SAME exit an authorization server that never
+          // implemented the profile takes: fall through to the ordinary
+          // interactive flow below. There is deliberately no second fallback
+          // path to keep in step with the first.
+          yield* Effect.annotateCurrentSpan({
+            "executor.oauth.enterprise_managed_fallback": true,
+            "executor.oauth.enterprise_managed_withheld": rolloutDecision.reason,
+          });
+        } else {
+          const enterprise = input.enterprise;
+          if (enterprise === undefined) {
+            return yield* new OAuthStartError({
+              message:
+                "This OAuth app uses enterprise-managed authorization, which requires an enterprise identity provider and an identity assertion on the connect request.",
+            });
+          }
+          const idpClient = yield* loadClient(enterprise.idpClientOwner, enterprise.idpClient);
+          if (!idpClient) {
+            return yield* new OAuthStartError({
+              message: `Enterprise identity provider OAuth client not found: ${enterprise.idpClient}`,
+            });
+          }
+          const metadata = yield* discoverResourceAuthorizationServer(client.resource).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OAuthStartError({
+                  // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: OAuthDiscoveryError carries a typed `message` field
+                  message: `Failed to discover the MCP server's authorization server: ${cause.message}`,
+                }),
+            ),
+          );
+          // Resolve the caller's optional assertion type ONCE: the chain sends
+          // it and the connection persists it, and those two must not be able
+          // to disagree about what was presented.
+          const resolvedEnterprise = {
+            ...enterprise,
+            subjectTokenType: enterprise.subjectTokenType ?? DEFAULT_SUBJECT_TOKEN_TYPE,
+          };
+          const enterpriseGrant = yield* runEnterpriseManagedAuthorization({
+            authorizationServerMetadata: metadata,
+            idp: {
+              tokenUrl: idpClient.tokenUrl,
+              clientId: idpClient.clientId,
+              clientSecret: idpClient.clientSecret,
+            },
+            resourceAuthorizationServer: {
+              clientId: client.clientId,
+              clientSecret: client.clientSecret,
+            },
+            subjectToken: resolvedEnterprise.subjectToken,
+            subjectTokenType: resolvedEnterprise.subjectTokenType,
+            resource: client.resource,
+            scopes: requestedScopes,
+            endpointUrlPolicy: deps.endpointUrlPolicy,
+            // No `httpClientLayer` here, deliberately: like every other token
+            // request in this service, the ID-JAG chain runs through oauth4webapi
+            // on the configured `fetch`, not Effect's HttpClient. Only discovery
+            // speaks HttpClient. Providing the layer here would claim otherwise.
+            fetch,
+          }).pipe(
+            Effect.map((grant) => ({ supported: true as const, grant })),
+            // Only the unsupported-profile failure is recoverable; every other
+            // tag reaches the caller as a start error carrying its own verdict.
+            Effect.catchTag("EmaGrantProfileUnsupported", () =>
+              Effect.succeed({ supported: false as const }),
+            ),
+            Effect.mapError(startErrorFromEnterpriseManaged),
+            // OBSERVATION ONLY. This taps the denial on its way out; it does not
+            // recover it, and no branch below reads the rollout decision again.
+            Effect.tapError((failure) =>
+              failure.blockedByAdmin === true
+                ? recordEnterpriseManagedRollout({
+                    kind: "blocked-by-admin",
+                    context: rolloutContext,
+                    decision: rolloutDecision,
+                    oauthErrorCode: failure.oauthErrorCode,
+                  })
+                : Effect.void,
+            ),
+          );
+          if (enterpriseGrant.supported) {
+            const connection = yield* mintEnterpriseManagedConnection(
+              { ...input, name },
+              client,
+              input.clientOwner,
+              enterpriseGrant.grant,
+              resolvedEnterprise,
+              metadata.issuer,
+            ).pipe(
+              Effect.mapError((cause) =>
+                Predicate.isTagged(cause, "OrgWriteDeniedError")
+                  ? cause
+                  : new OAuthStartError({
+                      // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
+                      message: `Failed to mint OAuth connection: ${cause.message}`,
+                    }),
+              ),
+            );
+            yield* recordEnterpriseManagedRollout({
+              kind: "connected",
+              context: rolloutContext,
+              decision: rolloutDecision,
+            });
+            return { status: "connected", connection } as const;
+          }
+          yield* Effect.annotateCurrentSpan({
+            "executor.oauth.enterprise_managed_fallback": true,
+          });
+        }
       }
 
       // authorization_code requires our callback to receive the code — fail
@@ -1182,9 +2025,28 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       // list is already authoritative (§7.2) and must not be re-narrowed by a
       // divergent authorization server.
       const authorizationRequestedScopes =
-        scopePolicy.kind === "discover"
-          ? requestedScopes
-          : yield* filterAuthorizationCodeScopes(client, requestedScopes);
+        firstParty?.authorizationScopes !== undefined
+          ? dedupeScopes(firstParty.authorizationScopes)
+          : scopePolicy.kind === "discover"
+            ? requestedScopes
+            : yield* filterAuthorizationCodeScopes(client, requestedScopes);
+      const providerExtras = providerAuthorizeExtras(client.authorizationUrl);
+      const workspaceOptionalScopes = firstPartyFlow
+        ? []
+        : dedupeScopes([
+            ...(providerExtras.optional_scope ?? "").split(/\s+/).filter(Boolean),
+            ...(scopePolicy.kind === "scopes" ? (scopePolicy.optionalScopes ?? []) : []),
+          ]);
+      const workspaceOptionalScopeSet = new Set(workspaceOptionalScopes);
+      const completeAuthorizationScopes = dedupeScopes([
+        ...authorizationRequestedScopes.filter((scope) => !workspaceOptionalScopeSet.has(scope)),
+        ...(firstParty?.additionalAuthorizationScopes ?? []),
+        ...additionalAuthorizationLifecycleScopes(client),
+      ]);
+      const completeRequestedScopes = dedupeScopes([
+        ...completeAuthorizationScopes,
+        ...workspaceOptionalScopes,
+      ]);
 
       // authorization_code: persist a session + build the authorize URL.
       const verifier = createPkceCodeVerifier();
@@ -1197,6 +2059,37 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
 
       const now = new Date();
       const expiresAt = Date.now() + OAUTH2_SESSION_TTL_MS;
+
+      // Drop verifiers that have already expired before parking a new one.
+      // `complete` discards an expired session lazily, but an ABANDONED flow is
+      // never completed, so that check never runs for it — and nothing else
+      // sweeps this table, so its verifier would sit here in plaintext forever.
+      // Doing it on `start` costs one delete on a path that is already writing,
+      // needs no scheduler in any host, and bounds the table by how often
+      // authorization is STARTED rather than by how often it is abandoned.
+      //
+      // Owner-scoped by the table's own delete policy, so a caller only ever
+      // sweeps rows it can already see.
+      //
+      // Best-effort, but NOT silent. Failing to tidy up must not stop someone
+      // connecting an account, so the failure is caught — and logged, because
+      // this is the only caller that ever runs the sweep, so a sweep that keeps
+      // failing quietly reinstates the very leak it exists to prevent. Warning
+      // rather than error: the authorization itself is unharmed.
+      yield* deps.fuma
+        .use("oauth_session.sweepExpired", (db) =>
+          looseDb(db).deleteMany("oauth_session", {
+            where: (b: any) => b("expires_at", "<", Date.now()),
+          }),
+        )
+        .pipe(
+          Effect.catch((failure) =>
+            Effect.logWarning("executor oauth expired-session sweep failed", {
+              failureType: typeof failure,
+            }),
+          ),
+        );
+
       yield* deps.fuma.use("oauth_session.create", (db) =>
         looseDb(db).create("oauth_session", {
           tenant: keys.tenant,
@@ -1217,7 +2110,7 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           payload: {
             owner: input.owner,
             clientOwner: input.clientOwner,
-            requestedScopes: authorizationRequestedScopes,
+            requestedScopes: completeRequestedScopes,
           },
           expires_at: expiresAt,
           created_at: now,
@@ -1230,14 +2123,21 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
             authorizationUrl: client.authorizationUrl,
             clientId: client.clientId,
             redirectUrl: flowRedirectUri,
-            scopes: authorizationRequestedScopes,
+            scopes: completeAuthorizationScopes,
             state: providerState,
             codeChallenge: challenge,
+            scopeSeparator: firstParty?.authorizationScopeSeparator,
             resource: client.resource ?? undefined,
             // Provider quirks (Google: access_type=offline + prompt=consent) —
             // without these Google returns no refresh token and won't re-consent
             // to widen scopes on reconnect.
-            extraParams: providerAuthorizeExtras(client.authorizationUrl),
+            extraParams: {
+              ...providerExtras,
+              ...(workspaceOptionalScopes.length > 0
+                ? { optional_scope: workspaceOptionalScopes.join(" ") }
+                : {}),
+              ...(firstParty?.authorizationExtraParams ?? {}),
+            },
             endpointUrlPolicy: deps.endpointUrlPolicy,
           }),
         catch: (cause) =>
@@ -1255,7 +2155,11 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
   // -----------------------------------------------------------------------
   const complete = (
     input: OAuthCompleteInput,
-  ): Effect.Effect<Connection, OAuthCompleteError | OAuthSessionNotFoundError | StorageFailure> =>
+    options?: OAuthCompleteOptions,
+  ): Effect.Effect<
+    Connection,
+    OAuthCompleteError | OAuthSessionNotFoundError | OrgWriteDeniedError | StorageFailure
+  > =>
     Effect.gen(function* () {
       const sessionRow = yield* deps.fuma.use("oauth_session.findFirst", (db) =>
         looseDb(db).findFirst("oauth_session", {
@@ -1294,6 +2198,9 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         "executor.connection": String(session.name),
         "executor.template": String(session.template),
         "executor.oauth.client": String(session.clientSlug),
+        "executor.oauth.client_first_party": isFirstPartyOAuthClientSlug(
+          String(session.clientSlug),
+        ),
       });
 
       // Expired sessions are not redeemable — drop + treat as not found.
@@ -1309,6 +2216,20 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
           message: `OAuth client not found: ${session.clientSlug}`,
           restartRequired: true,
         });
+      }
+      if (isFirstPartyOAuthClientSlug(String(session.clientSlug))) {
+        const firstParty = firstPartyBySlug.get(String(session.clientSlug));
+        if (
+          firstParty !== undefined &&
+          firstParty.allowedScopes !== undefined &&
+          (session.requestedScopes === null ||
+            !firstPartyOAuthClientAllowsScopes(firstParty, session.requestedScopes))
+        ) {
+          return yield* new OAuthCompleteError({
+            message: `The built-in OAuth app is no longer enabled for integration ${session.integration}; restart the flow.`,
+            restartRequired: true,
+          });
+        }
       }
 
       // The PKCE verifier is minted by `start` for every authorization_code
@@ -1339,6 +2260,8 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         redirectUrl: session.redirectUrl,
         codeVerifier: session.pkceVerifier,
         code: input.code,
+        clientAuth: client.tokenEndpointAuthMethod,
+        requestFormat: client.tokenRequestFormat,
         resource: client.resource ?? undefined,
         endpointUrlPolicy: deps.endpointUrlPolicy,
         fetch,
@@ -1370,14 +2293,19 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         // Persist the regional token endpoint ONLY when it differs from the
         // client's configured one, so refresh redeems against the same region.
         tokenUrl === client.tokenUrl ? null : tokenUrl,
+        // The grant and connection row are the callback's durable contract.
+        // Remote catalog discovery can be arbitrarily slow and must not keep
+        // the popup waiting after that contract has committed.
+        options?.toolSync ?? "explicit",
       ).pipe(
-        Effect.mapError(
-          (cause) =>
-            new OAuthCompleteError({
-              // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
-              message: `Failed to mint OAuth connection: ${cause.message}`,
-              restartRequired: false,
-            }),
+        Effect.mapError((cause) =>
+          Predicate.isTagged(cause, "OrgWriteDeniedError")
+            ? cause
+            : new OAuthCompleteError({
+                // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: StorageFailure carries a typed `message` field
+                message: `Failed to mint OAuth connection: ${cause.message}`,
+                restartRequired: false,
+              }),
         ),
       );
 
@@ -1395,6 +2323,20 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
       yield* deleteSession(input.state);
       return connection;
     }).pipe(
+      // A completion that cannot be retried has finished with this session, so
+      // drop it rather than leaving its PKCE verifier sitting in the table. The
+      // happy path and `cancel` already delete; the failure paths did not, and
+      // nothing sweeps the table, so a flow that died here kept its verifier
+      // indefinitely. `restartRequired` is the authorization the code already
+      // computes for this: false means the caller may redeem the same state
+      // again, and deleting it then would turn a retryable hiccup into a
+      // restart. Best-effort — a failed cleanup must not replace the real
+      // error with a storage one.
+      Effect.tapError((error) =>
+        Predicate.isTagged(error, "OAuthCompleteError") && error.restartRequired === true
+          ? deleteSession(input.state).pipe(Effect.ignore)
+          : Effect.void,
+      ),
       Effect.withSpan("executor.oauth.complete", {
         attributes: {
           "executor.oauth.grant": "authorization_code",
@@ -1407,9 +2349,9 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     );
 
   // -----------------------------------------------------------------------
-  // Mint the connection from a freshly exchanged token: store the access
-  // value (+ refresh) in the default writable provider, then write the
-  // connection row with OAuth lifecycle fields + produce its tools.
+  // Mint the connection from a freshly exchanged token: hand the access value
+  // (+ refresh) to the executor, which commits the row first, persists the
+  // credentials with compensation, then produces the connection's tools.
   // -----------------------------------------------------------------------
   const mintFromToken = (
     target: {
@@ -1430,8 +2372,13 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     /** Regional token endpoint override to persist when the code was redeemed
      *  off the client's configured host; null to use the client's token URL. */
     oauthTokenUrl: string | null,
-  ): Effect.Effect<Connection, StorageFailure> =>
+    toolSync: "explicit" | "background" = "explicit",
+  ): Effect.Effect<Connection, OrgWriteDeniedError | StorageFailure> =>
     Effect.gen(function* () {
+      // The token exchange may outlive the role that admitted `start`. Re-read
+      // the live binding at the first persistence sink so a demotion takes
+      // effect before either access or refresh credentials are stored.
+      yield* deps.guardOrgWrite(target.owner);
       const provider = deps.defaultWritableProvider();
       if (!provider || !provider.set) {
         return yield* new StorageError({
@@ -1441,12 +2388,9 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         });
       }
       const itemId = accessItemId(target.owner, target.integration, target.name);
-      yield* provider.set(ProviderItemId.make(itemId), token.access_token);
-
       let refreshItemId: string | null = null;
       if (token.refresh_token) {
         refreshItemId = refreshItemIdFor(itemId);
-        yield* provider.set(ProviderItemId.make(refreshItemId), token.refresh_token);
       }
 
       const oauthScope = recordedOAuthScope(token, requestedScopes);
@@ -1479,6 +2423,12 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         derivedIdentityLabel: token.idTokenIdentityLabel ?? null,
         provider: String(provider.key),
         itemId,
+        credentialValues: [
+          { itemId, value: token.access_token },
+          ...(refreshItemId === null || token.refresh_token === undefined
+            ? []
+            : [{ itemId: refreshItemId, value: token.refresh_token }]),
+        ],
         oauthClient: OAuthClientSlug.make(client.slug),
         oauthClientOwner: clientOwner,
         refreshItemId,
@@ -1490,6 +2440,74 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
         oauthScope,
         missingOAuthScopes: missingScopes,
         oauthTokenUrl,
+        toolSync,
+      });
+    });
+
+  /** Mint a connection from an enterprise-managed grant. Distinct from
+   *  `mintFromToken` because the material persisted is different: there is no
+   *  refresh token (draft §4.4.3), and the identity assertion takes the refresh
+   *  slot — it is exactly the credential that lets renewal run without the
+   *  user, which is what that slot means. */
+  const mintEnterpriseManagedConnection = (
+    target: {
+      readonly owner: Owner;
+      readonly name: ConnectionName;
+      readonly integration: IntegrationSlug;
+      readonly template: AuthTemplateSlug;
+      readonly identityLabel?: string | null;
+    },
+    client: LoadedOAuthClient,
+    clientOwner: Owner,
+    grant: EnterpriseManagedGrant,
+    /** The connect request's enterprise inputs with the assertion type already
+     *  resolved — the persisted state records what was actually presented, so
+     *  it must not re-derive a default the chain might have differed on. */
+    enterprise: EnterpriseManagedStartInput & { readonly subjectTokenType: SubjectTokenType },
+    /** The Resource Authorization Server's issuer identifier, as discovered. */
+    audience: string,
+  ): Effect.Effect<Connection, OrgWriteDeniedError | StorageFailure> =>
+    Effect.gen(function* () {
+      yield* deps.guardOrgWrite(target.owner);
+      const provider = deps.defaultWritableProvider();
+      if (!provider || !provider.set) {
+        return yield* new StorageError({
+          message:
+            "No default writable credential provider is registered to store the OAuth access token.",
+          cause: undefined,
+        });
+      }
+      const itemId = accessItemId(target.owner, target.integration, target.name);
+      const subjectTokenItemId = refreshItemIdFor(itemId);
+
+      yield* Effect.annotateCurrentSpan({
+        "executor.oauth.has_advertised_expiry": typeof grant.token.expires_in === "number",
+        "executor.oauth.enterprise_managed": true,
+      });
+      return yield* deps.mintOAuthConnection({
+        owner: target.owner,
+        name: target.name,
+        integration: target.integration,
+        template: target.template,
+        identityLabel: target.identityLabel ?? null,
+        derivedIdentityLabel: grant.token.idTokenIdentityLabel ?? null,
+        provider: String(provider.key),
+        itemId,
+        credentialValues: [
+          { itemId, value: grant.token.access_token },
+          { itemId: subjectTokenItemId, value: enterprise.subjectToken },
+        ],
+        oauthClient: OAuthClientSlug.make(client.slug),
+        oauthClientOwner: clientOwner,
+        refreshItemId: subjectTokenItemId,
+        expiresAt: expiresAtFrom(grant.token),
+        oauthScope: grant.scope,
+        enterpriseManaged: {
+          idpClient: enterprise.idpClient,
+          idpClientOwner: enterprise.idpClientOwner,
+          audience,
+          subjectTokenType: enterprise.subjectTokenType,
+        },
       });
     });
 

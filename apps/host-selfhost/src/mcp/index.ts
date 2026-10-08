@@ -9,7 +9,9 @@ import type {
 } from "@executor-js/host-mcp";
 
 import { BetterAuth, type BetterAuthHandle } from "../auth/better-auth";
+import { resolveSelfHostOrgRole } from "../auth/identity";
 import type { SelfHostDbHandle } from "../db/self-host-db";
+import type { SelfHostConfig } from "../config";
 import { selfHostMcpAuth } from "./auth";
 import {
   makeSelfHostMcpSessionStore,
@@ -67,7 +69,10 @@ export interface SelfHostMcpSeams {
 }
 
 const jsonResponse = (value: unknown, status: number): Response =>
-  new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
+  new Response(JSON.stringify(value), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
 
 const parseRoles = (role: string | null | undefined): ReadonlyArray<string> =>
   (role ?? "user")
@@ -82,15 +87,23 @@ type BetterAuthSession = NonNullable<
 const principalFromSession = (
   resolved: BetterAuthSession,
   betterAuth: BetterAuthHandle,
-): Principal => ({
-  accountId: resolved.user.id,
-  organizationId: resolved.session.activeOrganizationId ?? betterAuth.organizationId,
-  organizationName: betterAuth.organizationName,
-  email: resolved.user.email,
-  name: resolved.user.name ?? null,
-  avatarUrl: resolved.user.image ?? null,
-  roles: parseRoles(resolved.user.role ?? null),
-});
+  headers: Headers,
+): Effect.Effect<Principal> => {
+  const organizationId = resolved.session.activeOrganizationId ?? betterAuth.organizationId;
+  return resolveSelfHostOrgRole(betterAuth, headers, organizationId).pipe(
+    Effect.map((orgRole) => ({
+      accountId: resolved.user.id,
+      organizationId,
+      organizationName: betterAuth.organizationName,
+      email: resolved.user.email,
+      name: resolved.user.name ?? null,
+      avatarUrl: resolved.user.image ?? null,
+      roles: parseRoles(resolved.user.role ?? null),
+      orgRoleModel: "organization" as const,
+      orgRole,
+    })),
+  );
+};
 
 /**
  * Gate the browser-approval endpoints behind a valid Better Auth session (the
@@ -113,7 +126,9 @@ const makeApprovalHandler =
       }).pipe(Effect.orElseSucceed(() => null)),
     );
     if (!session) return jsonResponse({ error: "Unauthorized" }, 401);
-    const principal = principalFromSession(session, betterAuth);
+    const principal = await Effect.runPromise(
+      principalFromSession(session, betterAuth, request.headers),
+    );
 
     return (
       (await store.handlePausedRequest(request, principal)) ??
@@ -128,13 +143,24 @@ const makeApprovalHandler =
  * instance provided; it still requires `IdentityProvider` from the resolved
  * identity seam. Returns the three seam Layers plus the `close()` lifetime hook
  * the app wires into shutdown.
+ *
+ * Takes the already-resolved `SelfHostConfig` rather than reading it here: the
+ * app loads it once at boot, and `loadConfig()` refuses to boot on a malformed
+ * operator knob, so calling it from a seam factory would both hide an env read
+ * behind construction and move that failure off the boot path.
  */
 export const makeSelfHostMcpSeams = (
   dbHandle: SelfHostDbHandle,
   betterAuth: BetterAuthHandle,
-  webBaseUrl?: string,
+  config: SelfHostConfig,
 ): SelfHostMcpSeams => {
-  const sessionStore = makeSelfHostMcpSessionStore(dbHandle, webBaseUrl);
+  // The pinned public origin keeps browser-approval URLs reachable behind a
+  // reverse proxy (not the internal 127.0.0.1 bind from the request URL).
+  const sessionStore = makeSelfHostMcpSessionStore(
+    dbHandle,
+    config.webBaseUrl,
+    config.mcpSessionIdleTtlMs,
+  );
   const auth: Layer.Layer<McpAuthProvider, never, IdentityProvider> = selfHostMcpAuth.pipe(
     Layer.provide(Layer.succeed(BetterAuth)(betterAuth)),
   );

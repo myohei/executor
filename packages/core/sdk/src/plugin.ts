@@ -41,18 +41,21 @@ import type {
   InvokeOptions,
 } from "./elicitation";
 import type {
+  ConnectionAlreadyExistsError,
   ExecuteError,
   ConnectionNotFoundError,
   CredentialProviderNotRegisteredError,
   IntegrationNotFoundError,
   IntegrationRemovalNotAllowedError,
   InvalidConnectionInputError,
+  OrgWriteDeniedError,
 } from "./errors";
 import type { OAuthService } from "./oauth-client";
 import type { CredentialProvider, ProviderEntry } from "./provider";
 import type { PluginStorageConfig, PluginStorageFacade } from "./plugin-storage";
 import type {
   CreateToolPolicyInput,
+  DynamicToolScope,
   EffectivePolicy,
   RemoveToolPolicyInput,
   ToolPolicy,
@@ -129,13 +132,25 @@ export interface ToolPolicyProvider {
    * requests), so caching on it would serve stale policy state. Each operation
    * gets a fresh snapshot.
    */
-  readonly prepare?: () => Effect.Effect<
-    (input: {
-      readonly toolId: string;
-      readonly defaultRequiresApproval?: boolean;
-    }) => EffectivePolicy,
-    StorageFailure
-  >;
+  readonly prepare?: () => Effect.Effect<PreparedToolPolicy, StorageFailure>;
+}
+
+/** What `ToolPolicyProvider.prepare` hands core for one operation. */
+export interface PreparedToolPolicy {
+  /** Pure resolver over the snapshot `prepare` fetched. */
+  readonly resolve: (input: {
+    readonly toolId: string;
+    readonly defaultRequiresApproval?: boolean;
+  }) => EffectivePolicy;
+  /**
+   * The dynamic-tool prefixes this policy source can ever approve. When set,
+   * core restricts the tool rows it loads on a list to these prefixes instead
+   * of reading the whole catalog and blocking most of it in memory — the read
+   * then scales with the allowlist, not the workspace. An empty array means no
+   * dynamic tool is reachable. Omit when the source is not an allowlist (any
+   * row may be approved) so core keeps the unrestricted read.
+   */
+  readonly dynamicScope?: readonly DynamicToolScope[];
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +177,16 @@ export interface PluginCtx<TStore = unknown> {
 
   readonly core: {
     readonly integrations: {
-      /** Register / replace this plugin's integration in the catalog. */
-      readonly register: (input: RegisterIntegrationInput) => Effect.Effect<void, StorageFailure>;
+      /** Authorize a user-intent workspace catalog write before a plugin starts
+       *  external work or writes to storage outside the catalog transaction. */
+      readonly authorizeWrite: () => Effect.Effect<void, OrgWriteDeniedError>;
+      /** Register / replace this plugin's integration in the catalog. Both
+       *  operations are workspace-level changes gated by the executor's
+       *  `orgWrites` binding for end-user principals. Subjectless system
+       *  executors may re-register an existing row during boot convergence. */
+      readonly register: (
+        input: RegisterIntegrationInput,
+      ) => Effect.Effect<void, OrgWriteDeniedError | StorageFailure>;
       readonly update: (
         slug: IntegrationSlug,
         patch: {
@@ -171,21 +194,24 @@ export interface PluginCtx<TStore = unknown> {
           readonly description?: string;
           readonly config?: IntegrationConfig;
         },
-      ) => Effect.Effect<void, StorageFailure>;
+      ) => Effect.Effect<void, OrgWriteDeniedError | StorageFailure>;
       readonly list: () => Effect.Effect<readonly Integration[], StorageFailure>;
       readonly get: (
         slug: IntegrationSlug,
       ) => Effect.Effect<IntegrationRecord | null, StorageFailure>;
       readonly remove: (
         slug: IntegrationSlug,
-      ) => Effect.Effect<void, IntegrationRemovalNotAllowedError | StorageFailure>;
+      ) => Effect.Effect<
+        void,
+        IntegrationRemovalNotAllowedError | OrgWriteDeniedError | StorageFailure
+      >;
       /** Declare (or clear, with null) the integration's health check. Core
        *  owns this storage; plugins call it e.g. to install a zero-config
        *  default probe at registration time. */
       readonly setHealthCheck: (
         slug: IntegrationSlug,
         spec: HealthCheckSpec | null,
-      ) => Effect.Effect<void, StorageFailure>;
+      ) => Effect.Effect<void, OrgWriteDeniedError | StorageFailure>;
       readonly detect: (
         url: string,
       ) => Effect.Effect<readonly IntegrationDetectionResult[], StorageFailure>;
@@ -194,9 +220,15 @@ export interface PluginCtx<TStore = unknown> {
     };
     readonly policies: {
       readonly list: () => Effect.Effect<readonly ToolPolicy[], StorageFailure>;
-      readonly create: (input: CreateToolPolicyInput) => Effect.Effect<ToolPolicy, StorageFailure>;
-      readonly update: (input: UpdateToolPolicyInput) => Effect.Effect<ToolPolicy, StorageFailure>;
-      readonly remove: (input: RemoveToolPolicyInput) => Effect.Effect<void, StorageFailure>;
+      readonly create: (
+        input: CreateToolPolicyInput,
+      ) => Effect.Effect<ToolPolicy, OrgWriteDeniedError | StorageFailure>;
+      readonly update: (
+        input: UpdateToolPolicyInput,
+      ) => Effect.Effect<ToolPolicy, OrgWriteDeniedError | StorageFailure>;
+      readonly remove: (
+        input: RemoveToolPolicyInput,
+      ) => Effect.Effect<void, OrgWriteDeniedError | StorageFailure>;
     };
   };
 
@@ -208,8 +240,10 @@ export interface PluginCtx<TStore = unknown> {
     ) => Effect.Effect<
       Connection,
       | IntegrationNotFoundError
+      | ConnectionAlreadyExistsError
       | CredentialProviderNotRegisteredError
       | InvalidConnectionInputError
+      | OrgWriteDeniedError
       | StorageFailure
     >;
     readonly list: (filter?: {
@@ -221,14 +255,25 @@ export interface PluginCtx<TStore = unknown> {
     readonly update: (
       ref: ConnectionRef,
       input: UpdateConnectionInput,
-    ) => Effect.Effect<Connection, ConnectionNotFoundError | StorageFailure>;
+    ) => Effect.Effect<Connection, ConnectionNotFoundError | OrgWriteDeniedError | StorageFailure>;
     readonly remove: (
       ref: ConnectionRef,
-    ) => Effect.Effect<void, ConnectionNotFoundError | StorageFailure>;
+    ) => Effect.Effect<void, ConnectionNotFoundError | OrgWriteDeniedError | StorageFailure>;
     readonly refresh: (
       ref: ConnectionRef,
     ) => Effect.Effect<
       readonly Tool[],
+      ConnectionNotFoundError | IntegrationNotFoundError | OrgWriteDeniedError | StorageFailure
+    >;
+    /** Run the integration's declared health check against a saved connection
+     *  and persist the verdict. `ifStaleMs` serves the persisted verdict when
+     *  younger than that window, so concurrent readers collapse to one probe;
+     *  omit it to always probe. */
+    readonly checkHealth: (
+      ref: ConnectionRef,
+      options?: { readonly ifStaleMs?: number },
+    ) => Effect.Effect<
+      HealthCheckResult,
       ConnectionNotFoundError | IntegrationNotFoundError | StorageFailure
     >;
     /** Mark a connection's persisted tool catalog stale (clears its sync
@@ -286,6 +331,25 @@ export interface PluginCtx<TStore = unknown> {
   /** Run `effect` inside a FumaDB transaction (atomic across plugin storage +
    *  core integration/tool writes). */
   readonly transaction: <A, E>(effect: Effect.Effect<A, E>) => Effect.Effect<A, E | StorageFailure>;
+
+  /** Defer `effect` until the OUTERMOST transaction commits; discard it if that
+   *  transaction rolls back. With none active it runs immediately.
+   *
+   *  Use this for anything that reaches OUTSIDE the database — revoking a token
+   *  at the provider's API, deleting a remote object, sending a webhook. Such
+   *  work does not enlist in the transaction and cannot be rolled back with it,
+   *  so performing it inline means a later abort leaves the database restored
+   *  and the outside world already changed. That gap is not theoretical: the
+   *  lifecycle hooks below run inside core's own transaction.
+   *
+   *  Sequencing it after your `transaction(...)` call is NOT the same thing.
+   *  `transaction` nests by pass-through, so inside an active transaction the
+   *  inner call just runs its effect and "afterwards" is still before any
+   *  commit. This is the only construct that waits for the real one.
+   *
+   *  Best-effort by contract: failures and defects are swallowed, so a hook that
+   *  cannot tidy up never fails the operation that triggered it. */
+  readonly afterCommit: (effect: Effect.Effect<void>) => Effect.Effect<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +399,10 @@ export interface ResolveToolsResult {
   /** Human-readable reason for an incomplete listing. Persisted by core when it
    *  preserves the prior catalog so operators can see why data is stale. */
   readonly incompleteReason?: string;
+  /** An actionable connection-health outcome discovered while enumerating the
+   *  catalog. Core persists it while preserving the prior non-authoritative
+   *  catalog. Omit for ordinary transient discovery failures. */
+  readonly health?: HealthCheckResult;
 }
 
 export interface ProjectToolSchemaInput<TStore = unknown> {
@@ -564,6 +632,10 @@ export interface IntegrationPreset {
   readonly url?: string;
   readonly endpoint?: string;
   readonly icon?: string;
+  /** Image to show when `icon` cannot be resolved on this machine — a preset
+   *  whose icon is read from a local install has none until that install
+   *  exists, which is exactly when the card most needs to identify itself. */
+  readonly fallbackIcon?: string;
   readonly featured?: boolean;
   readonly family?: string;
   readonly specFormat?: string;
@@ -572,6 +644,10 @@ export interface IntegrationPreset {
   readonly specOverrides?: readonly unknown[];
   readonly authTemplate?: readonly IntegrationPresetAuthentication[];
   readonly healthCheck?: HealthCheckSpec;
+  /** The public registry lists this product: the picker shows the registry's
+   *  card, and the preset's knowledge rides quick add instead. A custom
+   *  deployment preset leaves this unset and keeps its own card. */
+  readonly registryListed?: boolean;
   readonly transport?: "remote" | "stdio";
   readonly command?: string;
   readonly args?: readonly string[];
@@ -582,6 +658,7 @@ export type IntegrationPresetAuthentication =
   | {
       readonly slug: string;
       readonly kind: "oauth2";
+      readonly label?: string;
       readonly authorizationUrl: string;
       readonly tokenUrl: string;
       readonly resource?: string | null;
@@ -706,13 +783,27 @@ export interface PluginSpec<
     readonly toolRows: readonly ToolInvocationRow[];
   }) => Effect.Effect<Record<string, ToolAnnotations>, unknown>;
 
-  /** Plugin-side cleanup when a connection is removed. */
+  /** Plugin-side cleanup when a connection is removed.
+   *
+   *  RUNS INSIDE core's removal transaction, so database work here is atomic
+   *  with the row deletions — which is the point. The consequence is that
+   *  anything reaching outside the database is NOT: revoking the token at the
+   *  provider's API, deleting a remote object, notifying a third party. If the
+   *  transaction later aborts, the connection is restored and that external
+   *  action has already happened, with nothing left to undo it.
+   *
+   *  Wrap such work in `ctx.afterCommit(...)`. It runs once the removal is
+   *  durable and is discarded if the removal rolls back. */
   readonly removeConnection?: (
     input: ConnectionLifecycleInput<TStore>,
   ) => Effect.Effect<void, unknown>;
 
   /** Plugin-side cleanup when a removable integration is removed. Core still
-   *  owns deleting the integration, connection, tool, and definition rows. */
+   *  owns deleting the integration, connection, tool, and definition rows.
+   *
+   *  Runs inside core's removal transaction, with the same consequence as
+   *  `removeConnection` above: defer any work that reaches outside the database
+   *  through `ctx.afterCommit(...)`. */
   readonly removeIntegration?: (
     input: IntegrationLifecycleInput<TStore>,
   ) => Effect.Effect<void, unknown>;

@@ -1,11 +1,12 @@
-import { Link, Outlet, useLocation, useParams } from "@tanstack/react-router";
+import { Link, Outlet, useLocation, useNavigate, useParams } from "@tanstack/react-router";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import * as AsyncResult from "effect/unstable/reactivity/AsyncResult";
-import { BookOpen, Command, ExternalLink } from "lucide-react";
+import { BookOpen, Command, ExternalLink, PlusIcon } from "lucide-react";
 import type { Integration } from "@executor-js/sdk/shared";
 import { integrationsOptimisticAtom } from "../api/atoms";
 import { trackEvent } from "../api/analytics";
+import { WorkspaceAdminHint } from "../components/workspace-admin-hint";
 import { Button } from "../components/button";
 import { Skeleton } from "../components/skeleton";
 import { SidebarUpdateCard } from "../components/update-card";
@@ -25,6 +26,7 @@ import { CommandPalette } from "../components/command-palette";
 import { Wordmark } from "../components/wordmark";
 import { useClientPlugins, useIntegrationPlugins } from "@executor-js/sdk/client";
 import { useAuth } from "./auth-context";
+import { useCanCreateWorkspaceConnections } from "./use-admin-nav";
 
 // ---------------------------------------------------------------------------
 // Shared multiplayer shell (cloud + self-host).
@@ -347,9 +349,11 @@ function SidebarContent(
     onNavigate?: () => void;
     showBrand?: boolean;
     onOpenCommands: () => void;
+    onOpenIntegrationConnect: () => void;
   },
 ) {
   const plugins = useClientPlugins();
+  const canCreateIntegration = useCanCreateWorkspaceConnections();
   const pluginNavItems = plugins.flatMap((plugin) =>
     (plugin.pages ?? []).flatMap((page) =>
       page.nav
@@ -382,8 +386,22 @@ function SidebarContent(
           />
         ))}
 
-        <div className="mt-5 mb-1 px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
+        <div className="mt-5 mb-1 flex items-center justify-between px-2.5 text-xs font-medium uppercase tracking-widest text-muted-foreground">
           <span>Integrations</span>
+          <WorkspaceAdminHint allowed={canCreateIntegration}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-xs"
+              disabled={!canCreateIntegration}
+              aria-label="Browse integrations"
+              title="Browse integrations"
+              onClick={props.onOpenIntegrationConnect}
+              className="-my-1 text-muted-foreground hover:bg-sidebar-active/60 hover:text-foreground"
+            >
+              <PlusIcon className="size-3.5" />
+            </Button>
+          </WorkspaceAdminHint>
         </div>
 
         <IntegrationList pathname={props.pathname} onNavigate={props.onNavigate} />
@@ -415,6 +433,13 @@ export function Shell(props: ShellProps) {
   const lastPathname = useRef(pathname);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const navigate = useNavigate();
+  // The connect dialog became the full-page picker; the sidebar affordance
+  // navigates instead of opening a modal.
+  const openIntegrationBrowse = () => {
+    trackEvent("integration_browse_opened", { via: "sidebar" });
+    void navigate({ to: "/{-$orgSlug}/integrations/browse" });
+  };
   if (lastPathname.current !== pathname) {
     lastPathname.current = pathname;
     if (mobileSidebarOpen) setMobileSidebarOpen(false);
@@ -438,6 +463,7 @@ export function Shell(props: ShellProps) {
           {...props}
           pathname={pathname}
           onOpenCommands={() => setCommandPaletteOpen(true)}
+          onOpenIntegrationConnect={openIntegrationBrowse}
         />
       </aside>
 
@@ -480,6 +506,10 @@ export function Shell(props: ShellProps) {
               onOpenCommands={() => {
                 setMobileSidebarOpen(false);
                 setCommandPaletteOpen(true);
+              }}
+              onOpenIntegrationConnect={() => {
+                setMobileSidebarOpen(false);
+                openIntegrationBrowse();
               }}
             />
           </div>

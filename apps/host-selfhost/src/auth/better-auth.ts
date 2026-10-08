@@ -1,6 +1,13 @@
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { APIError } from "better-auth/api";
-import { admin, bearer, deviceAuthorization, mcp, organization } from "better-auth/plugins";
+import {
+  admin,
+  bearer,
+  deviceAuthorization,
+  genericOAuth,
+  mcp,
+  organization,
+} from "better-auth/plugins";
 import { apiKey } from "@better-auth/api-key";
 import { type Client } from "@libsql/client";
 import { LibsqlDialect, type LibsqlDialectConfig } from "@libsql/kysely-libsql";
@@ -9,6 +16,7 @@ import { Context } from "effect";
 import { loadConfig } from "../config";
 import { seedOrgAndAdmin } from "./seed";
 import { consumeInviteCode, ensureInviteCodeTable, findRedeemableCode } from "./invites";
+import { isAdmitted, isOAuthCallback, ssoProviderConfig } from "./sso";
 
 // The self-service signup gate: present only on the live (phase-2) auth
 // instance, so the bootstrap seed's `createUser` — which
@@ -24,6 +32,8 @@ interface SignupGate {
 // Only self-service email signups are code-gated. Server/admin-initiated user
 // creation (the seed, or a future admin "add user") flows through other paths.
 const SIGNUP_PATH = "/sign-up/email";
+
+let warnedInsecureTrustedOrigin = false;
 
 // ---------------------------------------------------------------------------
 // Better Auth instance over the SAME libSQL CONNECTION as the FumaDB executor
@@ -63,6 +73,27 @@ const SIGNUP_PATH = "/sign-up/email";
 
 const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?: SignupGate) => {
   const config = loadConfig();
+  // A `Secure` session cookie is never sent back over plain HTTP, so an HTTP
+  // alias can sign in and then look signed out on every later request. Drop the
+  // attribute when ANY trusted origin is HTTP. This is not a new relaxation for
+  // the common cases: Better Auth already infers `useSecureCookies` from the
+  // baseURL scheme, so an all-HTTPS instance still gets `true` and the plain
+  // `http://localhost` default still gets `false`. It only changes the mixed
+  // case an operator opts into with EXECUTOR_TRUSTED_ORIGINS.
+  const hasInsecureTrustedOrigin = config.trustedOrigins.some((origin) =>
+    origin.startsWith("http://"),
+  );
+  // Warn only for that mixed case. An HTTP-only instance (local dev, a LAN
+  // deploy) never had Secure cookies to lose, and warning there would fire on
+  // every default boot.
+  const downgradesCanonicalCookies =
+    hasInsecureTrustedOrigin && config.webBaseUrl.startsWith("https://");
+  if (downgradesCanonicalCookies && !warnedInsecureTrustedOrigin) {
+    warnedInsecureTrustedOrigin = true;
+    console.warn(
+      "[executor] EXECUTOR_TRUSTED_ORIGINS contains an http:// origin, so session cookies drop the Secure attribute for every origin — including the https:// canonical URL. Use https:// aliases to keep session cookies transport-secure.",
+    );
+  }
   // Always resolved (generated + persisted when no env is set); this guards only
   // an explicitly-set env secret that is too weak.
   const secret = config.authSecret;
@@ -88,16 +119,21 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
       type: "sqlite" as const,
     },
     secret,
-    // The browser Origin must match this exactly; CLI/MCP bearer requests carry
-    // no Origin and are unaffected. `config.webBaseUrl` resolves from an explicit
-    // EXECUTOR_WEB_BASE_URL, else a platform-injected origin (Railway/Render/Fly/
-    // …), else localhost — so a PaaS deploy is zero-config and any other host
-    // sets the one variable (a loud warning fires on the localhost fallback).
-    // See config.ts. We deliberately do NOT derive this from the request `Host`:
-    // matching the ecosystem (Windmill `BASE_URL`, n8n `WEBHOOK_URL`), a pinned
-    // origin keeps host-header injection out of OAuth redirects and links.
+    // The canonical browser Origin is config.webBaseUrl; explicitly configured
+    // aliases may also send cookie-authenticated requests. CLI/MCP bearer
+    // requests carry no Origin and are unaffected. We deliberately do NOT derive
+    // either value from the request `Host`: matching the ecosystem (Windmill
+    // `BASE_URL`, n8n `WEBHOOK_URL`), a pinned origin keeps host-header injection
+    // out of OAuth redirects and links. Additional trusted origins affect only
+    // Better Auth's request validation; generated links and OAuth callbacks stay
+    // pinned to config.webBaseUrl.
     baseURL: config.webBaseUrl,
-    trustedOrigins: [config.webBaseUrl],
+    trustedOrigins: [...config.trustedOrigins],
+    advanced: { useSecureCookies: !hasInsecureTrustedOrigin },
+    // Better Auth's own limiter is on in production and off in development.
+    // Only an explicit opt-out is passed through, so that environment default
+    // stays in charge everywhere else.
+    ...(config.authRateLimit ? {} : { rateLimit: { enabled: false } }),
     emailAndPassword: { enabled: true },
     // `apiKey` issues long-lived personal keys (the API-keys page). With
     // `enableSessionForAPIKeys`, presenting a key resolves to its owner's
@@ -141,6 +177,14 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
       // is the page the user opens to confirm the code — the self-host app serves
       // it at /device (this is also the Better Auth default; pinned for clarity).
       deviceAuthorization({ verificationUri: "/device" }),
+      // The operator-configured SSO provider (see config.ts), spoken over plain
+      // OIDC discovery so Google, Okta, Entra, or any compliant IdP slots in —
+      // and so tests can point it at an emulated IdP. The domain gate below is
+      // what admits or refuses the users this creates; enabling the provider
+      // alone never opens registration. Always in the plugin tuple (an empty
+      // provider list serves no routes that match) so the inferred `auth.api`
+      // shape doesn't depend on the environment.
+      genericOAuth({ config: config.sso ? [ssoProviderConfig(config.sso)] : [] }),
       // `consentPage` makes the MCP authorize flow redirect to a human approval
       // screen instead of auto-issuing a code — but ONLY when the request
       // carries `prompt=consent`. MCP clients don't send that, so the self-host
@@ -175,8 +219,26 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
         ? {
             user: {
               create: {
-                before: async (_user, context) => {
-                  if (context?.path !== SIGNUP_PATH) return;
+                before: async (user, context) => {
+                  if (context?.path !== SIGNUP_PATH) {
+                    // SSO sign-ups arrive on an OAuth callback path; the
+                    // verified-domain allowlist gates them in place of an
+                    // invite code. Server-side creation (the seed, admin
+                    // add-user) passes.
+                    const sso = config.sso;
+                    if (
+                      isOAuthCallback(context?.path) &&
+                      !(sso !== undefined && isAdmitted(sso, user))
+                    ) {
+                      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: a Better Auth create hook rejects a request by throwing APIError
+                      throw new APIError("FORBIDDEN", {
+                        message: sso
+                          ? `Sign-ups are restricted to verified ${sso.allowedDomains.map((d) => `@${d}`).join(", ")} accounts.`
+                          : "SSO sign-up is not enabled on this instance.",
+                      });
+                    }
+                    return;
+                  }
                   if (await orgHasNoMembers(gate)) return; // first user claims the org
                   const code = inviteCodeFrom(context);
                   if (!code) {
@@ -193,9 +255,30 @@ const makeAuthOptions = (client: Client, getOrganizationId: () => string, gate?:
                   }
                 },
                 after: async (user, context) => {
-                  if (context?.path !== SIGNUP_PATH) return;
                   const auth = gate.getAuth();
                   if (!auth) return;
+                  if (context?.path !== SIGNUP_PATH) {
+                    // An SSO user that reached `after` was admitted by
+                    // `before`; joining the instance org as a member is what an
+                    // invite redemption would have done. Server-side creation
+                    // (no callback path) is left alone — the seed manages its
+                    // own membership.
+                    const sso = config.sso;
+                    if (
+                      isOAuthCallback(context?.path) &&
+                      sso !== undefined &&
+                      isAdmitted(sso, user)
+                    ) {
+                      await auth.api.addMember({
+                        body: {
+                          userId: user.id,
+                          role: "member",
+                          organizationId: gate.organizationId,
+                        },
+                      });
+                    }
+                    return;
+                  }
                   // First user into an empty org becomes its owner (no code).
                   if (await orgHasNoMembers(gate)) {
                     await auth.api.addMember({

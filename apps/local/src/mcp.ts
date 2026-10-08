@@ -7,6 +7,7 @@ import {
   defaultMcpResource,
   jsonRpcErrorBody,
   mcpResourceKey,
+  preInitializeMethodNotFound,
   type McpResource,
 } from "@executor-js/host-mcp";
 import {
@@ -14,11 +15,13 @@ import {
   type ExecutorMcpServerConfig,
 } from "@executor-js/host-mcp/tool-server";
 import {
-  approvalUrlForRequest,
+  buildResumeApprovalUrl,
   decodeResumeResponse,
   formatResumeAcknowledgement,
   readArtifactsEnabled,
   readElicitationMode,
+  readSearchToolsEnabled,
+  readToolMode,
 } from "@executor-js/host-mcp/browser-approval";
 import { makeInProcessBrowserApprovalStore } from "@executor-js/host-mcp/browser-approval-store";
 import {
@@ -54,6 +57,14 @@ export interface LocalMcpRequestHandlerConfig {
   readonly createConfigForResource?: (
     resource: McpResource,
   ) => Promise<LocalMcpServerConfig> | LocalMcpServerConfig;
+  /**
+   * Pinned public origin for browser-approval URLs. When set (for example
+   * `EXECUTOR_WEB_BASE_URL` behind a TLS proxy) it is preferred over the
+   * request URL, whose scheme is the internal HTTP listener. Omit it on
+   * loopback so the request origin stays the approval link. Port 0 (an
+   * ephemeral bind placeholder) is treated as unset.
+   */
+  readonly webBaseUrl?: string;
 }
 
 // Local serves these error bodies in-process; like the self-host store they are
@@ -120,6 +131,14 @@ const normalizeHandlerConfig = (
   input: ExecutorMcpServerConfig | LocalMcpRequestHandlerConfig,
 ): LocalMcpRequestHandlerConfig => ("defaultConfig" in input ? input : { defaultConfig: input });
 
+// `--port 0` (e2e, some CLI boots) installs EXECUTOR_WEB_BASE_URL with port 0
+// before the OS assigns a listen port. That origin is not browser-reachable
+// (Chrome ERR_UNSAFE_PORT), so approval URLs fall back to the request.
+const resumeApprovalOrigin = (configured: string | undefined, requestUrl: string): string => {
+  if (configured === undefined || configured.length === 0) return requestUrl;
+  return new URL(configured).port === "0" ? requestUrl : configured;
+};
+
 export const createMcpRequestHandler = (
   input: ExecutorMcpServerConfig | LocalMcpRequestHandlerConfig,
 ): McpRequestHandler => {
@@ -180,6 +199,13 @@ export const createMcpRequestHandler = (
         return transport.handleRequest(request);
       }
 
+      // Pre-initialize dispatch: only `initialize` opens a session here, so a
+      // probe for anything else is answered -32601 instead of the transport's
+      // fatal 400. `executor mcp` bridges this endpoint to stdio, so that 400
+      // would close the client's pipe before it could fall back to initialize.
+      const unsupported = await Effect.runPromise(preInitializeMethodNotFound(request));
+      if (unsupported) return unsupported;
+
       let created: McpServer | undefined;
       let createdSessionId: string | null = null;
       let resourceConfig: LocalMcpServerConfig | null = null;
@@ -220,12 +246,18 @@ export const createMcpRequestHandler = (
             ...resourceConfig.config,
             browserApprovalStore: approvals.store,
             artifactsEnabled: readArtifactsEnabled(request),
+            searchToolsEnabled: readSearchToolsEnabled(request),
+            mode: readToolMode(request),
             elicitationMode:
               elicitationMode === "browser"
                 ? {
                     mode: "browser" as const,
                     approvalUrl: (executionId) =>
-                      approvalUrlForRequest(request, executionId, createdSessionId),
+                      buildResumeApprovalUrl({
+                        origin: resumeApprovalOrigin(handlerConfig.webBaseUrl, request.url),
+                        executionId,
+                        sessionId: createdSessionId,
+                      }),
                   }
                 : { mode: elicitationMode },
           }),
@@ -277,7 +309,12 @@ export const createMcpRequestHandler = (
       const response = await readResumeResponse(request);
       if (!response) return json({ error: "Invalid approval response" }, 400);
 
-      await Effect.runPromise(approvals.recordResponse(executionId, response));
+      await Effect.runPromise(
+        approvals.recordResponse(executionId, {
+          response,
+          orgWriteAccess: "allowed",
+        }),
+      );
       return json(resumeApprovalResult(executionId, response));
     },
 

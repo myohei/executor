@@ -123,8 +123,11 @@ export const createServerHandlers = async (token: string): Promise<ServerHandler
         engine,
         artifacts: executor.artifacts,
         connections: executor.connections,
+        tools: executor.tools,
+        integrations: executor.integrations,
         ...appsConfig,
       },
+      webBaseUrl: process.env.EXECUTOR_WEB_BASE_URL || undefined,
       createConfigForResource: async (resource) => {
         if (resource.kind === "default") {
           return {
@@ -132,12 +135,19 @@ export const createServerHandlers = async (token: string): Promise<ServerHandler
               engine,
               artifacts: executor.artifacts,
               connections: executor.connections,
+              tools: executor.tools,
+              integrations: executor.integrations,
               ...appsConfig,
             },
           };
         }
+        // Borrow the running server's DB handle: this process already holds the
+        // data dir's exclusive ownership lock, so opening it a second time here
+        // fails against ourselves. The toolkit executor differs only in its
+        // plugin set, and the borrowed handle stays open when it disposes.
         const handle = await createExecutorHandle({
           activeToolkitSlug: resource.slug,
+          borrowedDb: (await getExecutorBundle()).db,
         });
         const toolkitEngine = withExecutionAnalytics(
           createExecutionEngine({
@@ -152,6 +162,8 @@ export const createServerHandlers = async (token: string): Promise<ServerHandler
             engine: toolkitEngine,
             artifacts: handle.executor.artifacts,
             connections: handle.executor.connections,
+            tools: handle.executor.tools,
+            integrations: handle.executor.integrations,
             ...appsConfig,
           },
           close: handle.dispose,

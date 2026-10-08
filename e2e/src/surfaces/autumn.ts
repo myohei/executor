@@ -51,11 +51,19 @@ export interface LedgerEntry {
   readonly method: string;
   readonly path: string;
   readonly faulted: boolean;
+  /** The customer the request was made against, read from its body. Autumn's
+   *  ledger is shared by every scenario in the run, so attempts have to be
+   *  attributed to one organization before they can be counted. */
+  readonly customerId?: string;
 }
 
 export interface AutumnSurface {
   /** One-shot read of the matching usage events from the ledger. */
   readonly usageEvents: (query: UsageQuery) => Effect.Effect<readonly UsageEvent[], unknown>;
+  /** Every customer id Autumn currently holds (`customers.list`). An org that
+   *  was never provisioned as a billing customer is simply absent — the state
+   *  in which every balance call 404s `customer_not_found` forever. */
+  readonly customerIds: () => Effect.Effect<readonly string[], unknown>;
   /** Poll until at least `count` matching events have landed. The track is
    *  forked and the worker drains it on `waitUntil` shortly after the execution
    *  returns, so arrival is eventually-consistent — polling IS the contract:
@@ -70,12 +78,35 @@ export interface AutumnSurface {
    *  the billing backend becomes consistent. The `sessionId` is the last path
    *  segment of the hosted checkout URL the browser was sent to. */
   readonly settleCheckout: (sessionId: string) => Effect.Effect<void, unknown>;
+  /** Land the asynchronous webhook for a hosted card-update (setup) session,
+   *  replacing the customer's default payment method. Same race as
+   *  `settleCheckout`: the browser is redirected back first, the card only
+   *  changes once this is called. The `sessionId` is the last path segment of
+   *  the hosted setup URL the browser was sent to. */
+  readonly settleSetup: (sessionId: string) => Effect.Effect<void, unknown>;
+  /** The customer's default payment method as Autumn holds it (the
+   *  `payment_method` expand on `customers.get_or_create`), or null when no
+   *  card is on file. */
+  readonly paymentMethod: (
+    customerId: string,
+  ) => Effect.Effect<
+    { brand: string; last4: string; expMonth: number; expYear: number } | null,
+    unknown
+  >;
   /** Burn an org's entire remaining "executions" balance in one `balances.track`,
    *  so the next `balances.check` reports `allowed: false`. The amount is the
    *  default plan's included allotment (read from the plan seed, never hardcoded),
    *  which drives `remaining` to zero. This is the setup a "blocked at cap"
    *  scenario runs before opening the session it expects to be gated. */
   readonly exhaustExecutions: (customerId: string) => Effect.Effect<void, unknown>;
+  /** Put an org on a plan directly (`billing.attach`), skipping the hosted
+   *  checkout. Only valid for a plan that needs no payment — Enterprise carries
+   *  no price and no card-required trial, so the emulator activates its
+   *  subscription inline. Team does have both, so it must still go through the
+   *  browser checkout + `settleCheckout`. This is the setup a scenario runs when
+   *  it needs a PAID org and the upgrade journey itself is not what's under
+   *  test (e.g. the rate-limit backstop's paid exemption). */
+  readonly attachPlan: (customerId: string, planId: string) => Effect.Effect<void, unknown>;
   /** Arm a fault against a matching Autumn request (`POST /_emulate/faults`). */
   readonly armFault: (input: FaultInput) => Effect.Effect<void, unknown>;
   /** Clear every armed fault (`DELETE /_emulate/faults`) — the finalizer that
@@ -84,6 +115,19 @@ export interface AutumnSurface {
   /** Read the emulator's request ledger, filtered to one operation — used to
    *  prove a faulted `balances.check` was actually attempted (fail-open proof). */
   readonly ledgerFor: (operationId: string) => Effect.Effect<readonly LedgerEntry[], unknown>;
+  /** The customer's `members` balance as Autumn holds it — the seat count the
+   *  org is billed on — or null when the customer's plan carries no members
+   *  item. */
+  readonly memberSeats: (
+    customerId: string,
+  ) => Effect.Effect<{ usage: number; granted: number; unlimited: boolean } | null, unknown>;
+  /** Poll until the billed seat count reaches `usage`. Seat reporting is
+   *  forked off the mutating request (like usage tracking), so arrival is
+   *  eventually-consistent — polling IS the contract. */
+  readonly expectMemberSeats: (
+    customerId: string,
+    usage: number,
+  ) => Effect.Effect<{ usage: number; granted: number; unlimited: boolean }, unknown>;
 }
 
 export const makeAutumnSurface = (autumnUrl: string): AutumnSurface => {
@@ -121,6 +165,26 @@ export const makeAutumnSurface = (autumnUrl: string): AutumnSurface => {
         }));
     });
 
+  const customerIds = () =>
+    Effect.gen(function* () {
+      const response = yield* Effect.promise(() =>
+        fetch(`${autumnUrl}/v1/customers.list`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: "{}",
+        }),
+      );
+      if (!response.ok) {
+        return yield* Effect.fail(
+          `autumn customers.list responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
+        );
+      }
+      const body = (yield* Effect.promise(() => response.json())) as {
+        readonly list?: ReadonlyArray<{ readonly id?: string }>;
+      };
+      return (body.list ?? []).map((customer) => customer.id ?? "");
+    });
+
   const settleCheckout = (sessionId: string) =>
     Effect.gen(function* () {
       const response = yield* Effect.promise(() =>
@@ -131,6 +195,50 @@ export const makeAutumnSurface = (autumnUrl: string): AutumnSurface => {
           `autumn checkout settle responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
         );
       }
+    });
+
+  const settleSetup = (sessionId: string) =>
+    Effect.gen(function* () {
+      const response = yield* Effect.promise(() =>
+        fetch(`${autumnUrl}/checkout/setup/${encodeURIComponent(sessionId)}/settle`, {
+          method: "POST",
+        }),
+      );
+      if (!response.ok) {
+        return yield* Effect.fail(
+          `autumn setup settle responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
+        );
+      }
+    });
+
+  const paymentMethod = (customerId: string) =>
+    Effect.gen(function* () {
+      const response = yield* Effect.promise(() =>
+        fetch(`${autumnUrl}/v1/customers.get_or_create`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ customer_id: customerId, expand: ["payment_method"] }),
+        }),
+      );
+      if (!response.ok) {
+        return yield* Effect.fail(
+          `autumn customers.get_or_create responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
+        );
+      }
+      const body = (yield* Effect.promise(() => response.json())) as {
+        readonly payment_method?: {
+          readonly card?: {
+            readonly brand: string;
+            readonly last4: string;
+            readonly exp_month: number;
+            readonly exp_year: number;
+          };
+        } | null;
+      };
+      const card = body.payment_method?.card;
+      return card
+        ? { brand: card.brand, last4: card.last4, expMonth: card.exp_month, expYear: card.exp_year }
+        : null;
     });
 
   // Track exactly the plan's included allotment in one event, driving
@@ -153,6 +261,63 @@ export const makeAutumnSurface = (autumnUrl: string): AutumnSurface => {
           `autumn balances.track responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
         );
       }
+    });
+
+  const attachPlan = (customerId: string, planId: string) =>
+    Effect.gen(function* () {
+      const response = yield* Effect.promise(() =>
+        fetch(`${autumnUrl}/v1/billing.attach`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ customer_id: customerId, plan_id: planId }),
+        }),
+      );
+      if (!response.ok) {
+        return yield* Effect.fail(
+          `autumn billing.attach responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
+        );
+      }
+      // A plan that needs payment answers with a checkout URL instead of
+      // activating; that silently leaves the org on Free, and a scenario that
+      // asked for a paid org would then assert against the wrong plan.
+      const body = (yield* Effect.promise(() => response.json())) as {
+        readonly payment_url?: string | null;
+      };
+      if (body.payment_url) {
+        return yield* Effect.fail(
+          `autumn billing.attach returned a checkout URL for '${planId}': it requires payment, so it cannot be attached directly`,
+        );
+      }
+    });
+
+  const memberSeats = (customerId: string) =>
+    Effect.gen(function* () {
+      const response = yield* Effect.promise(() =>
+        fetch(`${autumnUrl}/v1/customers.get_or_create`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ customer_id: customerId }),
+        }),
+      );
+      if (!response.ok) {
+        return yield* Effect.fail(
+          `autumn customers.get_or_create responded ${response.status}: ${yield* Effect.promise(() => response.text())}`,
+        );
+      }
+      const body = (yield* Effect.promise(() => response.json())) as {
+        readonly balances?: Record<
+          string,
+          { readonly usage?: number; readonly granted?: number; readonly unlimited?: boolean }
+        >;
+      };
+      const balance = body.balances?.["members"];
+      return balance
+        ? {
+            usage: balance.usage ?? 0,
+            granted: balance.granted ?? 0,
+            unlimited: balance.unlimited === true,
+          }
+        : null;
     });
 
   const armFault = (input: FaultInput) =>
@@ -197,25 +362,51 @@ export const makeAutumnSurface = (autumnUrl: string): AutumnSurface => {
           readonly method?: string;
           readonly path?: string;
           readonly faulted?: boolean;
+          readonly request?: { readonly body?: unknown };
         }>;
       };
       return (body.entries ?? [])
         .filter((entry) => entry.operationId === operationId)
-        .map((entry) => ({
-          operationId: entry.operationId,
-          method: entry.method ?? "",
-          path: entry.path ?? "",
-          faulted: entry.faulted === true,
-        }));
+        .map((entry) => {
+          const requestBody = entry.request?.body;
+          const customerId =
+            typeof requestBody === "object" && requestBody !== null
+              ? (requestBody as { readonly customer_id?: unknown }).customer_id
+              : undefined;
+          return {
+            operationId: entry.operationId,
+            method: entry.method ?? "",
+            path: entry.path ?? "",
+            faulted: entry.faulted === true,
+            customerId: typeof customerId === "string" ? customerId : undefined,
+          };
+        });
     });
 
   return {
     usageEvents,
+    customerIds,
     settleCheckout,
+    settleSetup,
+    paymentMethod,
     exhaustExecutions,
+    attachPlan,
     armFault,
     clearFaults,
     ledgerFor,
+    memberSeats,
+    expectMemberSeats: (customerId, usage) =>
+      memberSeats(customerId).pipe(
+        Effect.filterOrFail(
+          (balance): balance is { usage: number; granted: number; unlimited: boolean } =>
+            balance !== null && balance.usage === usage,
+          (balance) =>
+            `members balance for ${customerId} is ${balance ? balance.usage : "absent"}, expected ${usage}`,
+        ),
+        // Same ceiling as expectUsage: the forked seat sync drains on the
+        // worker's waitUntil shortly after the mutating request returns.
+        Effect.retry(Schedule.both(Schedule.spaced("500 millis"), Schedule.recurs(40))),
+      ),
     expectUsage: (query) =>
       usageEvents(query).pipe(
         Effect.filterOrFail(

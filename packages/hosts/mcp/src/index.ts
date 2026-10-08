@@ -21,6 +21,9 @@ export {
   defaultMcpResource,
   mcpResourceKey,
   principalOwns,
+  orgWriteAccessForPrincipal,
+  withOrgWriteAccess,
+  MCP_ORG_WRITE_ACCESS_HEADER,
   authenticated,
   unauthorized,
   forbidden,
@@ -40,5 +43,6 @@ export {
   McpServingRoutes,
   McpDiscoveryRoutes,
   jsonRpcErrorBody,
+  preInitializeMethodNotFound,
   UNAVAILABLE_RETRY_AFTER_SECONDS,
 } from "./envelope";

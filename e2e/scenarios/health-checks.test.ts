@@ -70,6 +70,11 @@ const identitySpec = (baseUrl: string): string =>
           summary: "Send a message",
           responses: { "201": { description: "created" } },
         },
+        delete: {
+          operationId: "deleteMessages",
+          summary: "Delete messages",
+          responses: { "204": { description: "deleted" } },
+        },
       },
     },
   });
@@ -141,14 +146,20 @@ const discriminatedUnionSpec = (baseUrl: string): string => {
 };
 
 /** A real node:http identity API on 127.0.0.1. `GET /me` returns the account
- *  JSON only when the bearer token matches `validToken`; any other token is a
- *  401 (the "the dev token got revoked" case the health check classifies as
- *  expired). Closed by the scope's finalizer. */
+ *  JSON only when the bearer token matches the CURRENT `validToken`; any other
+ *  token is a 401 (the "the dev token got revoked" case the health check
+ *  classifies as expired). `revoke()` rotates the server-side token so a saved
+ *  key stops working mid-scenario. Closed by the scope's finalizer. */
 const serveIdentityApi = (validToken: string) =>
   Effect.acquireRelease(
-    Effect.callback<{ readonly url: string; readonly close: () => void }>((resume) => {
+    Effect.callback<{
+      readonly url: string;
+      readonly revoke: () => void;
+      readonly close: () => void;
+    }>((resume) => {
+      let currentToken = validToken;
       const server = createServer((request, response) => {
-        const authorized = request.headers["authorization"] === `Bearer ${validToken}`;
+        const authorized = request.headers["authorization"] === `Bearer ${currentToken}`;
         if (request.method === "GET" && (request.url ?? "").startsWith("/me")) {
           if (!authorized) {
             response.writeHead(401, { "content-type": "application/json" });
@@ -168,6 +179,9 @@ const serveIdentityApi = (validToken: string) =>
         resume(
           Effect.succeed({
             url: `http://127.0.0.1:${port}`,
+            revoke: () => {
+              currentToken = `revoked_${validToken}`;
+            },
             close: () => {
               server.close();
               server.closeAllConnections();
@@ -323,17 +337,9 @@ scenario(
           expect(healthy.httpStatus, "the saved probe saw the 200").toBe(200);
           expect(healthy.identity, "the saved probe derives the account identity").toBe(IDENTITY);
 
-          // Re-creating the same (owner, integration, name) replaces the stored
-          // key in place: now the connection holds a key the server rejects.
-          yield* client.connections.create({
-            payload: {
-              owner: "org",
-              name,
-              integration: slug,
-              template: TEMPLATE,
-              value: "rotated-away",
-            },
-          });
+          // The server revokes the key: the connection's saved value now gets
+          // a 401 (the "dev token got revoked" case).
+          server.revoke();
           const expired = yield* client.connections.checkHealth({
             params: { owner: "org", integration: slug, name },
             query: {},
@@ -485,14 +491,13 @@ scenario(
         Effect.gen(function* () {
           yield* registerIdentityIntegration(client, slug, server.url);
 
-          // Deliberately declare the DESTRUCTIVE POST as the health check (the
-          // editor warns but allows saving; the runtime is the enforcement).
+          // API configuration must not bypass the runtime's method restriction.
           const candidates = yield* client.integrations.healthCheckCandidates({ params: { slug } });
-          const post = candidates.find((candidate) => candidate.method === "post");
-          if (!post) return yield* Effect.die("identity spec exposed no POST candidate");
+          const mutation = candidates.find((candidate) => candidate.method === "delete");
+          if (!mutation) return yield* Effect.die("identity spec exposed no DELETE candidate");
           yield* client.integrations.healthCheckSet({
             params: { slug },
-            payload: { spec: { operation: post.operation } },
+            payload: { spec: { operation: mutation.operation } },
           });
 
           yield* client.connections.create({
@@ -507,13 +512,15 @@ scenario(
 
           // A health check runs unattended and repeatedly with no approval
           // gate, so the probe REFUSES to execute a mutating operation: the
-          // result is unknown-with-reason and the upstream never sees a POST.
+          // result is unknown-with-reason and the upstream never sees a DELETE.
           const result = yield* client.connections.checkHealth({
             params: { owner: "org", integration: slug, name },
             query: {},
           });
           expect(result.status, "a mutating probe refuses to run").toBe("unknown");
-          expect(result.detail ?? "", "the refusal names the problem").toContain("mutating");
+          expect(result.detail ?? "", "the refusal names the problem").toContain(
+            "not supported for health checks",
+          );
           expect(result.httpStatus, "no request reached the upstream").toBeUndefined();
         }),
         Effect.gen(function* () {
@@ -642,22 +649,14 @@ scenario(
             },
           });
 
-          // Seed a verdict, then re-create the connection with a DEAD key: the
-          // persisted verdict (healthy) and reality (expired) now disagree.
+          // Seed a verdict, then revoke the key server-side: the persisted
+          // verdict (healthy) and reality (expired) now disagree.
           const seeded = yield* client.connections.checkHealth({
             params: { owner: "org", integration: slug, name },
             query: {},
           });
           expect(seeded.status, "the seed probe is healthy").toBe("healthy");
-          yield* client.connections.create({
-            payload: {
-              owner: "org",
-              name,
-              integration: slug,
-              template: TEMPLATE,
-              value: "rotated-away",
-            },
-          });
+          server.revoke();
 
           // Within the freshness window the CACHED verdict comes back with no
           // probe, so the dead key still reads healthy (stale by design).

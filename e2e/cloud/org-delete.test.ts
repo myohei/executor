@@ -1,3 +1,4 @@
+import { verifyAdminInBrowser } from "./support/admin-mfa";
 // Cloud-specific (browser): an admin permanently deletes their organization.
 // A fresh user creates an org through onboarding, opens Organization settings,
 // and uses the danger-zone "Delete organization" flow — which requires
@@ -9,6 +10,7 @@ import { Effect } from "effect";
 
 import { scenario } from "../src/scenario";
 import { Browser, Target } from "../src/services";
+import { visit, settle } from "../src/surfaces/browser";
 
 scenario(
   "Organizations · an admin deletes the organization from settings",
@@ -22,7 +24,7 @@ scenario(
       const ORG = "Doomed Org";
 
       await step("Fresh user creates an org via onboarding", async () => {
-        await page.goto("/", { waitUntil: "networkidle" });
+        await visit(page, "/");
         await page.getByPlaceholder("Northwind Labs").fill(ORG);
         await page.getByRole("button", { name: "Create organization" }).click();
         await page.getByText("Connect your MCP client").waitFor();
@@ -32,13 +34,14 @@ scenario(
         await page.waitForURL((url) => /^\/[a-z0-9-]+\/?$/.test(url.pathname), {
           timeout: 30_000,
         });
-        await page.waitForLoadState("networkidle");
+        await settle(page);
       });
 
       const slug = new URL(page.url()).pathname.split("/").filter(Boolean)[0]!;
 
       await step("Open Organization settings and find the danger zone", async () => {
-        await page.goto(`/${slug}/org`, { waitUntil: "networkidle" });
+        await visit(page, `/${slug}/org`);
+        await verifyAdminInBrowser(page);
         // The admin-only danger zone renders (a member would not see it).
         await page.getByText("Permanently delete this organization").waitFor();
       });

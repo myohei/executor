@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 
 import { formatPausedExecution, type ExecutionEngine } from "@executor-js/execution";
+import type { Executor, OrgWriteAccess } from "@executor-js/sdk";
 
 import {
   buildResumeApprovalUrl,
@@ -10,23 +11,29 @@ import {
   formatResumeAcknowledgement,
   readArtifactsEnabled,
   readElicitationMode,
+  readSearchToolsEnabled,
+  readToolMode,
+  type McpToolMode,
 } from "./browser-approval";
 import {
   makeInProcessBrowserApprovalStore,
   type InProcessBrowserApprovalStore,
 } from "./browser-approval-store";
-import { jsonRpcErrorBody } from "./envelope";
+import { jsonRpcErrorBody, preInitializeMethodNotFound } from "./envelope";
 import {
   McpSessionStore,
+  MCP_ORG_WRITE_ACCESS_HEADER,
   defaultMcpResource,
   mcpResourceKey,
+  orgWriteAccessForPrincipal,
   principalOwns,
+  withOrgWriteAccess,
   type McpDispatchInput,
   type McpDispatchResult,
   type Principal,
   type McpResource,
 } from "./seams";
-import type { BrowserApprovalStore } from "./tool-server";
+import type { BrowserApprovalStore, McpPassthroughUnavailableError } from "./tool-server";
 
 // ---------------------------------------------------------------------------
 // In-process McpSessionStore — the single-node serving store, shared by every
@@ -52,6 +59,38 @@ import type { BrowserApprovalStore } from "./tool-server";
 //   - "forbidden" (session owned by another bearer) -> envelope renders 403 -32003
 // ---------------------------------------------------------------------------
 
+// A streamable-HTTP session only leaves these maps when the client sends
+// `DELETE /mcp`, and nothing sends it: `StreamableHTTPClientTransport.close()`
+// aborts locally and puts nothing on the wire (only `terminateSession()` sends
+// the DELETE, and `Client.close()` does not call it), and a client that crashes
+// or is killed cannot send it at all. Without a sweep, one abandoned session
+// pins its `McpServer`, its tool registry, and its `ExecutionEngine` for the
+// lifetime of the process.
+//
+// The standalone SSE stream is NOT a substitute teardown signal, and it is not
+// absent either. `enableJsonResponse` governs only how a POST carrying requests
+// answers; a POST carrying just the `notifications/initialized` notification
+// still gets a bare 202, which is exactly the cue the client SDK uses to open
+// the long-lived `GET /mcp` stream. So essentially every session holds an open
+// server-to-client stream for its whole life. That stream is silent by design
+// (it exists for server-initiated messages) and this transport does no max-age
+// rotation, so it produces no recurring request to stamp against — an open
+// stream tells us the socket is up, never that the peer is still working.
+//
+// So the store treats a session as abandoned once it has gone `idleTtlMs`
+// without a REQUEST and disposes it, open stream or not. That mirrors cloud's
+// `decideSessionAlarm`, where an active stream extends the lease only up to
+// `MAX_RUNNING_SESSION_IDLE_MS` and the session is then destroyed regardless;
+// the default here is that same order of ceiling. It is also what the
+// streamable-HTTP spec allows a server to do: a request carrying an evicted id
+// gets the store's existing "not-found" (404, -32001), the client's cue to
+// re-initialize. The cost is bounded and visible — a connected-but-quiet client
+// loses its stream at the ceiling and re-initializes on its next call.
+/** Idle window after which an untouched session is evicted. */
+const DEFAULT_SESSION_IDLE_TTL_MS = 30 * 60 * 1000;
+/** Floor on the sweep interval, so a small TTL cannot spin the timer. */
+const MIN_SWEEP_INTERVAL_MS = 30 * 1000;
+
 /** Engine construction failed for a principal. The store surfaces it as a 500. */
 export class McpEngineBuildError extends Data.TaggedError("McpEngineBuildError")<{
   readonly cause: unknown;
@@ -61,6 +100,8 @@ export class McpEngineBuildError extends Data.TaggedError("McpEngineBuildError")
 export interface BuiltMcpServer {
   readonly mcpServer: McpServer;
   readonly engine: ExecutionEngine<Cause.YieldableError>;
+  readonly executor?: Executor;
+  readonly close?: () => Promise<void>;
 }
 
 /** The browser-mode wiring the store hands a build call when a session opts in. */
@@ -75,13 +116,18 @@ export interface McpBuildServerOptions {
    *  with `?artifacts=false`; opted out, the built server registers none of
    *  the artifact tools, resource, or skills. */
   readonly artifactsEnabled?: boolean;
+  /** Whether this session serves the per-integration `search_<integration>`
+   *  tools. False unless the client connected with `?search_tools=true`. */
+  readonly searchToolsEnabled?: boolean;
+  /** The tool surface (`?mode=`): codemode (default) or passthrough. */
+  readonly mode?: McpToolMode;
 }
 
 /** Build the per-session `McpServer` + engine for a principal (the host's engine + tools). */
 export type McpBuildServer = (
   principal: Principal,
   options?: McpBuildServerOptions,
-) => Effect.Effect<BuiltMcpServer, McpEngineBuildError>;
+) => Effect.Effect<BuiltMcpServer, McpEngineBuildError | McpPassthroughUnavailableError>;
 
 export interface InMemoryMcpSessionStore {
   /** The `McpSessionStore` seam value to hand to `inMemoryMcpSessionsLayer`. */
@@ -104,18 +150,54 @@ export interface InMemoryMcpSessionStore {
     request: Request,
     principal?: Principal,
   ) => Promise<Response | null>;
+  /** Number of live initialized sessions currently owned by this store. */
+  readonly sessionCount: () => number;
+  /**
+   * Dispose every session idle past the store's TTL and return how many went.
+   * Runs on a timer; exposed so a host (or a test) can drive it directly.
+   */
+  readonly sweepIdleSessions: (now?: number) => Promise<number>;
   /** Dispose every live session — wire into the host's shutdown (not a seam). */
   readonly close: () => Promise<void>;
 }
 
-const ignoreClose = (close: (() => Promise<void>) | undefined): Promise<void> =>
-  close
-    ? Effect.runPromise(Effect.ignore(Effect.tryPromise({ try: close, catch: () => undefined })))
-    : Promise.resolve();
-
 const formatBoundaryError = (error: unknown): unknown =>
   // oxlint-disable-next-line executor/no-instanceof-error, executor/no-unknown-error-message -- boundary: log unknown MCP SDK/runtime failures
   error instanceof Error ? (error.stack ?? error.message) : error;
+
+/** One session handle refused to close. Reported, never propagated. */
+class McpHandleCloseError extends Data.TaggedError("McpHandleCloseError")<{
+  readonly cause: unknown;
+}> {}
+
+/**
+ * Release one session handle, best effort. Disposal must finish even when a
+ * handle refuses to close — the other handles still have to go, and a rejection
+ * here would surface as an unhandled rejection on a sweep tick nobody awaits.
+ * But a silently swallowed failure is a leaked transport, server, or engine that
+ * nothing can see, so name the handle and the session in a warning.
+ */
+const ignoreClose = (
+  sessionId: string | null,
+  handle: string,
+  close: (() => Promise<void>) | undefined,
+): Promise<void> => {
+  if (!close) return Promise.resolve();
+  const warn = (detail: unknown): Effect.Effect<void> =>
+    Effect.sync(() => {
+      console.warn(
+        `[mcp] failed to close ${handle} for session ${sessionId ?? "<uninitialized>"}:`,
+        formatBoundaryError(detail),
+      );
+    });
+  return Effect.runPromise(
+    Effect.tryPromise({ try: close, catch: (cause) => new McpHandleCloseError({ cause }) }).pipe(
+      Effect.catch((error) => warn(error.cause)),
+      // A defect cannot escape either: this runs detached from any request.
+      Effect.catchCause((cause) => warn(Cause.squash(cause))),
+    ),
+  );
+};
 
 // The store's error bodies are INNER responses (no CORS): the serving envelope
 // re-wraps the store `Response` with CORS before it leaves the origin, so the
@@ -155,39 +237,141 @@ export const makeInMemoryMcpSessionStore = (
   // proxy) it is preferred over the request URL — whose host would be the
   // internal bind address (127.0.0.1:PORT), unreachable for the user. Omit it on
   // loopback hosts (local/desktop), where the request URL is already correct.
-  options: { readonly webBaseUrl?: string } = {},
+  options: {
+    readonly webBaseUrl?: string;
+    /** Idle window before a session is evicted. 0 disables eviction. */
+    readonly sessionIdleTtlMs?: number;
+    /** How often the sweep runs. Defaults to a quarter of the TTL. */
+    readonly sessionSweepIntervalMs?: number;
+  } = {},
 ): InMemoryMcpSessionStore => {
   const transports = new Map<string, WebStandardStreamableHTTPServerTransport>();
   const servers = new Map<string, McpServer>();
   const owners = new Map<string, SessionOwner>();
   const engines = new Map<string, ExecutionEngine<Cause.YieldableError>>();
+  const executors = new Map<string, Executor>();
+  const closers = new Map<string, () => Promise<void>>();
   const approvals: InProcessBrowserApprovalStore = makeInProcessBrowserApprovalStore();
+  // Monotonic-ish last-touch stamp per live session, the first input the idle
+  // sweep reads. Written on create and on every forwarded request.
+  const lastSeen = new Map<string, number>();
+  // Requests currently inside `transport.handleRequest` for a session, the
+  // sweep's second input. A stamp alone cannot describe a long call: it is
+  // written BEFORE the await, so a single `execute` that outruns the TTL (a
+  // browser approval waiting on a human, a slow upstream) would look exactly
+  // like an abandoned session and have its transport, server, and engine closed
+  // out from under the request that is still using them. Counting requests in
+  // flight makes "idle" mean what it says.
+  const activeRequests = new Map<string, number>();
+
+  const idleTtlMs = options.sessionIdleTtlMs ?? DEFAULT_SESSION_IDLE_TTL_MS;
+  const sweepIntervalMs =
+    options.sessionSweepIntervalMs ?? Math.max(MIN_SWEEP_INTERVAL_MS, Math.floor(idleTtlMs / 4));
+
+  const touch = (id: string): void => {
+    if (lastSeen.has(id)) lastSeen.set(id, Date.now());
+  };
+
+  /** Claim a session for one in-flight request, so the sweep cannot take it. */
+  const beginRequest = (id: string): void => {
+    activeRequests.set(id, (activeRequests.get(id) ?? 0) + 1);
+  };
+
+  /**
+   * Release the claim and restamp: a call that ran for an hour leaves the
+   * session idle from the moment it FINISHED, not from the moment it started.
+   * `touch` is a no-op once the session is gone, so this can never resurrect a
+   * disposed id.
+   */
+  const endRequest = (id: string): void => {
+    const remaining = (activeRequests.get(id) ?? 1) - 1;
+    if (remaining > 0) activeRequests.set(id, remaining);
+    else activeRequests.delete(id);
+    touch(id);
+  };
+
+  /**
+   * Shut down a session's engine. Dropping the reference is not enough: the
+   * engine's paused executions hold detached sandbox fibers that keep running —
+   * and keep querying the host's database handle — until `shutdown` interrupts
+   * them. Every disposal path goes through here.
+   */
+  const shutdownEngine = (
+    id: string | null,
+    engine: ExecutionEngine<Cause.YieldableError> | undefined,
+  ): Promise<void> =>
+    ignoreClose(id, "engine", engine ? () => Effect.runPromise(engine.shutdown) : undefined);
+
+  /**
+   * Shut down a session's scoped executor and its plugin resources (such as
+   * tool subprocesses and connection pools). Every disposal path goes through here.
+   */
+  const shutdownExecutor = (id: string | null, executor: Executor | undefined): Promise<void> =>
+    ignoreClose(id, "executor", executor ? () => Effect.runPromise(executor.close()) : undefined);
 
   const dispose = async (id: string, opts: { transport?: boolean; server?: boolean } = {}) => {
     const transport = transports.get(id);
     const server = servers.get(id);
+    const engine = engines.get(id);
+    const executor = executors.get(id);
+    const closer = closers.get(id);
     transports.delete(id);
     servers.delete(id);
     owners.delete(id);
     engines.delete(id);
-    if (opts.transport) await ignoreClose(transport ? () => transport.close() : undefined);
-    if (opts.server) await ignoreClose(server ? () => server.close() : undefined);
+    executors.delete(id);
+    closers.delete(id);
+    lastSeen.delete(id);
+    activeRequests.delete(id);
+    if (opts.transport)
+      await ignoreClose(id, "transport", transport ? () => transport.close() : undefined);
+    if (opts.server) await ignoreClose(id, "server", server ? () => server.close() : undefined);
+    await shutdownEngine(id, engine);
+    await shutdownExecutor(id, executor);
+    await ignoreClose(id, "session", closer);
   };
 
   /**
    * Drive a transport for one web request, recovering any defect to a 500. On a
    * fresh transport that never minted a session id (e.g. a non-initialize first
-   * request), close it and its server eagerly so they don't leak.
+   * request), close it and its server eagerly so they don't leak. The SDK
+   * transport rejects malformed or literal-null POST bodies before dispatch;
+   * every request that reaches dispatch has its org-write-access header
+   * overwritten below with the value derived from the authenticated principal.
    */
   const runHandleRequest = (
     transport: WebStandardStreamableHTTPServerTransport,
     request: Request,
+    orgWriteAccess: OrgWriteAccess,
     onClose?: () => void,
   ): Effect.Effect<Response> => {
     const finish = (): void => {
       if (onClose && !transport.sessionId) onClose();
     };
-    return Effect.promise(() => transport.handleRequest(request)).pipe(
+    const handle =
+      request.method === "POST"
+        ? Effect.tryPromise({
+            try: () => request.json(),
+            catch: () => null,
+          }).pipe(
+            Effect.orElseSucceed(() => null),
+            Effect.flatMap((parsedBody) => {
+              if (parsedBody === null)
+                return Effect.promise(() => transport.handleRequest(request));
+              const headers = new Headers(request.headers);
+              headers.set(MCP_ORG_WRITE_ACCESS_HEADER, orgWriteAccess);
+              const bodylessRequest = new Request(request.url, {
+                method: request.method,
+                headers,
+                signal: request.signal,
+              });
+              return Effect.promise(() => transport.handleRequest(bodylessRequest, { parsedBody }));
+            }),
+          )
+        : Effect.promise(() =>
+            transport.handleRequest(withOrgWriteAccess(request, orgWriteAccess)),
+          );
+    return handle.pipe(
       Effect.tap(() => Effect.sync(finish)),
       Effect.catchCause((cause) =>
         Effect.sync(() => {
@@ -210,7 +394,16 @@ export const makeInMemoryMcpSessionStore = (
     const owner = owners.get(sessionId);
     if (!transport || !owner) return Effect.succeed("not-found");
     if (!sessionOwnerMatches(owner, principal, resource)) return Effect.succeed("forbidden");
-    return runHandleRequest(transport, request);
+    owners.set(sessionId, { principal, resource });
+    touch(sessionId);
+    // Claim before the await, release in the finalizer — `runHandleRequest`
+    // already recovers every failure to a 500, but `ensuring` also covers an
+    // interrupt, so the counter cannot be left permanently raised (which would
+    // make the session immortal, the opposite leak).
+    beginRequest(sessionId);
+    return runHandleRequest(transport, request, orgWriteAccessForPrincipal(principal)).pipe(
+      Effect.ensuring(Effect.sync(() => endRequest(sessionId))),
+    );
   };
 
   /**
@@ -224,10 +417,19 @@ export const makeInMemoryMcpSessionStore = (
     sessionId: () => string | null,
   ): McpBuildServerOptions => {
     const artifactsEnabled = readArtifactsEnabled(request);
-    const mode = readElicitationMode(request);
-    if (mode !== "browser") return { artifactsEnabled, elicitationMode: { mode } };
-    return {
+    const searchToolsEnabled = readSearchToolsEnabled(request);
+    const toolMode = readToolMode(request);
+    const surface = {
       artifactsEnabled,
+      searchToolsEnabled,
+      mode: toolMode,
+    };
+    const mode = readElicitationMode(request);
+    if (mode !== "browser") {
+      return { ...surface, elicitationMode: { mode } };
+    }
+    return {
+      ...surface,
       elicitationMode: {
         mode: "browser",
         // Prefer the pinned public origin; fall back to the request URL (correct
@@ -244,7 +446,7 @@ export const makeInMemoryMcpSessionStore = (
   };
 
   /** Open a new session: build the server, connect a transport, drive the request. */
-  const create = (
+  const openSession = (
     principal: Principal,
     resource: McpResource,
     request: Request,
@@ -254,7 +456,7 @@ export const makeInMemoryMcpSessionStore = (
       ...buildOptionsFor(request, () => createdSessionId),
       resource,
     }).pipe(
-      Effect.flatMap(({ mcpServer, engine }) =>
+      Effect.flatMap(({ mcpServer, engine, executor, close }) =>
         Effect.gen(function* () {
           const transport = new WebStandardStreamableHTTPServerTransport({
             sessionIdGenerator: () => crypto.randomUUID(),
@@ -265,6 +467,9 @@ export const makeInMemoryMcpSessionStore = (
               servers.set(sid, mcpServer);
               owners.set(sid, { principal, resource });
               engines.set(sid, engine);
+              if (executor) executors.set(sid, executor);
+              if (close) closers.set(sid, close);
+              lastSeen.set(sid, Date.now());
             },
             onsessionclosed: (sid) => void dispose(sid, { server: true }),
           });
@@ -275,18 +480,51 @@ export const makeInMemoryMcpSessionStore = (
           yield* Effect.promise(() => mcpServer.connect(transport));
           // The session id is minted on the first (initialize) request, so we
           // drive `handleRequest` here; if no id results we close eagerly.
-          return yield* runHandleRequest(transport, request, () => {
-            void ignoreClose(() => transport.close());
-            void ignoreClose(() => mcpServer.close());
-          });
+          return yield* runHandleRequest(
+            transport,
+            request,
+            orgWriteAccessForPrincipal(principal),
+            () => {
+              // Nothing was ever registered under a session id, so `dispose` has
+              // no entry to work from — release the handles by hand, engine
+              // and executor included.
+              void ignoreClose(null, "transport", () => transport.close());
+              void ignoreClose(null, "server", () => mcpServer.close());
+              void shutdownEngine(null, engine);
+              void shutdownExecutor(null, executor);
+              if (close) void ignoreClose(null, "session", close);
+            },
+          );
         }),
       ),
       // A build failure has nowhere typed to go in the envelope; render a 500.
-      Effect.catchTag("McpEngineBuildError", () =>
-        Effect.succeed(jsonRpcError(500, -32603, "Internal server error")),
-      ),
+      Effect.catchTags({
+        McpEngineBuildError: () =>
+          Effect.succeed(jsonRpcError(500, -32603, "Internal server error")),
+        McpPassthroughUnavailableError: () =>
+          Effect.succeed(jsonRpcError(500, -32603, "Internal server error")),
+      }),
     );
   };
+
+  /**
+   * The session-less POST path: answer a probe for anything but `initialize`
+   * with -32601 (see `preInitializeMethodNotFound`) rather than let the
+   * transport reject it with a connection-killing 400, and only then build a
+   * server and open a session.
+   */
+  const create = (
+    principal: Principal,
+    resource: McpResource,
+    request: Request,
+  ): Effect.Effect<McpDispatchResult> =>
+    preInitializeMethodNotFound(request).pipe(
+      Effect.flatMap((unsupported) =>
+        unsupported
+          ? Effect.succeed<McpDispatchResult>(unsupported)
+          : openSession(principal, resource, request),
+      ),
+    );
 
   const store: McpSessionStore["Service"] = {
     dispatch: ({ request, principal, resource, sessionId }: McpDispatchInput) =>
@@ -364,7 +602,12 @@ export const makeInMemoryMcpSessionStore = (
     const response = raw === null ? null : decodeResumeResponse(raw);
     if (!response) return json({ error: "Invalid approval response" }, 400);
 
-    await Effect.runPromise(approvals.recordResponse(executionId, response));
+    await Effect.runPromise(
+      approvals.recordResponse(executionId, {
+        response,
+        orgWriteAccess: principal ? orgWriteAccessForPrincipal(principal) : "allowed",
+      }),
+    );
     return json({
       status: "completed",
       ...formatResumeAcknowledgement(executionId, response),
@@ -372,12 +615,54 @@ export const makeInMemoryMcpSessionStore = (
     });
   };
 
+  /**
+   * Dispose every session whose last request is older than the idle window AND
+   * which has nothing in flight. A session serving a request is busy, however
+   * long ago that request started; it gets a fresh stamp the moment it ends, so
+   * a later sweep still reclaims it if the client then goes quiet.
+   */
+  const sweepIdleSessions = async (now: number = Date.now()): Promise<number> => {
+    if (idleTtlMs <= 0) return 0;
+    const stale = [...lastSeen.entries()]
+      .filter(([id, seen]) => now - seen >= idleTtlMs && (activeRequests.get(id) ?? 0) === 0)
+      .map(([id]) => id);
+    // Both flags: an evicted session's transport has no other owner, and leaving
+    // it open would keep the very handles the eviction exists to release.
+    await Promise.all(stale.map((id) => dispose(id, { transport: true, server: true })));
+    return stale.length;
+  };
+
+  // `unref` so the sweep never keeps a host process alive on its own. Node and
+  // Bun both return a Timeout with it; the DOM typing does not, hence the guard.
+  const sweepTimer: ReturnType<typeof setInterval> | undefined =
+    idleTtlMs > 0
+      ? setInterval(() => {
+          // Same shape as `ignoreClose`: a sweep failure is not the host's
+          // problem and must never surface as an unhandled rejection.
+          void Effect.runPromise(
+            Effect.ignore(
+              Effect.tryPromise({ try: () => sweepIdleSessions(), catch: () => undefined }),
+            ),
+          );
+        }, sweepIntervalMs)
+      : undefined;
+  (sweepTimer as { unref?: () => void } | undefined)?.unref?.();
+
   return {
     store,
     handlePausedRequest,
     handleApprovalRequest,
+    sessionCount: () => transports.size,
+    sweepIdleSessions,
     close: async () => {
-      const ids = new Set([...transports.keys(), ...servers.keys()]);
+      if (sweepTimer !== undefined) clearInterval(sweepTimer);
+      const ids = new Set([
+        ...transports.keys(),
+        ...servers.keys(),
+        ...engines.keys(),
+        ...executors.keys(),
+        ...closers.keys(),
+      ]);
       await Promise.all([...ids].map((id) => dispose(id, { transport: true, server: true })));
     },
   };

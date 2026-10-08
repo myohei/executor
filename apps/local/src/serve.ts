@@ -13,7 +13,7 @@ import type { Subprocess } from "bun";
 import { setOAuthCompletionListener } from "@executor-js/api";
 import { oauthClientIdMetadataDocumentFromRequest } from "@executor-js/api/server";
 import { loadOrMintLocalAuthToken } from "./auth";
-import { consumeOAuthResult, publishOAuthResult } from "./oauth-result-store";
+import { publishOAuthResult, waitForOAuthResult } from "./oauth-result-store";
 import { disposeAnalytics } from "./analytics";
 import { startIntegrationsRefresh } from "./integrations";
 import { disposeServerHandlers, getServerHandlers } from "./main";
@@ -26,6 +26,11 @@ import {
   makeIsAuthorized,
   normalizeCredential,
 } from "./serve-shared";
+
+// How long one /api/oauth/await request is held open waiting for the OAuth
+// completion to be published. Shorter than the client's overall timeout; the
+// client reconnects after each deadline, so this only bounds a single hold.
+const OAUTH_AWAIT_LONG_POLL_DEADLINE_MS = 25_000;
 
 // ---------------------------------------------------------------------------
 // Static files
@@ -113,6 +118,8 @@ interface ViteChild {
   readonly stop: () => Promise<void>;
 }
 
+const viteChildSignals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+
 async function allocatePort(): Promise<number> {
   const probe = Bun.serve({
     port: 0,
@@ -127,15 +134,15 @@ async function allocatePort(): Promise<number> {
 async function startViteChild(): Promise<ViteChild> {
   const vitePort = await allocatePort();
   const cwd = resolve(import.meta.dirname, "..");
+  const viteEntrypoint = resolve(cwd, "node_modules/vite/bin/vite.js");
   const env = { ...process.env };
   delete env.PORT;
-  // `bunx --bun vite` runs vite under Bun, matching the `dev:vite` script
-  // already in apps/local. --strictPort keeps the URL we hand back stable.
+  // Run Vite directly under Bun, matching the `dev:vite` script without a
+  // bunx wrapper that can outlive its child. --strictPort keeps the URL stable.
   const child: Subprocess = Bun.spawn(
     [
-      "bunx",
-      "--bun",
-      "vite",
+      process.execPath,
+      viteEntrypoint,
       "dev",
       "--port",
       String(vitePort),
@@ -158,20 +165,45 @@ async function startViteChild(): Promise<ViteChild> {
     },
   );
 
+  let stopping = false;
+  const stop = async (): Promise<void> => {
+    if (stopping) {
+      await child.exited;
+      return;
+    }
+    stopping = true;
+    for (const signal of viteChildSignals) process.off(signal, stopOnParentSignal);
+    if (child.exitCode === null) child.kill();
+    await Promise.race([child.exited, Bun.sleep(5_000)]);
+    if (child.exitCode === null) child.kill("SIGKILL");
+    await child.exited;
+  };
+  const stopOnParentSignal = (): void => {
+    // A PTY/session teardown can signal the CLI while Vite is still optimizing
+    // dependencies, before the server's normal stop handle exists. Reap the
+    // owned child immediately; the CLI's signal waiter performs full cleanup
+    // once startup has completed.
+    void stop();
+  };
+  for (const signal of viteChildSignals) process.once(signal, stopOnParentSignal);
+
   const url = `http://127.0.0.1:${vitePort}`;
   const deadline = Date.now() + 30_000;
   while (Date.now() < deadline) {
     // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: probing a child process that may not be listening yet
     try {
-      const r = await fetch(`${url}/`, { redirect: "manual" });
+      const r = await fetch(`${url}/`, {
+        redirect: "manual",
+        // A listening socket is not proof that Vite can answer. Bound each
+        // probe so one accepted-but-stalled request cannot defeat the 30s boot
+        // deadline and wedge the entire local e2e suite.
+        signal: AbortSignal.timeout(5_000),
+      });
       if (r.status < 500) {
         await r.body?.cancel();
         return {
           url,
-          stop: async () => {
-            child.kill();
-            await child.exited;
-          },
+          stop,
         };
       }
       await r.body?.cancel();
@@ -179,12 +211,13 @@ async function startViteChild(): Promise<ViteChild> {
       // not up yet
     }
     if (child.exitCode !== null) {
+      await stop();
       // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: child process aborted before becoming ready
       throw new Error(`vite dev exited with code ${child.exitCode} before becoming ready`);
     }
     await Bun.sleep(150);
   }
-  child.kill();
+  await stop();
   // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: vite never became reachable
   throw new Error(`vite dev did not become reachable on ${url} within 30s`);
 }
@@ -429,9 +462,20 @@ export async function startServer(opts: StartServerOptions = {}): Promise<Server
         // OAuth result polling — local-only, served outside the typed API
         // because cloud (Cloudflare Workers, stateless) can't back the
         // in-memory store. See setOAuthCompletionListener above.
+        // Long-poll: hold the request until the completion listener publishes
+        // for this session, then answer immediately instead of making the
+        // client wait for its next poll tick. On deadline (or client
+        // disconnect) answer null — "still pending" — so the client's outer
+        // retry loop reconnects. `idleTimeout: 0` above permits the hold.
+        // Holds are bounded (one per session, small global cap — see
+        // oauth-result-store.ts); over-cap requests answer immediately with
+        // the current store value, i.e. the pre-long-poll poll behavior.
         const awaitMatch = /^\/api\/oauth\/await\/([^/?#]+)$/.exec(url.pathname);
         if (awaitMatch && req.method === "GET") {
-          const result = consumeOAuthResult(awaitMatch[1]);
+          const result = await waitForOAuthResult(awaitMatch[1], {
+            timeoutMs: OAUTH_AWAIT_LONG_POLL_DEADLINE_MS,
+            signal: req.signal,
+          });
           return withCors(
             new Response(JSON.stringify(result), {
               headers: { "content-type": "application/json" },

@@ -11,6 +11,7 @@ import {
   ToolName,
 } from "./ids";
 import type { AuthMethodDescriptor } from "./integration";
+import { firstPartyOAuthClientSlug } from "./oauth-client";
 import { definePlugin, type IntegrationRecord } from "./plugin";
 import { makeTestWorkspaceHarness, memoryCredentialsPlugin } from "./test-config";
 import { serveTestHttpApp } from "./testing";
@@ -36,8 +37,11 @@ const DECLARED_SCOPES = ["calendar", "gmail", "drive", "sheets"] as const;
  *  scopes (the MCP/no-template-scopes case). */
 const makeScopePluginWithId = <const TId extends string>(
   id: TId,
-  config: { readonly scopes: readonly string[] | null },
-  options: { readonly discoversScopes?: boolean } = {},
+  config: {
+    readonly scopes: readonly string[] | null;
+    readonly authorizationUrl?: string;
+  },
+  options: { readonly discoversScopes?: boolean; readonly discoveryUrl?: string } = {},
 ) =>
   definePlugin(() => ({
     id,
@@ -48,7 +52,10 @@ const makeScopePluginWithId = <const TId extends string>(
       }),
     invokeTool: ({ credential }) => Effect.succeed({ token: credential.value }),
     describeAuthMethods: (record: IntegrationRecord): readonly AuthMethodDescriptor[] => {
-      const cfg = record.config as { readonly scopes?: readonly string[] | null } | null;
+      const cfg = record.config as {
+        readonly scopes?: readonly string[] | null;
+        readonly authorizationUrl?: string;
+      } | null;
       const scopes = cfg?.scopes;
       if (scopes == null) {
         // No declared oauth scopes. Server-targeting methods (MCP) expose a
@@ -61,7 +68,7 @@ const makeScopePluginWithId = <const TId extends string>(
             kind: "oauth",
             template: String(TEMPLATE),
             ...(options.discoversScopes
-              ? { oauth: { discoveryUrl: `https://${id}.example/mcp` } }
+              ? { oauth: { discoveryUrl: options.discoveryUrl ?? `https://${id}.example/mcp` } }
               : {}),
           },
         ];
@@ -72,7 +79,12 @@ const makeScopePluginWithId = <const TId extends string>(
           label: "OAuth2",
           kind: "oauth",
           template: String(TEMPLATE),
-          oauth: { scopes },
+          oauth: {
+            scopes,
+            ...(cfg?.authorizationUrl === undefined
+              ? {}
+              : { authorizationUrl: cfg.authorizationUrl }),
+          },
         },
       ];
     },
@@ -81,13 +93,20 @@ const makeScopePluginWithId = <const TId extends string>(
         ctx.core.integrations.register({
           slug: INTEG,
           description: "Acme",
-          config: { scopes: config.scopes },
+          config: {
+            scopes: config.scopes,
+            ...(config.authorizationUrl === undefined
+              ? {}
+              : { authorizationUrl: config.authorizationUrl }),
+          },
         }),
     }),
   }))();
 
-const makeScopePlugin = (config: { readonly scopes: readonly string[] | null }) =>
-  makeScopePluginWithId("acme", config);
+const makeScopePlugin = (config: {
+  readonly scopes: readonly string[] | null;
+  readonly authorizationUrl?: string;
+}) => makeScopePluginWithId("acme", config);
 
 const makeMcpScopePlugin = (config: { readonly scopes: readonly string[] | null }) =>
   makeScopePluginWithId("mcp", config, { discoversScopes: true });
@@ -158,11 +177,14 @@ const serveMetadataServer = (config: {
  *  given server as its resource, returning the executor ready to `oauth.start`.
  *  The shared setup for the discovery cases below; case (h) inlines its own (no
  *  `resource`) because the absent resource IS the case under test. */
-const setupMcpScopeClient = (server: {
-  readonly authorizationEndpoint: string;
-  readonly tokenEndpoint: string;
-  readonly mcpResourceUrl: string;
-}) =>
+const setupMcpScopeClient = (
+  server: {
+    readonly authorizationEndpoint: string;
+    readonly tokenEndpoint: string;
+    readonly mcpResourceUrl: string;
+  },
+  options: { readonly authorizationEndpoint?: string } = {},
+) =>
   Effect.gen(function* () {
     const plugins = [memoryCredentialsPlugin(), makeMcpScopePlugin({ scopes: null })] as const;
     const { executor } = yield* makeTestWorkspaceHarness({ plugins });
@@ -170,7 +192,7 @@ const setupMcpScopeClient = (server: {
     yield* executor.oauth.createClient({
       owner: "org",
       slug: CLIENT,
-      authorizationUrl: server.authorizationEndpoint,
+      authorizationUrl: options.authorizationEndpoint ?? server.authorizationEndpoint,
       tokenUrl: server.tokenEndpoint,
       grant: "authorization_code",
       clientId: "test-client",
@@ -220,6 +242,57 @@ describe("oauth.start integration-driven scopes", () => {
           expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual([...DECLARED_SCOPES]);
         }),
       ),
+  );
+
+  it.effect("moves integration-declared optional scopes out of scope into optional_scope", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const declared = [
+          "oauth",
+          "crm.objects.contacts.read",
+          "crm.objects.companies.read",
+        ] as const;
+        const optional = [
+          "crm.objects.contacts.read",
+          "crm.objects.companies.read",
+          "content",
+        ] as const;
+        const server = yield* serveOAuthTestServer({ scopes: [...declared] });
+        const plugins = [
+          memoryCredentialsPlugin(),
+          makeScopePlugin({
+            scopes: declared,
+            authorizationUrl: `${server.authorizationEndpoint}?optional_scope=${optional.join("+")}`,
+          }),
+        ] as const;
+        const { executor } = yield* makeTestWorkspaceHarness({ plugins });
+        yield* executor.acme.seed();
+        yield* executor.oauth.createClient({
+          owner: "org",
+          slug: CLIENT,
+          authorizationUrl: server.authorizationEndpoint,
+          tokenUrl: server.tokenEndpoint,
+          grant: "authorization_code",
+          clientId: "test-client",
+          clientSecret: "test-secret",
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+
+        const url = new URL(started.authorizationUrl);
+        expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual(["oauth"]);
+        expect(url.searchParams.get("optional_scope")?.split(/\s+/)).toEqual(optional);
+      }),
+    ),
   );
 
   it.effect("filters stale declared scopes against authorization-server metadata", () =>
@@ -404,6 +477,57 @@ describe("oauth.start integration-driven scopes", () => {
       ),
   );
 
+  it.effect("requests Vercel offline_access so authorization-code connections can refresh", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveMetadataServer({
+          prm: { scopesSupported: ["openid"] },
+        });
+        const executor = yield* setupMcpScopeClient(server, {
+          authorizationEndpoint: "https://vercel.com/oauth/authorize",
+        });
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+
+        expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual([
+          "openid",
+          "offline_access",
+        ]);
+      }),
+    ),
+  );
+
+  it.effect("does not add Vercel lifecycle scopes on a different port", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const server = yield* serveMetadataServer({ prm: { scopesSupported: ["openid"] } });
+        const executor = yield* setupMcpScopeClient(server, {
+          authorizationEndpoint: "https://vercel.com:8443/oauth/authorize",
+        });
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+        expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual(["openid"]);
+      }),
+    ),
+  );
+
   it.effect(
     "(e) for MCP, discovers scopes from a cross-origin authorization server named in resource metadata",
     () =>
@@ -494,19 +618,28 @@ describe("oauth.start integration-driven scopes", () => {
   );
 
   it.effect(
-    "(h) for MCP, a client with no resource fails start (discovery cannot run without one)",
+    "(h) for MCP, a client with no resource still discovers scopes from the integration's discovery URL",
     () =>
       Effect.scoped(
         Effect.gen(function* () {
+          // #1789 — a user may CLEAR the client's RFC 8707 resource (Entra v2
+          // rejects the parameter). Scope discovery must not die with it: the
+          // integration's own discovery URL (the MCP endpoint) is probed
+          // instead, and the authorize request carries no `resource`.
           const server = yield* serveMetadataServer({ prm: { scopesSupported: ["read"] } });
           const plugins = [
             memoryCredentialsPlugin(),
-            makeMcpScopePlugin({ scopes: null }),
+            makeScopePluginWithId(
+              "mcp",
+              { scopes: null },
+              { discoversScopes: true, discoveryUrl: server.mcpResourceUrl },
+            ),
           ] as const;
           const { executor } = yield* makeTestWorkspaceHarness({ plugins });
           yield* executor.mcp.seed();
 
-          // No `resource` on the client — discovery has nothing to probe.
+          // No `resource` on the client — the wire parameter is absent by
+          // choice, while discovery still has the integration's URL.
           yield* executor.oauth.createClient({
             owner: "org",
             slug: CLIENT,
@@ -517,28 +650,105 @@ describe("oauth.start integration-driven scopes", () => {
             clientSecret: "test-secret",
           });
 
-          const exit = yield* Effect.exit(
-            executor.oauth.start({
-              owner: "org",
-              client: CLIENT,
-              clientOwner: "org",
-              name: ConnectionName.make("main"),
-              integration: INTEG,
-              template: TEMPLATE,
-            }),
-          );
-          expect(Exit.isFailure(exit)).toBe(true);
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: CLIENT,
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+
+          expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual(["read"]);
+          // The cleared resource stays cleared on the wire.
+          expect(new URL(started.authorizationUrl).searchParams.has("resource")).toBe(false);
         }),
       ),
   );
 
-  it.effect("(j) caps server-advertised resource scopes so the authorize URL stays bounded", () =>
+  it.effect(
+    "(i) a scope-limited first-party MCP app caps the provider's advertised scope catalog",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const server = yield* serveMetadataServer({
+            prm: { scopesSupported: ["read", "write", "admin"] },
+          });
+          const plugins = [
+            memoryCredentialsPlugin(),
+            makeMcpScopePlugin({ scopes: null }),
+          ] as const;
+          const { executor } = yield* makeTestWorkspaceHarness({
+            plugins,
+            firstPartyOAuthClients: [
+              {
+                name: "acme",
+                authorizationUrl: server.authorizationEndpoint,
+                tokenUrl: server.tokenEndpoint,
+                resource: server.mcpResourceUrl,
+                clientId: "test-client",
+                clientSecret: "test-secret",
+                integrations: [INTEG],
+                allowedScopes: ["read", "write"],
+              },
+            ],
+          });
+          yield* executor.mcp.seed();
+
+          const started = yield* executor.oauth.start({
+            owner: "org",
+            client: firstPartyOAuthClientSlug("acme"),
+            clientOwner: "org",
+            name: ConnectionName.make("main"),
+            integration: INTEG,
+            template: TEMPLATE,
+          });
+          expect(started.status).toBe("redirect");
+          if (started.status !== "redirect") return;
+
+          expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual(["read", "write"]);
+        }),
+      ),
+  );
+
+  it.effect("(j) requests every advertised scope of a large but realistic resource list", () =>
     Effect.scoped(
       Effect.gen(function* () {
-        // A hostile/buggy server advertises far more scopes than any real
-        // template. Discovery caps the request at 100 so the authorize URL
-        // cannot be blown up.
-        const manyScopes = Array.from({ length: 200 }, (_, i) => `scope:${i}`);
+        // A fine-grained resource can legitimately advertise well over a
+        // hundred scopes (PostHog lists 150). Dropping any of them mints a
+        // token the resource rejects, so the whole list must be requested.
+        const manyScopes = Array.from(
+          { length: 150 },
+          (_, i) => `resource_${i}:${i % 2 === 0 ? "read" : "write"}`,
+        );
+        const server = yield* serveMetadataServer({ prm: { scopesSupported: manyScopes } });
+        const executor = yield* setupMcpScopeClient(server);
+
+        const started = yield* executor.oauth.start({
+          owner: "org",
+          client: CLIENT,
+          clientOwner: "org",
+          name: ConnectionName.make("main"),
+          integration: INTEG,
+          template: TEMPLATE,
+        });
+        expect(started.status).toBe("redirect");
+        if (started.status !== "redirect") return;
+
+        expect(scopesFromAuthorizeUrl(started.authorizationUrl)).toEqual(manyScopes);
+      }),
+    ),
+  );
+
+  it.effect("(j2) caps server-advertised resource scopes so the authorize URL stays bounded", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        // A hostile/buggy server advertises an absurd list. Discovery keeps
+        // the longest leading prefix whose joined `scope` value fits the
+        // 8 KiB budget so the authorize URL cannot be blown up.
+        const manyScopes = Array.from({ length: 2000 }, (_, i) => `scope:${i}`);
         const server = yield* serveMetadataServer({ prm: { scopesSupported: manyScopes } });
         const executor = yield* setupMcpScopeClient(server);
 
@@ -554,8 +764,10 @@ describe("oauth.start integration-driven scopes", () => {
         if (started.status !== "redirect") return;
 
         const requested = scopesFromAuthorizeUrl(started.authorizationUrl);
-        expect(requested.length).toBe(100);
-        expect(requested).toEqual(manyScopes.slice(0, 100));
+        expect(requested.length).toBeLessThan(manyScopes.length);
+        expect(requested).toEqual(manyScopes.slice(0, requested.length));
+        expect(requested.join(" ").length).toBeLessThanOrEqual(8192);
+        expect([...requested, manyScopes[requested.length]].join(" ").length).toBeGreaterThan(8192);
       }),
     ),
   );

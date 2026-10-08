@@ -17,6 +17,8 @@ import { ApiKeyService } from "../auth/api-keys";
 import { BEARER_PREFIX } from "../auth/bearer";
 import { authorizeOrganization } from "../auth/organization";
 import { UserStoreService, makeUserStoreLayer } from "../auth/context";
+import { makeMemberDirectoryLayer } from "../auth/member-directory";
+import { makeWorkOsMirrorLayer } from "../auth/workos-mirror";
 import { CoreSharedServices } from "../auth/workos";
 import { makeDbLayer } from "../db/db";
 import { bearerChallenge } from "./responses";
@@ -60,7 +62,7 @@ const TOOLKIT_SEGMENT = "/toolkits/";
 // the token's `org_id` claim. start.ts / the test worker rewrite `/org_xxx/mcp`
 // (and the org-scoped discovery doc) to the bare path the shared envelope routes
 // and stash the URL-pinned org in this INTERNAL header; the provider reads it
-// back. The org is re-checked against live WorkOS membership per request
+// back. The org is re-checked against the local membership mirror per request
 // (`McpOrganizationAuth.authorize`), so the header — like the URL it came from —
 // is a SELECTOR, not a trust boundary.
 export const MCP_ORGANIZATION_HEADER = "x-executor-mcp-organization";
@@ -160,19 +162,33 @@ export class McpAuth extends Context.Service<
   }
 >()("@executor-js/cloud/McpAuth") {}
 
+/**
+ * The organization an MCP request was authorized against. The full record, not
+ * just its id: the same request later needs the org's display name and slug to
+ * open a session, and re-reading the row for them (from the session Durable
+ * Object, on a fresh database connection) is a redundant failure point on a
+ * request that already has the answer.
+ */
+export type AuthorizedMcpOrganization = {
+  readonly id: string;
+  readonly name: string;
+  readonly slug?: string;
+  readonly memberRole: "admin" | "member";
+};
+
 export class McpOrganizationAuth extends Context.Service<
   McpOrganizationAuth,
   {
     /**
      * Authorize `accountId` against an org SELECTOR — a WorkOS org id
      * (`org_…`, from the token or a legacy URL) or the org's URL slug (the
-     * form the install card prints). Returns the resolved org id when the
+     * form the install card prints). Returns the resolved organization when the
      * caller holds an active membership, `null` otherwise.
      */
     readonly authorize: (
       accountId: string,
       organizationSelector: string,
-    ) => Effect.Effect<string | null, unknown>;
+    ) => Effect.Effect<AuthorizedMcpOrganization | null, unknown>;
   }
 >()("@executor-js/cloud/McpOrganizationAuth") {}
 
@@ -187,24 +203,34 @@ const verifyJwt = (token: string) =>
 // `DbService.Live` would open its postgres socket on the first request and
 // illegally reuse it on later ones ("Cannot perform I/O on behalf of a
 // different request"), failing the org lookup on every follow-up — the
-// "connected · tools fetch failed" symptom. A fresh DB + UserStore layer per
-// call gives each request its own request-scoped socket. `CoreSharedServices`
-// (WorkOS, no per-request socket) stays shared.
+// "connected · tools fetch failed" symptom. A fresh DB + UserStore +
+// MemberDirectory + WorkOsMirror layer per call gives each request its own
+// request-scoped socket. `CoreSharedServices` (WorkOS, no per-request socket) stays shared.
 const makeMcpOrganizationAuthServices = () => {
   const dbLive = makeDbLayer();
   const userStoreLive = makeUserStoreLayer().pipe(Layer.provide(dbLive));
-  return Layer.mergeAll(dbLive, userStoreLive, CoreSharedServices);
+  const memberDirectoryLive = makeMemberDirectoryLayer().pipe(Layer.provide(dbLive));
+  const workOsMirrorLive = makeWorkOsMirrorLayer().pipe(Layer.provide(dbLive));
+  return Layer.mergeAll(
+    dbLive,
+    userStoreLive,
+    memberDirectoryLive,
+    workOsMirrorLive,
+    CoreSharedServices,
+  );
 };
 
 // A URL slug resolves through the mirror to its org id before the membership
 // check; an unknown slug authorizes nothing. Ids pass straight through —
-// `authorizeOrganization` verifies live WorkOS membership either way.
+// `authorizeOrganization` verifies membership against the mirror either way.
 const resolveOrgSelector = (selector: string) =>
   selector.startsWith("org_")
     ? Effect.succeed(selector)
     : Effect.gen(function* () {
         const users = yield* UserStoreService;
-        const org = yield* users.use((s) => s.getOrganizationBySlug(selector));
+        const org = yield* users.use("getOrganizationBySlug", (s) =>
+          s.getOrganizationBySlug(selector),
+        );
         return org?.id ?? null;
       });
 
@@ -214,7 +240,16 @@ export const McpOrganizationAuthLive = Layer.succeed(McpOrganizationAuth)({
       Effect.flatMap((organizationId) =>
         organizationId
           ? authorizeOrganization(accountId, organizationId).pipe(
-              Effect.map((org) => (org ? org.id : null)),
+              Effect.map((org) =>
+                org
+                  ? ({
+                      id: org.id,
+                      name: org.name,
+                      slug: org.slug,
+                      memberRole: org.memberRole,
+                    } as const)
+                  : null,
+              ),
             )
           : Effect.succeed(null),
       ),
@@ -291,7 +326,9 @@ export const McpAuthLive = Layer.effect(
       if (!verified) return mcpUnauthorized("invalid_token", "The access token is invalid");
       if (Predicate.isTagged(verified, "Unauthorized")) return verified;
       if (!verified.accountId) {
-        yield* Effect.annotateCurrentSpan({ "mcp.auth.outcome": "missing_subject" });
+        yield* Effect.annotateCurrentSpan({
+          "mcp.auth.outcome": "missing_subject",
+        });
         return mcpUnauthorized("invalid_token", "The access token is invalid");
       }
       yield* Effect.annotateCurrentSpan({
@@ -306,7 +343,9 @@ export const McpAuthLive = Layer.effect(
       verifyBearer: Effect.fn("mcp.auth.verify_bearer")(function* (request) {
         const authHeader = request.headers.get("authorization");
         if (!authHeader?.startsWith(BEARER_PREFIX)) {
-          yield* Effect.annotateCurrentSpan({ "mcp.auth.outcome": "missing_bearer" });
+          yield* Effect.annotateCurrentSpan({
+            "mcp.auth.outcome": "missing_bearer",
+          });
           return mcpUnauthorized("missing_bearer");
         }
         const token = authHeader.slice(BEARER_PREFIX.length).trim();

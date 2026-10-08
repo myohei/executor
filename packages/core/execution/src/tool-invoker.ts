@@ -31,8 +31,12 @@ const TOOL_HTTP_META_TYPESCRIPT = "{ status: number; headers: { [k: string]: str
 const TOOL_FILE_TYPESCRIPT =
   '{ _tag: "ToolFile"; name?: string; mimeType: string; encoding: "base64"; data: string; byteLength: number; }';
 
-const wrapOutputTypeScript = (outputTypeScript?: string): string =>
-  `{ ok: true; data: ${outputTypeScript ?? "unknown"}; http?: ToolHttpMeta } | { ok: false; error: ToolError }`;
+const wrapOutputTypeScript = (outputTypeScript?: string, marker?: string): string =>
+  `{ ok: true; data: ${outputTypeScript ?? "unknown"}${marker ?? ""}; http?: ToolHttpMeta } | { ok: false; error: ToolError }`;
+
+/** Inline provenance for observed types — a model that copies only the type
+ *  string still sees the hint, since the compact render drops descriptions. */
+const OBSERVED_TYPE_MARKER = " /* observed; may be incomplete */";
 
 const withToolResultDefinitions = (
   definitions?: Record<string, string>,
@@ -76,7 +80,15 @@ type DescribedTool = {
   readonly description?: string;
   readonly inputTypeScript?: string;
   readonly outputTypeScript?: string;
+  readonly outputTypeScriptNote?: string;
   readonly typeScriptDefinitions?: Record<string, string>;
+  /** The tool's declared annotations, when it carries any. Lets code inside
+   *  `execute` branch on approval posture without parsing the description. */
+  readonly annotations?: {
+    readonly requiresApproval?: boolean;
+    readonly approvalDescription?: string;
+    readonly mayElicit?: boolean;
+  };
   /** Set when the path resolves to no tool — mirrors invoke's tool_not_found. */
   readonly error?: {
     readonly code: "tool_not_found";
@@ -130,7 +142,7 @@ const BUILTIN_TOOL_DESCRIPTIONS: ReadonlyMap<string, DescribedTool> = new Map<
       outputTypeScript: "DescribedTool",
       typeScriptDefinitions: {
         DescribedTool:
-          '{ path: string; name: string; description?: string; inputTypeScript?: string; outputTypeScript?: string; typeScriptDefinitions?: { [k: string]: string; }; error?: { code: "tool_not_found"; message: string; suggestions?: string[]; }; }',
+          '{ path: string; name: string; description?: string; inputTypeScript?: string; outputTypeScript?: string; typeScriptDefinitions?: { [k: string]: string; }; annotations?: { requiresApproval?: boolean; approvalDescription?: string; mayElicit?: boolean; }; error?: { code: "tool_not_found"; message: string; suggestions?: string[]; }; }',
       },
     },
   ],
@@ -301,7 +313,10 @@ const extractNamespace = (path: string): string => {
  */
 export const makeExecutorToolInvoker = (
   executor: Executor,
-  options: { readonly invokeOptions: InvokeOptions },
+  options: {
+    readonly invokeOptions: InvokeOptions;
+    readonly onConnectedToolCall?: (path: string) => void;
+  },
 ): SandboxToolInvoker => ({
   invoke: Effect.fn("mcp.tool.dispatch")(function* ({ path, args }) {
     yield* Effect.annotateCurrentSpan({
@@ -367,6 +382,12 @@ export const makeExecutorToolInvoker = (
     // outcome annotation the dispatch span reads as healthy even when the
     // caller hit an upstream error or auth wall.
     yield* annotateToolResultOutcome(result);
+    const connectedToolPath = parseToolAddress(String(address))
+      ? addressToPath(String(address))
+      : undefined;
+    if (connectedToolPath && (!isToolResult(result) || result.ok)) {
+      options.onConnectedToolCall?.(connectedToolPath);
+    }
     if (isToolResult(result)) {
       return result;
     }
@@ -651,7 +672,7 @@ const scoreToolMatch = (tool: SearchableTool, query: string): ToolDiscoveryResul
 
 /** What `tools.search()` calls inside the sandbox. */
 export const searchTools = Effect.fn("executor.tools.search")(function* (
-  executor: Executor,
+  executor: { readonly tools: Pick<Executor["tools"], "list"> },
   query: string,
   limit = 12,
   options?: { readonly namespace?: string; readonly offset?: number },
@@ -865,8 +886,20 @@ export const describeTool = Effect.fn("executor.tools.describe")(function* (
     name: schema.name ?? path,
     description: schema.description,
     inputTypeScript: schema.inputTypeScript,
-    outputTypeScript: wrapOutputTypeScript(schema.outputTypeScript),
+    outputTypeScript: wrapOutputTypeScript(
+      schema.outputTypeScript,
+      schema.outputSchemaSource === "observed" ? OBSERVED_TYPE_MARKER : undefined,
+    ),
+    // The compact TS render drops the schema's provenance description, so an
+    // observed (runtime-inferred) shape gets an explicit note: the model
+    // should treat the fields as reliable but not exhaustive.
+    ...(schema.outputSchemaSource === "observed"
+      ? {
+          outputTypeScriptNote: `data type observed from ${schema.outputSchemaObservations ?? 1} live response(s), not declared by the provider; fields may be incomplete.`,
+        }
+      : {}),
     typeScriptDefinitions: withToolResultDefinitions(schema.typeScriptDefinitions),
+    ...(schema.annotations ? { annotations: schema.annotations } : {}),
   };
   return described;
 });

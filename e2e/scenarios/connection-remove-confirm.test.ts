@@ -14,6 +14,7 @@ import { AuthTemplateSlug, ConnectionName, IntegrationSlug } from "@executor-js/
 
 import { scenario } from "../src/scenario";
 import { Api, Browser, Target } from "../src/services";
+import { visit } from "../src/surfaces/browser";
 
 const api = composePluginApi([openApiHttpPlugin()] as const);
 
@@ -40,7 +41,7 @@ scenario(
     const client = yield* makeClient(api, identity);
 
     const slug = IntegrationSlug.make(`rm-confirm-${randomBytes(4).toString("hex")}`);
-    const name = ConnectionName.make("main");
+    const name = ConnectionName.make("longconnectionnamethatmustwrapwithoutoverflow");
 
     yield* Effect.ensuring(
       Effect.gen(function* () {
@@ -72,19 +73,37 @@ scenario(
           const connections = page.locator("section").filter({
             has: page.getByRole("heading", { level: 3, name: "Connections" }),
           });
-          const row = connections.getByText("main", { exact: true });
+          const row = connections.getByText(String(name), { exact: true });
           const menuTrigger = connections.locator('button[aria-haspopup="menu"]');
           const confirm = page.getByRole("alertdialog");
+          const removeAction = confirm.getByRole("button", { name: "Remove connection" });
 
           await step("Open the integration's connections", async () => {
-            await page.goto(`/integrations/${slug}`, { waitUntil: "networkidle" });
+            await visit(page, `/integrations/${slug}`);
             await row.waitFor();
           });
 
           await step("Remove asks for confirmation instead of firing", async () => {
             await menuTrigger.click();
             await page.getByRole("menuitem", { name: "Remove" }).click();
-            await confirm.getByText("Remove main?").waitFor();
+            const title = confirm.getByText(`Remove ${String(name)}?`);
+            await title.waitFor();
+            await removeAction.getByText("Remove", { exact: true }).waitFor();
+
+            const layout = await confirm.evaluate((dialog) => {
+              const title = dialog.querySelector<HTMLElement>('[data-slot="alert-dialog-title"]');
+              if (title === null) return null;
+              const titleText = document.createRange();
+              titleText.selectNodeContents(title);
+              return {
+                dialogFits: dialog.scrollWidth <= dialog.clientWidth + 1,
+                titleWraps: titleText.getClientRects().length > 1,
+              };
+            });
+            expect(layout, "the confirmation title wraps without widening the dialog").toEqual({
+              dialogFits: true,
+              titleWraps: true,
+            });
           });
 
           await step("Cancel keeps the connection", async () => {
@@ -96,7 +115,7 @@ scenario(
           await step("Confirming actually removes it", async () => {
             await menuTrigger.click();
             await page.getByRole("menuitem", { name: "Remove" }).click();
-            await confirm.getByRole("button", { name: "Remove connection" }).click();
+            await removeAction.click();
             await confirm.waitFor({ state: "detached" });
             await row.waitFor({ state: "detached" });
           });

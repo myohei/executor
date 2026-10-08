@@ -29,6 +29,7 @@ import {
   createPkceCodeVerifier,
   type OAuthEndpointUrlPolicy,
 } from "./oauth-helpers";
+import { parseChallenges } from "./www-authenticate";
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -82,8 +83,30 @@ export const OAuthAuthorizationServerMetadataSchema = Schema.Struct({
   introspection_endpoint: Schema.optional(Schema.String),
   userinfo_endpoint: Schema.optional(Schema.String),
   id_token_signing_alg_values_supported: Schema.optional(StringArray),
+  /** draft-ietf-oauth-identity-assertion-authz-grant-04 §7.2 — the
+   *  authorization grant profiles this Resource Authorization Server
+   *  implements. Advertising a profile says only that the server implements
+   *  its processing rules; it promises nothing about any particular issuer,
+   *  client, or subject being accepted. */
+  authorization_grant_profiles_supported: Schema.optional(StringArray),
 }).annotate({ identifier: "OAuthAuthorizationServerMetadata" });
 export type OAuthAuthorizationServerMetadata = typeof OAuthAuthorizationServerMetadataSchema.Type;
+
+/** draft-ietf-oauth-identity-assertion-authz-grant-04 §7.2 — the profile
+ *  identifier a Resource Authorization Server advertises when it can process
+ *  an Identity Assertion JWT Authorization Grant (ID-JAG). */
+export const ID_JAG_GRANT_PROFILE = "urn:ietf:params:oauth:grant-profile:id-jag";
+
+/** Whether a Resource Authorization Server advertises the ID-JAG grant profile
+ *  (§7.2). This is the ONLY discovery signal that gates enterprise-managed
+ *  authorization: a server that stays silent gets the ordinary interactive
+ *  flow. It is deliberately not inferred from `grant_types_supported`
+ *  containing `jwt-bearer` — that grant type predates this profile and says
+ *  nothing about ID-JAG processing rules. */
+export const supportsIdJagGrantProfile = (
+  metadata: Pick<OAuthAuthorizationServerMetadata, "authorization_grant_profiles_supported">,
+): boolean =>
+  metadata.authorization_grant_profiles_supported?.includes(ID_JAG_GRANT_PROFILE) === true;
 
 export type DynamicClientMetadata = {
   readonly client_name?: string;
@@ -228,8 +251,8 @@ const executeText = (
 // ---------------------------------------------------------------------------
 // RFC 9728 — Protected Resource Metadata
 //
-// Not covered by `oauth4webapi`. Hand-rolled probe: try the path-scoped
-// well-known first, then the origin-scoped fallback.
+// Follow the protected endpoint's advertised metadata URL before trying
+// path-scoped and origin-scoped well-known locations (RFC 9728 section 5).
 // ---------------------------------------------------------------------------
 
 const buildResourceMetadataUrls = (resourceUrl: string): string[] => {
@@ -256,6 +279,61 @@ const withResourceQueryParams = (
   return parsed.toString();
 };
 
+const discoverResourceMetadataChallenge = (
+  resourceUrl: string,
+  options: DiscoveryRequestOptions,
+): Effect.Effect<string | null, OAuthDiscoveryError> =>
+  provideHttpClient(
+    Effect.gen(function* () {
+      yield* validateEndpointUrl(resourceUrl, "resource", options.endpointUrlPolicy);
+      let request = HttpClientRequest.get(
+        withResourceQueryParams(resourceUrl, options.resourceQueryParams),
+      ).pipe(HttpClientRequest.setHeader("accept", "application/json"));
+      for (const [name, value] of Object.entries(options.resourceHeaders ?? {})) {
+        request = HttpClientRequest.setHeader(request, name, value);
+      }
+      if (options.mcpProtocolVersion) {
+        request = HttpClientRequest.setHeader(
+          request,
+          MCP_PROTOCOL_VERSION_HEADER,
+          options.mcpProtocolVersion,
+        );
+      }
+      const client = yield* HttpClient.HttpClient;
+      // Read headers only: an MCP GET can open a long-lived event stream.
+      const response = yield* HttpClient.withScope(client)
+        .execute(request)
+        .pipe(
+          Effect.timeout(Duration.millis(options.timeoutMs ?? OAUTH2_DEFAULT_TIMEOUT_MS)),
+          Effect.mapError(
+            (cause) =>
+              new OAuthDiscoveryError({
+                message: "Failed to discover the protected resource authentication challenge",
+                cause,
+              }),
+          ),
+        );
+      if (response.status !== 401 && response.status !== 403) return null;
+      const header = response.headers["www-authenticate"];
+      if (header === undefined) return null;
+      const challenges = parseChallenges(header);
+      if (challenges === null) return null;
+      for (const challenge of challenges) {
+        if (challenge.scheme !== "bearer") continue;
+        const metadataUrl = challenge.params.get("resource_metadata");
+        if (metadataUrl === undefined) continue;
+        return yield* validateEndpointUrl(
+          metadataUrl,
+          "resource_metadata",
+          options.endpointUrlPolicy,
+        );
+      }
+      return null;
+    }).pipe(Effect.scoped),
+    options,
+  );
+
+/** Discover RFC 9728 metadata, preferring an explicit Bearer challenge URL. */
 export const discoverProtectedResourceMetadata = (
   resourceUrl: string,
   options: DiscoveryRequestOptions = {},
@@ -264,12 +342,22 @@ export const discoverProtectedResourceMetadata = (
   OAuthDiscoveryError
 > =>
   Effect.gen(function* () {
-    for (const url of buildResourceMetadataUrls(resourceUrl)) {
-      const requestUrl = withResourceQueryParams(url, options.resourceQueryParams);
+    const advertisedUrl = yield* discoverResourceMetadataChallenge(resourceUrl, options);
+    const metadataUrls =
+      advertisedUrl === null ? buildResourceMetadataUrls(resourceUrl) : [advertisedUrl];
+    for (const url of metadataUrls) {
+      // A challenge may name another origin. Never forward resource credentials there.
+      const sameOrigin = new URL(url).origin === new URL(resourceUrl).origin;
+      const requestUrl = withResourceQueryParams(
+        url,
+        sameOrigin ? options.resourceQueryParams : undefined,
+      );
       let request = HttpClientRequest.get(requestUrl).pipe(
         HttpClientRequest.setHeader("accept", "application/json"),
       );
-      for (const [name, value] of Object.entries(options.resourceHeaders ?? {})) {
+      for (const [name, value] of Object.entries(
+        sameOrigin ? (options.resourceHeaders ?? {}) : {},
+      )) {
         request = HttpClientRequest.setHeader(request, name, value);
       }
       if (options.mcpProtocolVersion) {
@@ -314,17 +402,42 @@ export const discoverProtectedResourceMetadata = (
 // HttpClient boundary and timeout behavior.
 // ---------------------------------------------------------------------------
 
-const wellKnownUrlFor = (
+interface WellKnownCandidate {
+  readonly algorithm: "oauth2" | "oidc";
+  readonly url: string;
+}
+
+const wellKnownCandidatesFor = (
   issuerOrigin: string,
-  algorithm: "oauth2" | "oidc",
   issuerPath: string,
-): string => {
+): readonly WellKnownCandidate[] => {
+  const hasPath = issuerPath !== "" && issuerPath !== "/";
   // Mirrors the library's own well-known composition so the URL we
   // surface matches what was actually fetched.
-  const suffix = algorithm === "oauth2" ? "oauth-authorization-server" : "openid-configuration";
-  return issuerPath && issuerPath !== "/"
-    ? `${issuerOrigin}/.well-known/${suffix}${issuerPath}`
-    : `${issuerOrigin}/.well-known/${suffix}`;
+  const insertPath = (suffix: string) =>
+    hasPath
+      ? `${issuerOrigin}/.well-known/${suffix}${issuerPath}`
+      : `${issuerOrigin}/.well-known/${suffix}`;
+
+  const candidates: WellKnownCandidate[] = [
+    { algorithm: "oauth2", url: insertPath("oauth-authorization-server") },
+    { algorithm: "oidc", url: insertPath("openid-configuration") },
+  ];
+
+  // OIDC Discovery 1.0 §4 appends the well-known segment to the issuer
+  // instead of inserting it after the origin, and the MCP authorization
+  // spec requires clients to try that form as well. An issuer mounted
+  // under a path may serve only this variant, in which case stopping
+  // after the two path-insertion URLs reports "no metadata" for an
+  // authorization server that is configured correctly.
+  if (hasPath) {
+    candidates.push({
+      algorithm: "oidc",
+      url: `${issuerOrigin}${issuerPath}/.well-known/openid-configuration`,
+    });
+  }
+
+  return candidates;
 };
 
 export const discoverAuthorizationServerMetadata = (
@@ -343,8 +456,10 @@ export const discoverAuthorizationServerMetadata = (
     const issuerOrigin = `${issuerUrl.protocol}//${issuerUrl.host}`;
     const issuerPath = issuerUrl.pathname.replace(/\/+$/, "");
 
-    for (const algorithm of ["oauth2", "oidc"] as const) {
-      const metadataUrl = wellKnownUrlFor(issuerOrigin, algorithm, issuerPath);
+    for (const { algorithm, url: metadataUrl } of wellKnownCandidatesFor(
+      issuerOrigin,
+      issuerPath,
+    )) {
       let request = HttpClientRequest.get(metadataUrl).pipe(
         HttpClientRequest.setHeader("accept", "application/json"),
       );

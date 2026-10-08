@@ -13,6 +13,7 @@ import { Predicate, Schema } from "effect";
 import {
   AuthTemplateSlug,
   ConnectionAddress,
+  ConnectionAlreadyExistsError,
   ConnectionName,
   ConnectionNotFoundError,
   CredentialProviderNotRegisteredError,
@@ -22,6 +23,7 @@ import {
   IntegrationSlug,
   InternalError,
   InvalidConnectionInputError,
+  OrgWriteDeniedError,
   OAuthClientSlug,
   Owner,
   ProviderItemId,
@@ -167,6 +169,9 @@ const ConnectionNotFound = ConnectionNotFoundError.annotate({
 const IntegrationNotFound = IntegrationNotFoundError.annotate({
   httpApiStatus: 404,
 });
+const ConnectionAlreadyExists = ConnectionAlreadyExistsError.annotate({
+  httpApiStatus: 409,
+});
 const CredentialProviderNotRegistered = CredentialProviderNotRegisteredError.annotate({
   httpApiStatus: 409,
 });
@@ -193,8 +198,10 @@ export const ConnectionsApi = HttpApiGroup.make("connections")
       error: [
         InternalError,
         IntegrationNotFound,
+        ConnectionAlreadyExists,
         CredentialProviderNotRegistered,
         InvalidConnectionInput,
+        OrgWriteDeniedError,
       ],
     }),
   )
@@ -210,21 +217,21 @@ export const ConnectionsApi = HttpApiGroup.make("connections")
       params: ConnectionParams,
       payload: UpdateConnectionPayload,
       success: ConnectionResponse,
-      error: [InternalError, ConnectionNotFound],
+      error: [InternalError, ConnectionNotFound, OrgWriteDeniedError],
     }),
   )
   .add(
     HttpApiEndpoint.delete("remove", "/connections/:owner/:integration/:name", {
       params: ConnectionParams,
       success: Schema.Struct({ removed: Schema.Boolean }),
-      error: [InternalError, ConnectionNotFound],
+      error: [InternalError, ConnectionNotFound, OrgWriteDeniedError],
     }),
   )
   .add(
     HttpApiEndpoint.post("refresh", "/connections/:owner/:integration/:name/refresh", {
       params: ConnectionParams,
       success: Schema.Array(ToolResponse),
-      error: [InternalError, ConnectionNotFound, IntegrationNotFound],
+      error: [InternalError, ConnectionNotFound, IntegrationNotFound, OrgWriteDeniedError],
     }),
   )
   // Run the integration's declared health check against a SAVED connection: is

@@ -19,6 +19,7 @@ import {
   type HealthCheckResult,
   type IntegrationConfig,
   type IntegrationRecord,
+  type OrgWriteDeniedError,
   type PluginCtx,
   type StorageFailure,
   type ToolAnnotations,
@@ -99,6 +100,8 @@ const GRAPHQL_INVALID_SCHEMA_DETAIL =
 const GRAPHQL_AUTH_DETAIL = "Check the credential and selected authentication method.";
 const GRAPHQL_NETWORK_DETAIL =
   "The GraphQL endpoint could not be reached. Check the URL and upstream availability, then try again.";
+const GRAPHQL_INVALID_ENDPOINT_DETAIL =
+  "The GraphQL endpoint URL is invalid. Edit the integration configuration, then try again.";
 
 const truncateHealthDetail = (text: string, max = 240): string => {
   const normalized = text.replaceAll(/\s+/g, " ").trim();
@@ -145,6 +148,18 @@ const healthFromIntrospectionError = (
   const upstream = error.upstreamMessage;
   const httpStatus = error.status;
 
+  // Classified first, and never as a credential problem: the endpoint was
+  // rejected before any request went out, so nothing upstream judged the
+  // credential. Sending the operator to re-enter a working secret would be a
+  // dead end — the URL in the integration config is what needs the edit.
+  if (error.reason === "invalid-endpoint") {
+    return {
+      status: "unknown",
+      checkedAt,
+      detail: GRAPHQL_INVALID_ENDPOINT_DETAIL,
+    };
+  }
+
   if (httpStatus === 401 || httpStatus === 403 || isAuthMessage(upstream)) {
     const statusDetail =
       httpStatus === 401 || httpStatus === 403
@@ -155,6 +170,13 @@ const healthFromIntrospectionError = (
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       checkedAt,
       detail: appendUpstreamMessage(`${statusDetail} ${GRAPHQL_AUTH_DETAIL}`, upstream),
+      // `upstream_status` means "a non-2xx HTTP verdict" — any such status
+      // here claims it (401/403, but also e.g. a 400 whose body names an auth
+      // failure). An auth message inside an HTTP 200 body (the common GraphQL
+      // shape) has no HTTP verdict — omit the reason rather than mislabel it.
+      ...(httpStatus !== undefined && (httpStatus < 200 || httpStatus >= 300)
+        ? { reason: "upstream_status" as const }
+        : {}),
     };
   }
 
@@ -168,6 +190,8 @@ const healthFromIntrospectionError = (
       ...(httpStatus !== undefined ? { httpStatus } : {}),
       checkedAt,
       detail: GRAPHQL_INVALID_SCHEMA_DETAIL,
+      // The response arrived but was unusable — no upstream HTTP verdict.
+      reason: "probe_failed",
     };
   }
 
@@ -176,6 +200,7 @@ const healthFromIntrospectionError = (
       status: "degraded",
       checkedAt,
       detail: GRAPHQL_NETWORK_DETAIL,
+      reason: "probe_failed",
     };
   }
 
@@ -188,6 +213,9 @@ const healthFromIntrospectionError = (
         "Schema introspection returned GraphQL errors. Check that introspection is enabled and the credential can read the schema.",
         upstream,
       ),
+      // GraphQL errors ride an HTTP 200; the response body, not the status,
+      // is what failed the probe.
+      reason: "probe_failed",
     };
   }
 
@@ -195,6 +223,9 @@ const healthFromIntrospectionError = (
     status: "degraded",
     ...(httpStatus !== undefined ? { httpStatus } : {}),
     checkedAt,
+    ...(httpStatus !== undefined && (httpStatus < 200 || httpStatus >= 300)
+      ? { reason: "upstream_status" as const }
+      : { reason: "probe_failed" as const }),
     detail: appendUpstreamMessage(
       httpStatus !== undefined
         ? `Schema introspection failed with HTTP ${httpStatus}. Check the endpoint and upstream status, then try again.`
@@ -696,6 +727,7 @@ const checkGraphqlHealth = (input: {
         status: "expired",
         checkedAt,
         detail: `Enter a credential value for ${missing.join(", ")}, then try again.`,
+        reason: "credential_missing",
       } satisfies HealthCheckResult;
     }
 
@@ -723,16 +755,16 @@ const checkGraphqlHealth = (input: {
         : { ...verdict, detail: scrubCredentialValues(verdict.detail, input.credential.values) };
     }
 
+    // No `identity`: the schema's root type name ("Query" almost everywhere)
+    // identifies nothing, and the accounts UI would show it as the account
+    // label. Introspection proves reachability, not who the credential is.
     const queryType = result.introspection.__schema.queryType?.name;
     return {
       status: "healthy",
       httpStatus: 200,
       checkedAt,
       ...(queryType != null
-        ? {
-            identity: `GraphQL schema: ${queryType}`,
-            responseSample: [{ path: "__schema.queryType.name", value: queryType }],
-          }
+        ? { responseSample: [{ path: "__schema.queryType.name", value: queryType }] }
         : {}),
     } satisfies HealthCheckResult;
   });
@@ -811,7 +843,9 @@ export const describeGraphqlAuthMethods = (
 ): readonly AuthMethodDescriptor[] => {
   const config = Option.getOrUndefined(decodeGraphqlIntegrationConfigOption(record.config));
   if (!config) return [];
-  return config.authenticationTemplate.map((method: GraphqlAuthMethod): AuthMethodDescriptor => {
+  const templates = config.authenticationTemplate;
+  if (templates.length === 0) return [describeNoneAuthMethod("none")];
+  return templates.map((method: GraphqlAuthMethod): AuthMethodDescriptor => {
     if (method.kind === "apikey") return describeApiKeyAuthMethod(method);
     if (method.kind === "oauth2") {
       return {
@@ -876,6 +910,7 @@ const makeGraphqlExtension = (ctx: PluginCtx<GraphqlStore>) => {
         return yield* new IntegrationAlreadyExistsError({ slug });
       }
 
+      yield* ctx.core.integrations.authorizeWrite();
       return yield* addIntegrationTransaction(input, slug);
     });
 
@@ -923,6 +958,7 @@ const makeGraphqlExtension = (ctx: PluginCtx<GraphqlStore>) => {
         introspectionHash,
       });
 
+      yield* ctx.core.integrations.authorizeWrite();
       yield* ctx.storage.putIntrospection(introspectionHash, snapshotJson);
 
       yield* ctx.transaction(
@@ -1020,7 +1056,7 @@ const makeGraphqlExtension = (ctx: PluginCtx<GraphqlStore>) => {
   const configureAuthMethods = (
     slug: string,
     input: GraphqlConfigureAuthInput,
-  ): Effect.Effect<readonly GraphqlAuthMethod[], StorageFailure> =>
+  ): Effect.Effect<readonly GraphqlAuthMethod[], OrgWriteDeniedError | StorageFailure> =>
     ctx.transaction(
       Effect.gen(function* () {
         const record = yield* ctx.core.integrations.get(IntegrationSlug.make(slug));
@@ -1354,7 +1390,14 @@ export const graphqlPlugin = definePlugin((options?: GraphqlPluginOptions) => {
             method.kind === "oauth2"
               ? [TOKEN_VARIABLE]
               : requiredPlacementVariables(method.placements)
-          ).filter((variable) => credential.values[variable] == null);
+          )
+            // An empty value is as unusable as an absent one, and forwarding it
+            // sends an empty credential upstream — the 401 that follows names the
+            // wrong problem. Matches the OpenAPI backing's check.
+            .filter((variable) => {
+              const value = credential.values[variable];
+              return value == null || value === "";
+            });
           if (missing.length > 0) {
             return yield* new GraphqlAuthRequiredError({
               code:

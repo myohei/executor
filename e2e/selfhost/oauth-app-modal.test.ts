@@ -1,7 +1,8 @@
 // Selfhost (browser): a registered OAuth app is managed entirely from the
 // Add-connection modal — there is no separate "OAuth apps" page. The user
-// registers a bring-your-own app for an integration, edits its stored client
-// id, and removes it, all from the OAuth app picker inside the modal.
+// registers a bring-your-own app for an integration, selects and persists its
+// token-endpoint client authentication, edits its stored client id, and removes
+// it, all from the OAuth app picker inside the modal.
 //
 // The integration only needs to DECLARE an OAuth method for the picker to show;
 // registering/editing/removing an app touches stored credentials only and never
@@ -16,6 +17,7 @@ import { openApiHttpPlugin } from "@executor-js/plugin-openapi/api";
 
 import { scenario } from "../src/scenario";
 import { Api, Browser, Target } from "../src/services";
+import { visit } from "../src/surfaces/browser";
 
 const api = composePluginApi([openApiHttpPlugin()] as const);
 
@@ -81,7 +83,7 @@ scenario(
           const actions = page.getByRole("button", { name: `Actions for ${appName}` });
 
           await step("Open the integration and start a new connection", async () => {
-            await page.goto(`/integrations/${integration}`, { waitUntil: "networkidle" });
+            await visit(page, `/integrations/${integration}`);
             await page.getByRole("button", { name: "Add connection" }).click();
             // OAuth2 is the integration's only method, so the modal opens on
             // the OAuth app step with nothing registered yet. (`exact` avoids
@@ -94,6 +96,7 @@ scenario(
             await page.locator("#oauth-app-name").fill(appName);
             await page.locator("#oauth-client-id").fill("client-one");
             await page.locator("#oauth-client-secret").fill("secret-one");
+            await page.getByRole("radio", { name: /^HTTP Basic client_secret_basic$/ }).check();
             await page.getByRole("button", { name: "Register app", exact: true }).click();
             // Back on the picker, the new app is selectable AND manageable —
             // the per-app actions menu is what replaced the old apps page.
@@ -108,6 +111,11 @@ scenario(
               await page.locator("#oauth-client-id").inputValue(),
               "the edit form prefills the stored client id",
             ).toBe("client-one");
+            await expect
+              .poll(() =>
+                page.getByRole("radio", { name: /^HTTP Basic client_secret_basic$/ }).isChecked(),
+              )
+              .toBe(true);
           });
 
           await step("Change the client id and save the edit", async () => {

@@ -1,5 +1,57 @@
 # @executor-js/desktop
 
+## 1.6.10
+
+### Patch Changes
+
+- [#2049](https://github.com/UsefulSoftwareCo/executor/pull/2049) [`dc0808d`](https://github.com/UsefulSoftwareCo/executor/commit/dc0808d5ca9716d73e4def9365f49d4c1afd4af9) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Fix macOS auto-update. The 1.6.9 update zip was built with a 7-Zip that
+  expanded the framework symlinks into copies, so the extracted app failed code
+  signing and Squirrel.Mac silently refused to install it; "Restart to update"
+  appeared to do nothing. electron-builder is bumped to a release that preserves
+  symlinks, the publish job now verifies the zip's signature before uploading,
+  and a rejected install surfaces as "Update failed" instead of leaving the card
+  untouched.
+
+## 1.6.9
+
+## 1.6.8
+
+## 1.6.7
+
+### Patch Changes
+
+- [#1876](https://github.com/UsefulSoftwareCo/executor/pull/1876) [`75b3674`](https://github.com/UsefulSoftwareCo/executor/commit/75b3674136b44a2e43fb23eb7a058e7e51528527) Thanks [@RhysSullivan](https://github.com/RhysSullivan)! - Let macOS ask before denying Codex plugins Automation access. The desktop app
+  and its bundled daemon are hardened-runtime signed without the Apple Events
+  entitlement, so tccd refused to even show the consent prompt: every Messages
+  call was denied silently, no Automation row was ever created in System
+  Settings, and the access check sat on "Checking…" for a full minute before
+  misreporting the hang as a failed start. The app and daemon are now signed
+  with `com.apple.security.automation.apple-events` and carry a usage
+  description, so the first call raises the real consent prompt and the grant
+  becomes visible in Privacy & Security → Automation.
+
+  The access check also stops waiting after 25 seconds and says what a hang
+  means — answer the permission prompt on screen, then check again — instead of
+  blaming the Codex install.
+
+## 1.6.6
+
+## 1.6.5
+
+## 1.6.4
+
+## 1.6.3
+
+## 1.6.2
+
+## 1.6.1
+
+## 1.6.0
+
+## 1.5.42
+
+## 1.5.41
+
 ## 1.5.40
 
 ## 1.5.39

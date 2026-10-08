@@ -15,16 +15,32 @@ import { ToolAddress } from "./ids";
 // definitions for schema exploration, and optionally TypeScript preview strings.
 // ---------------------------------------------------------------------------
 
+// Mirrors the `ToolAnnotations` contract in `tool.ts` field for field. Plugins
+// may stamp extra keys on a tool row (the mcp plugin carries its own routing
+// data there); only the declared contract is projected, so the view never
+// leaks a plugin's private bookkeeping to callers.
+export const ToolAnnotationsView = Schema.Struct({
+  requiresApproval: Schema.optional(Schema.Boolean),
+  approvalDescription: Schema.optional(Schema.String),
+  mayElicit: Schema.optional(Schema.Boolean),
+});
+export type ToolAnnotationsView = typeof ToolAnnotationsView.Type;
+
 export const ToolSchemaView = Schema.Struct({
   address: ToolAddress,
   name: Schema.optional(Schema.String),
   description: Schema.optional(Schema.String),
   inputSchema: Schema.optional(Schema.Unknown),
   outputSchema: Schema.optional(Schema.Unknown),
+  // "observed" = runtime-inferred from live responses (muscle memory), served
+  // because the plugin declared no output schema. Absent = declared as-is.
+  outputSchemaSource: Schema.optional(Schema.Literals(["observed"])),
+  outputSchemaObservations: Schema.optional(Schema.Number),
   schemaDefinitions: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
   inputTypeScript: Schema.optional(Schema.String),
   outputTypeScript: Schema.optional(Schema.String),
   typeScriptDefinitions: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  annotations: Schema.optional(ToolAnnotationsView),
 });
 export type ToolSchemaView = typeof ToolSchemaView.Type;
 

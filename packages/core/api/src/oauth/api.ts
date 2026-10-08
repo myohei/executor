@@ -18,6 +18,7 @@ import {
   AuthTemplateSlug,
   ConnectionAddress,
   ConnectionName,
+  EnterpriseManagedStartInputSchema,
   IntegrationSlug,
   InternalError,
   OAuthClientSlug,
@@ -27,8 +28,10 @@ import {
   OAuthSessionNotFoundError,
   OAuthStartError,
   OAuthState,
+  OrgWriteDeniedError,
   Owner,
   ProviderKey,
+  TokenEndpointAuthMethodSchema,
 } from "@executor-js/sdk/shared";
 
 // ---------------------------------------------------------------------------
@@ -62,9 +65,10 @@ const CreateClientPayload = Schema.Struct({
   slug: OAuthClientSlug,
   authorizationUrl: Schema.String,
   tokenUrl: Schema.String,
-  grant: Schema.Literals(["authorization_code", "client_credentials"]),
+  grant: Schema.Literals(["authorization_code", "client_credentials", "id_jag"]),
   clientId: Schema.String,
   clientSecret: Schema.String,
+  tokenEndpointAuthMethod: Schema.optional(TokenEndpointAuthMethodSchema),
   resource: Schema.optional(Schema.NullOr(Schema.String)),
   /** Integration whose connect dialog registered this manual app. Recorded so
    *  the picker matches it to this integration by intent, not root domain. */
@@ -110,16 +114,26 @@ const RegisterDynamicResponse = Schema.Struct({
 const OAuthClientSummaryResponse = Schema.Struct({
   owner: Owner,
   slug: OAuthClientSlug,
-  grant: Schema.Literals(["authorization_code", "client_credentials"]),
+  grant: Schema.Literals(["authorization_code", "client_credentials", "id_jag"]),
   authorizationUrl: Schema.String,
   tokenUrl: Schema.String,
   resource: Schema.optional(Schema.NullOr(Schema.String)),
   clientId: Schema.String,
+  tokenEndpointAuthMethod: Schema.optional(TokenEndpointAuthMethodSchema),
   origin: Schema.Union([
     Schema.Struct({ kind: Schema.Literal("manual") }),
     Schema.Struct({
       kind: Schema.Literal("dynamic_client_registration"),
       integration: Schema.optional(Schema.NullOr(IntegrationSlug)),
+    }),
+    /** Host-operated app declared in executor config — every org connects
+     *  through it; nothing to paste. `integrations` ranks it as the default
+     *  for those integrations; `allowedScopes` is the host-enforced scope
+     *  boundary the picker mirrors before offering it. */
+    Schema.Struct({
+      kind: Schema.Literal("first_party"),
+      integrations: Schema.optional(Schema.Array(IntegrationSlug)),
+      allowedScopes: Schema.optional(Schema.Array(Schema.String)),
     }),
   ]),
 });
@@ -164,6 +178,12 @@ const StartPayload = Schema.Struct({
    *  name server-side instead of re-minting the existing row. */
   newConnection: Schema.optional(Schema.Boolean),
   redirectUri: Schema.optional(Schema.NullOr(Schema.String)),
+  /** Enterprise-managed authorization inputs (MCP EMA profile). Required when
+   *  the named client's grant is `id_jag`, ignored otherwise: the client's own
+   *  id/secret authenticate at the MCP server's authorization server, while
+   *  these name the SECOND registration at the enterprise identity provider and
+   *  carry the identity assertion the user already holds from single sign-on. */
+  enterprise: Schema.optional(EnterpriseManagedStartInputSchema),
 });
 
 const StartResponse = Schema.Union([
@@ -259,14 +279,14 @@ export const OAuthApi = HttpApiGroup.make("oauth")
     HttpApiEndpoint.post("createClient", "/oauth/clients", {
       payload: CreateClientPayload,
       success: CreateClientResponse,
-      error: InternalError,
+      error: [InternalError, OrgWriteDeniedError],
     }),
   )
   .add(
     HttpApiEndpoint.post("registerDynamic", "/oauth/clients/register-dynamic", {
       payload: RegisterDynamicPayload,
       success: RegisterDynamicResponse,
-      error: [InternalError, OAuthRegisterDynamic],
+      error: [InternalError, OAuthRegisterDynamic, OrgWriteDeniedError],
     }),
   )
   .add(
@@ -280,21 +300,21 @@ export const OAuthApi = HttpApiGroup.make("oauth")
       params: RemoveClientParams,
       payload: RemoveClientPayload,
       success: RemoveClientResponse,
-      error: InternalError,
+      error: [InternalError, OrgWriteDeniedError],
     }),
   )
   .add(
     HttpApiEndpoint.post("start", "/oauth/start", {
       payload: StartPayload,
       success: StartResponse,
-      error: [InternalError, OAuthStart],
+      error: [InternalError, OAuthStart, OrgWriteDeniedError],
     }),
   )
   .add(
     HttpApiEndpoint.post("complete", "/oauth/complete", {
       payload: CompletePayload,
       success: ConnectionResponse,
-      error: [InternalError, OAuthComplete, OAuthSessionNotFound],
+      error: [InternalError, OAuthComplete, OAuthSessionNotFound, OrgWriteDeniedError],
     }),
   )
   .add(

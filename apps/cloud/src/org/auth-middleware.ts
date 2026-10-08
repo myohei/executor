@@ -1,10 +1,17 @@
-import { Effect, Layer } from "effect";
+import { env } from "cloudflare:workers";
+import { ADMIN_MFA_COOKIE, readAdminMfaProof } from "../auth/admin-mfa-proof";
+import { Clock, Context, Effect, Layer } from "effect";
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
 
-import { AuthContext, requestScopedMiddleware } from "@executor-js/api/server";
+import {
+  AuthContext,
+  requestScopedMiddleware,
+  type MemberDirectory,
+} from "@executor-js/api/server";
 
 import { UserStoreService } from "../auth/context";
 import { sessionFromSealed } from "../auth/middleware";
+import { WorkOsMirror } from "../auth/workos-mirror";
 import { ORG_SELECTOR_HEADER, authorizeOrganizationSelector } from "../auth/organization";
 import { WorkOSClient } from "../auth/workos";
 import { DbService } from "../db/db";
@@ -27,7 +34,21 @@ const noOrganization = () =>
     { status: 403 },
   );
 
-const OrgAuthMiddleware = HttpRouter.middleware<{ provides: AuthContext }>()(
+/**
+ * The caller's role in the session org, as `authorizeOrganizationSelector`
+ * read it for THIS request from the membership mirror (`auth/organization.ts`).
+ * Provided beside `AuthContext` — the shared seam, which carries no role — so
+ * the domain handlers' admin gate is this one value, never a second read of
+ * the mirror.
+ */
+export class OrgMemberRole extends Context.Service<
+  OrgMemberRole,
+  { readonly memberRole: "admin" | "member" }
+>()("@executor-js/cloud/OrgMemberRole") {}
+
+const OrgAuthMiddleware = HttpRouter.middleware<{
+  provides: AuthContext | OrgMemberRole;
+}>()(
   Effect.gen(function* () {
     const captured = yield* Effect.context<WorkOSClient>();
     const workos = yield* WorkOSClient;
@@ -52,6 +73,19 @@ const OrgAuthMiddleware = HttpRouter.middleware<{ provides: AuthContext }>()(
         );
         if (!org) return noOrganization();
 
+        const proof = yield* readAdminMfaProof(
+          env.WORKOS_COOKIE_PASSWORD,
+          { userId: result.userId, sessionId: result.sessionId },
+          "verified",
+          request.cookies[ADMIN_MFA_COOKIE],
+          yield* Clock.currentTimeMillis,
+        );
+        if (!proof)
+          return HttpServerResponse.jsonUnsafe(
+            { _tag: "Forbidden", message: "Verify your identity to open organization settings." },
+            { status: 403, headers: { "cache-control": "no-store" } },
+          );
+
         const session = sessionFromSealed(result, cookieValue);
         const auth = AuthContext.of({
           accountId: session.accountId,
@@ -62,10 +96,16 @@ const OrgAuthMiddleware = HttpRouter.middleware<{ provides: AuthContext }>()(
           roles: [],
         });
 
-        return yield* Effect.provideService(httpEffect, AuthContext, auth);
+        return yield* Effect.provideContext(
+          httpEffect,
+          Context.make(AuthContext, auth).pipe(
+            Context.add(OrgMemberRole, { memberRole: org.memberRole }),
+          ),
+        );
       }).pipe(Effect.provideContext(captured));
   }),
 );
 
-export const orgAuthMiddleware = (rsLive: Layer.Layer<DbService | UserStoreService>) =>
-  OrgAuthMiddleware.combine(requestScopedMiddleware(rsLive)).layer;
+export const orgAuthMiddleware = (
+  rsLive: Layer.Layer<DbService | UserStoreService | MemberDirectory | WorkOsMirror>,
+) => OrgAuthMiddleware.combine(requestScopedMiddleware(rsLive)).layer;

@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   app,
+  autoUpdater as nativeAutoUpdater,
   BrowserWindow,
   dialog,
   ipcMain,
@@ -35,6 +36,8 @@ import {
   reportAProblem,
 } from "./diagnostics";
 import { sidecarCrashHtml, startupWindowHtml } from "./crash-screen";
+import { isExpectedNavigationAbort } from "./navigation-errors";
+import { isAppQuitting } from "./app-quit";
 import { replaceSupervisedDaemonForDesktop } from "./supervised-connection";
 import {
   bundledExecutorPath,
@@ -76,7 +79,13 @@ import {
 // executor.jsonc plugin manifest) is pinned separately to ~/.executor in
 // main/sidecar.ts — that path matches the CLI's default.
 app.setName("Executor");
-app.setPath("userData", join(app.getPath("appData"), "Executor"));
+// A dev run must not collide with an installed Executor: userData also holds
+// Electron's single-instance lock, so sharing it makes the second process quit
+// silently at startup. `EXECUTOR_DESKTOP_USER_DATA` gives a dev run its own.
+app.setPath(
+  "userData",
+  process.env.EXECUTOR_DESKTOP_USER_DATA ?? join(app.getPath("appData"), "Executor"),
+);
 
 log.initialize({ preload: true });
 log.transports.file.level = "info";
@@ -147,6 +156,37 @@ const webUrlForConnection = (conn: SidecarConnection): string => {
 
 const htmlDataUrl = (html: string): string =>
   `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+
+/**
+ * True when a `loadURL` rejection is just Chromium cancelling a navigation
+ * whose window went away — the window closing mid-load is a race we cause, not
+ * a failure to reach the server.
+ */
+const isTeardownNavigationError = (error: unknown, window: BrowserWindow): boolean =>
+  isExpectedNavigationAbort({
+    // oxlint-disable-next-line executor/no-instanceof-error, executor/no-unknown-error-message -- boundary: Electron rejects loadURL with a plain Node Error carrying the net error name
+    message: error instanceof Error ? error.message : String(error),
+    windowDestroyed: window.isDestroyed(),
+    appQuitting: isAppQuitting(),
+  });
+
+/**
+ * Fire-and-forget navigation. The caller has no way to react to a failure, so
+ * an uncaught rejection here would only reach the main-process unhandled
+ * rejection handler; log it instead, quietly when it is teardown noise.
+ */
+const loadWindowUrl = async (window: BrowserWindow, url: string): Promise<void> => {
+  // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: Electron navigation rejects; there is no caller left to surface it to
+  try {
+    await window.loadURL(url);
+  } catch (error) {
+    if (isTeardownNavigationError(error, window)) {
+      log.info("Navigation aborted while the window was closing");
+      return;
+    }
+    log.error("Failed to load window URL", error);
+  }
+};
 
 // The supervised daemon (and the desktop sidecar) own this data dir — the same
 // path the CLI's `executor web`/daemon uses, so desktop and CLI share state.
@@ -355,7 +395,7 @@ const armSupervisedMonitor = () => {
         supervisedDaemonDown = false;
         connection = live;
         installBearerAuthHeader(live.baseUrl, live.authToken);
-        if (window) void window.loadURL(webUrlForConnection(live));
+        if (window) void loadWindowUrl(window, webUrlForConnection(live));
       }
     })();
   }, 10_000);
@@ -540,10 +580,13 @@ const showStartupWindow = async (): Promise<void> => {
   }
 };
 
-const showCrashScreen = (window: BrowserWindow | null = liveMainWindow()): void => {
+const showCrashScreen = (
+  window: BrowserWindow | null = liveMainWindow(),
+  options: { readonly reported: boolean } = { reported: errorReportingEnabled },
+): void => {
   if (!window) return;
-  const html = sidecarCrashHtml({ reported: errorReportingEnabled });
-  void window.loadURL(htmlDataUrl(html));
+  const html = sidecarCrashHtml({ reported: options.reported && errorReportingEnabled });
+  void loadWindowUrl(window, htmlDataUrl(html));
 };
 
 const createWindow = async (conn: SidecarConnection) => {
@@ -560,6 +603,12 @@ const createWindow = async (conn: SidecarConnection) => {
     await window.loadURL(webUrlForConnection(conn));
     if (!window.isDestroyed() && !window.isVisible()) window.show();
   } catch (error) {
+    // The window was closed (or the app is quitting) while this navigation was
+    // in flight. Nothing failed — there is just nowhere left to navigate.
+    if (isTeardownNavigationError(error, window)) {
+      log.info("Executor web UI load aborted while the window was closing");
+      return;
+    }
     log.error("Failed to load Executor web UI", error);
     if (!existingWindow) destroyWindow(window);
     // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: caller decides whether to fall back or surface startup failure
@@ -758,17 +807,11 @@ const registerIpcHandlers = () => {
     // Outside a packaged build there is no real bundle to swap, and quitting
     // would tear down the e2e harness — reflect "installing" so the renderer
     // can prove the wiring instead.
-    if (!app.isPackaged) {
-      setUpdateStatus({ state: "installing", version });
-      return;
-    }
-    // Stop the sidecar cleanly before Squirrel.Mac swaps the bundle, matching
-    // the native dialog's restart path.
-    stopSupervisedMonitor();
-    if (connection) {
-      await stopConnection(connection);
-      connection = null;
-    }
+    setUpdateStatus({ state: "installing", version });
+    if (!app.isPackaged) return;
+    // Squirrel.Mac only validates the staged bundle now; the sidecar is torn
+    // down in 'before-quit-for-update' once it has accepted the update, so a
+    // rejected zip leaves the app usable and surfaces via the 'error' handler.
     autoUpdater.quitAndInstall(false, true);
   });
   // Crash-screen last resort for damaged state: confirm, move the data dir
@@ -889,13 +932,7 @@ const promptInstallUpdate = async (version: string) => {
       cancelId: 1,
     });
     if (response.response === 0) {
-      // Stop the sidecar cleanly before Squirrel.Mac swaps the bundle. A
-      // supervised daemon is left running — it's independent of this bundle.
-      stopSupervisedMonitor();
-      if (connection) {
-        await stopConnection(connection);
-        connection = null;
-      }
+      setUpdateStatus({ state: "installing", version });
       autoUpdater.quitAndInstall(false, true);
       return;
     }
@@ -915,6 +952,18 @@ const setupAutoUpdater = () => {
   autoUpdater.logger = log;
   autoUpdater.autoDownload = true;
   autoUpdater.autoInstallOnAppQuit = false;
+  // Fired by Electron's native updater once Squirrel.Mac has downloaded and
+  // validated the bundle and is about to quit for the swap. Stop a spawned
+  // sidecar here rather than before quitAndInstall: if Squirrel rejects the
+  // update (bad signature, corrupt zip) nothing has been torn down. A
+  // supervised daemon is left running — it's independent of this bundle.
+  nativeAutoUpdater.on("before-quit-for-update", () => {
+    stopSupervisedMonitor();
+    if (connection) {
+      void stopConnection(connection);
+      connection = null;
+    }
+  });
 
   autoUpdater.on("update-available", (info: UpdateInfo) => {
     pendingUpdateVersion = info.version;
@@ -1158,8 +1207,11 @@ const boot = async () => {
   // A sidecar that dies under a live window would leave the web UI failing
   // every request with no explanation. Swap in the crash screen — its
   // buttons drive the regular preload bridge (restart / export diagnostics).
-  onUnexpectedSidecarExit(() => {
-    showCrashScreen();
+  onUnexpectedSidecarExit((notice) => {
+    // An expected shutdown (an interrupt aimed at the app) still leaves the web
+    // UI dead, so the screen is the same — it just must not claim a crash
+    // report was sent when none was.
+    showCrashScreen(liveMainWindow(), { reported: notice.reported });
     // A crashing sidecar may be a broken release — quietly stage any
     // available update so the install prompt appears on its own (same
     // self-heal as the fatal startup path).

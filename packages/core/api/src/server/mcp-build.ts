@@ -48,7 +48,10 @@ export const makeMcpBuildServer =
         principal.accountId,
         principal.organizationId,
         principal.organizationName,
-        { mcpResource: options?.resource },
+        {
+          mcpResource: options?.resource,
+          orgWrites: "request",
+        },
       ).pipe(Effect.withSpan("mcp.execution_stack.build"));
       // Read inside the provided boundary: `webBaseUrl` is a host seam, and
       // hosts that can't know their public URL at boot leave it unset — in
@@ -68,6 +71,8 @@ export const makeMcpBuildServer =
           engine,
           artifacts: executor.artifacts,
           connections: executor.connections,
+          tools: executor.tools,
+          integrations: executor.integrations,
           ...(hostOptions?.loadAppShellHtml
             ? { loadAppShellHtml: hostOptions.loadAppShellHtml }
             : {}),
@@ -85,7 +90,9 @@ export const makeMcpBuildServer =
           ...(options ?? {}),
         }).pipe(
           Effect.withSpan("mcp.server.create"),
-          Effect.map((mcpServer) => ({ mcpServer, engine })),
+          // Catalog failures use the same retryable build envelope.
+          Effect.mapError((cause) => new McpEngineBuildError({ cause })),
+          Effect.map((mcpServer) => ({ mcpServer, engine, executor })),
         ),
       ),
     );

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "@effect/vitest";
 import { Effect, Predicate, Result } from "effect";
+import type * as Tracer from "effect/Tracer";
 import { HttpClient, HttpClientRequest } from "effect/unstable/http";
 
 import {
@@ -266,4 +267,133 @@ describe("hosted outbound HTTP client", () => {
       expect(calls).toBe(1);
     }),
   );
+
+  it.effect("redacts every span header attribute outside the safe allowlist", () =>
+    Effect.gen(function* () {
+      const spanAttributes = new Map<string, unknown>();
+      const recordingTracer: Tracer.Tracer = {
+        span: (options) => {
+          let status: Tracer.SpanStatus = { _tag: "Started", startTime: options.startTime };
+          return {
+            _tag: "Span",
+            name: options.name,
+            spanId: "0000000000000001",
+            traceId: "00000000000000000000000000000001",
+            parent: options.parent,
+            annotations: options.annotations,
+            get status() {
+              return status;
+            },
+            attributes: spanAttributes,
+            links: options.links,
+            sampled: options.sampled,
+            kind: options.kind,
+            end: (endTime, exit) => {
+              status = { _tag: "Ended", startTime: options.startTime, endTime, exit };
+            },
+            attribute: (key, value) => {
+              spanAttributes.set(key, value);
+            },
+            event: () => undefined,
+            addLinks: () => undefined,
+          };
+        },
+      };
+
+      const fakeFetch: typeof globalThis.fetch = (async () =>
+        new Response("{}", {
+          status: 200,
+          headers: {
+            "content-type": "application/json",
+            "cf-ray": "a2ca5b47bb7f3550",
+            location: "https://example.com/callback?code=secret-code",
+            "mcp-session-id": "secret-session",
+          },
+        })) as typeof globalThis.fetch;
+
+      yield* Effect.gen(function* () {
+        const client = yield* HttpClient.HttpClient;
+        return yield* client.execute(
+          HttpClientRequest.get("https://api.example/data").pipe(
+            HttpClientRequest.setHeaders({
+              accept: "application/json",
+              "x-goog-api-key": "live-credential",
+              referer: "https://example.com/callback?code=secret-code",
+              "mcp-session-id": "secret-session",
+              tracestate: "vendor=secret-value",
+            }),
+          ),
+        );
+      }).pipe(
+        Effect.provide(
+          makeHostedHttpClientLayer({ fetch: fakeFetch, resolveHostname: publicResolver }),
+        ),
+        Effect.withTracer(recordingTracer),
+      );
+
+      expect(String(spanAttributes.get("http.request.header.accept"))).toBe("application/json");
+      expect(String(spanAttributes.get("http.request.header.x-goog-api-key"))).toBe("<redacted>");
+      expect(String(spanAttributes.get("http.response.header.content-type"))).toBe(
+        "application/json",
+      );
+      expect(String(spanAttributes.get("http.response.header.cf-ray"))).toBe("<redacted>");
+      for (const key of [
+        "http.request.header.referer",
+        "http.request.header.mcp-session-id",
+        "http.request.header.tracestate",
+        "http.response.header.location",
+        "http.response.header.mcp-session-id",
+      ]) {
+        expect(String(spanAttributes.get(key))).toBe("<redacted>");
+      }
+    }),
+  );
+});
+
+describe("hosted TLS policy", () => {
+  it.effect(
+    "rejects public plaintext requests even when private development access is enabled",
+    () =>
+      Effect.gen(function* () {
+        const result = yield* validateHostedOutboundUrl("http://api.example/data", {
+          requireTls: true,
+          allowLocalNetwork: true,
+        }).pipe(Effect.result);
+        expect(Result.isFailure(result)).toBe(true);
+        yield* validateHostedOutboundUrl("https://api.example/data", { requireTls: true });
+        yield* validateHostedOutboundUrl("http://127.0.0.1:3000/data", {
+          requireTls: true,
+          allowLocalNetwork: true,
+        });
+      }),
+  );
+
+  it("blocks HTTPS downgrade redirects before sending the redirected request", async () => {
+    let calls = 0;
+    const guarded = makeHostedFetch({
+      requireTls: true,
+      resolveHostname: publicResolver,
+      fetch: (async () => {
+        calls++;
+        return new Response(null, {
+          status: 302,
+          headers: { location: "http://api.example/data" },
+        });
+      }) as typeof globalThis.fetch,
+    });
+    await expect(
+      guarded("https://api.example/data", {
+        headers: { authorization: "Bearer synthetic-secret" },
+      }),
+    ).rejects.toMatchObject({
+      _tag: "HostedOutboundRequestBlocked",
+      reason: "This host requires HTTPS for outbound requests",
+    });
+    expect(calls).toBe(1);
+    await expect(guarded("http://api.example/data")).rejects.toMatchObject({
+      _tag: "HostedOutboundRequestBlocked",
+      reason: "This host requires HTTPS for outbound requests",
+    });
+    expect(calls).toBe(1);
+  });
 });

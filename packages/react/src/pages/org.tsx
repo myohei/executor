@@ -14,6 +14,16 @@ import {
   DialogFooter,
   DialogClose,
 } from "../components/dialog";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "../components/alert-dialog";
 import { Button } from "../components/button";
 import { PageContainer, PageHeader } from "../components/page";
 import { Badge } from "../components/badge";
@@ -59,7 +69,7 @@ import { isAsyncResultLoading } from "../lib/async-result";
 
 type MemberData = {
   id: string;
-  email: string;
+  email: string | null;
   name: string | null;
   avatarUrl: string | null;
   role: string;
@@ -69,6 +79,23 @@ type MemberData = {
 };
 
 type RoleData = { slug: string; name: string };
+
+/** What a member row is called: name, else email, else the one thing every
+ *  member has — a membership id — so a profile the host has not learned yet
+ *  still renders as a row an admin can act on. */
+const memberLabel = (member: MemberData): string => member.name ?? member.email ?? member.id;
+
+const memberInitials = (member: MemberData): string => {
+  if (member.name) {
+    return member.name
+      .split(" ")
+      .map((n: string) => n[0])
+      .join("")
+      .slice(0, 2)
+      .toUpperCase();
+  }
+  return (member.email?.[0] ?? "?").toUpperCase();
+};
 
 type InviteState = {
   email: string;
@@ -153,6 +180,7 @@ export function OrgPage(props: {
   const refreshMembers = useAtomRefresh(orgMembersAtom);
   const rolesResult = useAtomValue(orgRolesAtom);
   const doRemove = useAtomSet(removeMember, { mode: "promiseExit" });
+  const [removingMember, setRemovingMember] = useState<{ id: string; name: string } | null>(null);
   const doUpdateRole = useAtomSet(updateMemberRole, { mode: "promiseExit" });
   const doUpdateOrgName = useAtomSet(updateOrgName, { mode: "promiseExit" });
   const [inviteOpen, setInviteOpen] = useState(false);
@@ -179,6 +207,7 @@ export function OrgPage(props: {
   const showUpgradeOnInvite = atSeatLimit && !!props.upgradeAction;
 
   const handleRemove = async (membershipId: string, name: string) => {
+    setRemovingMember(null);
     const exit = await doRemove({
       params: { membershipId },
       reactivityKeys: orgMemberWriteKeys,
@@ -302,7 +331,7 @@ export function OrgPage(props: {
               const filtered = search
                 ? members.filter(
                     (m: MemberData) =>
-                      m.email.toLowerCase().includes(search.toLowerCase()) ||
+                      (m.email?.toLowerCase().includes(search.toLowerCase()) ?? false) ||
                       (m.name?.toLowerCase().includes(search.toLowerCase()) ?? false),
                   )
                 : members;
@@ -326,21 +355,14 @@ export function OrgPage(props: {
                         <img src={member.avatarUrl} alt="" className="size-8 rounded-full" />
                       ) : (
                         <div className="flex size-8 items-center justify-center rounded-full bg-muted text-xs font-semibold text-muted-foreground">
-                          {member.name
-                            ? member.name
-                                .split(" ")
-                                .map((n: string) => n[0])
-                                .join("")
-                                .slice(0, 2)
-                                .toUpperCase()
-                            : member.email[0]!.toUpperCase()}
+                          {memberInitials(member)}
                         </div>
                       )}
 
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <p className="truncate text-sm font-medium text-foreground leading-none">
-                            {member.name ?? member.email}
+                            {memberLabel(member)}
                           </p>
                           {member.isCurrentUser && (
                             <Badge className="bg-muted text-muted-foreground">You</Badge>
@@ -349,7 +371,7 @@ export function OrgPage(props: {
                             <Badge className="bg-muted text-muted-foreground">Invited</Badge>
                           )}
                         </div>
-                        {member.name && (
+                        {member.name && member.email && (
                           <p className="mt-0.5 truncate text-xs text-muted-foreground leading-none">
                             {member.email}
                           </p>
@@ -406,7 +428,12 @@ export function OrgPage(props: {
                             )}
                             <DropdownMenuItem
                               className="text-destructive focus:text-destructive text-sm"
-                              onClick={() => handleRemove(member.id, member.name ?? member.email)}
+                              onClick={() =>
+                                setRemovingMember({
+                                  id: member.id,
+                                  name: memberLabel(member),
+                                })
+                              }
                             >
                               Remove member
                             </DropdownMenuItem>
@@ -425,6 +452,38 @@ export function OrgPage(props: {
       </section>
 
       {props.dangerZoneSection}
+
+      <AlertDialog
+        open={removingMember !== null}
+        onOpenChange={(open: boolean) => {
+          if (!open) setRemovingMember(null);
+        }}
+      >
+        <AlertDialogContent size="sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {removingMember ? `Remove ${removingMember.name}?` : "Remove member?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              They lose access to this organization immediately. This cannot be undone; you would
+              need to invite them again.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={() => {
+                if (removingMember !== null) {
+                  void handleRemove(removingMember.id, removingMember.name);
+                }
+              }}
+            >
+              Remove member
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <InviteDialog open={inviteOpen} onOpenChange={setInviteOpen} roles={roles} />
       <UpgradeDialog
@@ -447,7 +506,8 @@ function UpgradeDialog(props: {
 }) {
   return (
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
-      <DialogContent className="sm:max-w-[400px]">
+      {/* Informational only: nothing to lose, so clicking away dismisses it. */}
+      <DialogContent dismissOnOutsideClick className="sm:max-w-[400px]">
         <DialogHeader>
           <DialogTitle className="font-display text-xl">You are at your member limit</DialogTitle>
           <DialogDescription className="text-sm leading-relaxed">

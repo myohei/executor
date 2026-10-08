@@ -15,12 +15,22 @@ import {
 import {
   PAUSED_APPROVAL_TIMEOUT_MS,
   formatMcpExecutionOutcome,
+  type BrowserApprovalDecision,
   type PausedExecutionHooks,
   type ResumeFallbackOutcome,
 } from "@executor-js/host-mcp/tool-server";
-import { defaultMcpResource, type McpResource } from "@executor-js/host-mcp";
+import { defaultMcpResource, mcpResourceKey, type McpResource } from "@executor-js/host-mcp";
+import { decodeResumeResponse, type McpToolMode } from "@executor-js/host-mcp/browser-approval";
+import {
+  CurrentOrgWriteAccess,
+  ElicitationResponse,
+  currentOrgWriteAccess,
+  makeOrgWriteAccessState,
+  type OrgWriteAccess,
+} from "@executor-js/sdk";
 
 import type { IncomingPropagationHeaders, McpElicitationMode } from "./do-headers";
+import { classifyDurableObjectError, type DurableObjectFailure } from "./durable-object-errors";
 import type {
   McpExecutionOwnerDirectory,
   McpExecutionOwnerRecord,
@@ -33,21 +43,55 @@ import {
   pausedLeaseExtensionLog,
   runningLeaseExtensionLog,
 } from "./session-alarm-policy";
+import {
+  acquireResidentRuntime,
+  currentInFlightColdBuildCount,
+  currentResidentRuntimeCount,
+  markEvictionRequested,
+  pickEvictionCandidate,
+  registerResidentSession,
+  releaseColdBuildSlot,
+  releaseResidentRuntime,
+  releaseResidentSession,
+  reserveColdBuildSlot,
+  type ResidentSessionEntry,
+  residencyAttributes,
+  RESIDENT_RUNTIME_SOFT_CAP,
+  touchResidentSession,
+} from "./session-runtime-residency";
+import type { OrgRoleMetadata } from "./role-metadata";
 
 export type IncomingTraceHeaders = IncomingPropagationHeaders;
 
-export interface McpSessionInit {
+interface McpSessionInitBase {
   readonly organizationId: string;
+  /** The organization's display name, as the worker resolved it while
+   *  authorizing this very request. Carried so the session DO never has to
+   *  re-read a row the request already loaded. Absent when the auth plane could
+   *  not name the org, in which case the host resolves it itself. */
+  readonly organizationName?: string;
+  /** The organization's URL slug, from the same resolved record. */
+  readonly organizationSlug?: string;
   readonly userId: string;
   readonly elicitationMode: McpElicitationMode;
   /** Whether this session serves artifacts, read off `?artifacts=` at connect
    *  time. Absent means the default (enabled). */
   readonly artifactsEnabled?: boolean;
+  /** Whether this session serves the per-integration `search_<integration>`
+   *  tools, read off `?search_tools=` at connect time. Absent means the
+   *  default (disabled). */
+  readonly searchToolsEnabled?: boolean;
+  /** The tool surface, read off `?mode=` at connect time. Absent means the
+   *  default (codemode). */
+  readonly toolMode?: McpToolMode;
   /** The MCP resource the session was minted against (`/mcp` default vs a
    *  `/mcp/toolkits/<slug>` toolkit), so the tool catalog is scoped to it. */
   readonly resource: McpResource;
   readonly webOrigin?: string;
 }
+
+/** Live session initialization metadata from an authenticated principal. */
+export type McpSessionInit = McpSessionInitBase & OrgRoleMetadata;
 
 export interface McpSessionProps extends Record<string, unknown> {
   readonly session: McpSessionInit;
@@ -57,6 +101,17 @@ export interface McpSessionProps extends Record<string, unknown> {
 export type McpApprovalOwner = {
   readonly accountId: string;
   readonly organizationId: string;
+};
+
+/** A model `resume` forwarded from another session of the same owner, carrying
+ *  the workspace-write access its own request was authenticated with. */
+export type McpModelResumeCaller = McpApprovalOwner & {
+  readonly orgWriteAccess: OrgWriteAccess;
+};
+
+/** Authenticated browser approver with a freshly resolved organization role. */
+export type McpApprovalPrincipal = McpApprovalOwner & {
+  readonly orgRole: "admin" | "member";
 };
 
 type McpSessionApprovalErrorResult =
@@ -93,7 +148,7 @@ export interface SessionDbHandle {
   readonly end: () => Promise<void> | void;
 }
 
-export interface SessionMeta {
+interface SessionMetaBase {
   readonly organizationId: string;
   readonly organizationName: string;
   /** The org's URL slug, when the host's `resolveSessionMeta` carried one.
@@ -105,6 +160,15 @@ export interface SessionMeta {
    *  Absent — including for sessions persisted before the flag existed — means
    *  the default (enabled). */
   readonly artifactsEnabled?: boolean;
+  /** Whether the session serves the per-integration search tools (carried from
+   *  {@link McpSessionInit}). Absent — including for sessions persisted before
+   *  the flag existed — means the default (disabled). */
+  readonly searchToolsEnabled?: boolean;
+  /** The tool surface (carried from {@link McpSessionInit}). Absent —
+   *  including for sessions persisted before the field existed — means
+   *  codemode. A cold restore MUST rebuild the same surface the client first
+   *  saw, or its cached tool names stop resolving mid-conversation. */
+  readonly toolMode?: McpToolMode;
   /** The MCP resource the session serves (carried from {@link McpSessionInit});
    *  `buildMcpServer` scopes the tool catalog to it. */
   readonly resource: McpResource;
@@ -122,26 +186,47 @@ export interface SessionMeta {
   readonly appsEnabled?: boolean;
 }
 
+/** Durable session metadata, including the pre-role-model persisted shape. */
+export type SessionMeta = SessionMetaBase &
+  (
+    | OrgRoleMetadata
+    | {
+        /** Missing only on records written before role models were persisted. */
+        readonly orgRoleModel?: undefined;
+        readonly orgRole?: "admin" | "member";
+      }
+  );
+
 export interface BuiltMcpServer {
   readonly mcpServer: McpServer;
   readonly engine: ExecutionEngine<Cause.YieldableError>;
 }
 
 export interface BrowserApprovalStore {
-  readonly takeResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
-  readonly waitForResponse: (executionId: string) => Effect.Effect<ResumeResponse | null>;
+  readonly takeResponse: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
+  readonly waitForResponse: (executionId: string) => Effect.Effect<BrowserApprovalDecision | null>;
 }
 
 const SESSION_META_KEY = "session-meta";
 const LAST_ACTIVITY_KEY = "last-activity-ms";
 const PARTYSERVER_NAME_KEY = "__ps_name";
+/**
+ * Stand-in session id for a log line written when the DO's name could not be
+ * resolved. A named placeholder keeps the field present and the log shape
+ * stable, and is countable when it happens.
+ */
+const UNRESOLVED_SESSION_ID = "unresolved";
 /** The agents SDK's durable "condemned" marker (`_cf_scheduleDestroy`). */
 const AGENTS_DESTROY_PENDING_KEY = "cf_agents_destroy_pending";
 const MCP_HTTP_METHOD_HEADER = "cf-mcp-method";
 const MCP_MESSAGE_HEADER = "cf-mcp-message";
 const MODEL_RESUME_FORWARD_TIMEOUT_MS = 10_000;
-const MCP_STREAM_REQS_KEY_PREFIX = "__mcp_stream_reqs__:";
 const approvalResponseKey = (executionId: string) => `approval-response:${executionId}`;
+const BrowserApprovalDecisionStorage = Schema.Struct({
+  response: ElicitationResponse,
+  orgWriteAccess: Schema.Literals(["allowed", "denied"]),
+});
+const decodeBrowserApprovalDecision = Schema.decodeUnknownOption(BrowserApprovalDecisionStorage);
 
 type JsonRpcRequestId = string | number;
 const JsonRpcRequestWithId = Schema.Struct({
@@ -230,20 +315,89 @@ export abstract class McpAgentSessionDOBase<
   private dbHandle: TDbHandle | null = null;
   private sessionMeta: SessionMeta | null = null;
   private initialized = false;
+  /** Whether this instance is currently counted in the isolate's residency
+   *  gauge. Tracked separately from `engine` because `closeRuntime` runs on
+   *  paths where nothing was ever built, and it must not decrement then. */
+  private countedAsResident = false;
+  /** Whether THIS init's cold-build admission is currently holding a reserved
+   *  slot in the isolate-wide in-flight counter. Mirrors `countedAsResident`'s
+   *  guard discipline: gates {@link releaseColdBuildSlotIfReserved} so it
+   *  releases exactly once per reservation, from whichever of its two callers
+   *  (success or failure/interrupt) gets there first. */
+  private reservedColdBuildSlot = false;
+  /**
+   * The `AbortController` backing the currently in-flight `init` call's
+   * `Effect.runPromise`, so its root fiber can be interrupted from outside
+   * the Promise it returns. Nothing in production ever calls `.abort()` on
+   * it today — it exists so a unit test can interrupt `init` deterministically
+   * at a chosen suspension point (e.g. mid `openSessionDbHandle`) and assert
+   * the cold-build reservation is still released, rather than only ever being
+   * exercised through failure/defect paths.
+   */
+  private initAbortController: AbortController | null = null;
+  /** Same purpose as {@link initAbortController}, for `disposeIdleRuntime`'s
+   *  root effect (`closeRuntime` plus its alarm/activity bookkeeping) — lets
+   *  a unit test interrupt a disposal deterministically to confirm the
+   *  uninterruptible teardown in `closeRuntime` actually finishes rather than
+   *  being cut short. */
+  private disposeAbortController: AbortController | null = null;
+  /**
+   * The in-progress runtime disposal, if one is running right now — from
+   * whichever of `closeRuntime`'s callers (the idle alarm, a cap eviction
+   * request, `cleanup`) got there first. Set at the very start of
+   * `closeRuntime`'s body, before its first async close, and cleared in a
+   * finally once that disposal settles.
+   *
+   * Exists to close two races at once: `init` awaits this before deciding
+   * whether to rebuild, so a request that lands mid-teardown never races the
+   * closes it is waiting on; and a second `closeRuntime` call that lands
+   * while this is set (the idle alarm and a cap eviction request landing
+   * together) waits on the SAME promise instead of running the teardown a
+   * second time.
+   */
+  private disposingRuntime: Promise<void> | null = null;
   private onStartPromise: Promise<void> | null = null;
   private lastActivityMs = 0;
-  private approvalResponses = new Map<string, ResumeResponse>();
-  private approvalWaiters = new Map<string, Deferred.Deferred<ResumeResponse>>();
+  private resolvedSessionName: string | undefined = undefined;
+  private approvalResponses = new Map<string, BrowserApprovalDecision>();
+  private approvalWaiters = new Map<string, Deferred.Deferred<BrowserApprovalDecision>>();
   private pendingApprovalLeases = new Map<string, PendingApprovalLease>();
 
   protected abstract openSessionDb(): TDbHandle | Promise<TDbHandle>;
 
-  protected abstract resolveSessionMeta(token: McpSessionInit): Effect.Effect<SessionMeta>;
+  /**
+   * Build the session's {@link SessionMeta} for this init.
+   *
+   * `storedMeta` is what this DO already persisted for the SAME organization on
+   * an earlier init, or `null`. It is offered first so a host never has to
+   * re-resolve an org identity it is already holding — on cloud that resolution
+   * is a fresh Postgres connection, and a cold restore used to die on it. Every
+   * field the CONNECT carries (resource, elicitation mode, capability flags)
+   * still comes from `token`; only the org identity may be reused.
+   */
+  protected abstract resolveSessionMeta(
+    token: McpSessionInit,
+    storedMeta: SessionMeta | null,
+  ): Effect.Effect<SessionMeta>;
 
   protected abstract buildMcpServer(
     sessionMeta: SessionMeta,
     dbHandle: TDbHandle,
   ): Effect.Effect<BuiltMcpServer>;
+
+  /**
+   * Cheap, count-only proxies for what the runtime `buildMcpServer` just built
+   * holds — e.g. connected-integration counts — attributed alongside
+   * `residencyAttributes()` on the same `McpSessionDO.init` span so per-session
+   * memory footprint is queryable next to isolate residency without a
+   * cross-span join. Empty by default: a host that has nothing free to read
+   * (or nothing beyond what `buildMcpServer` already returns) need not
+   * override this. MUST stay O(1)/O(count) over already-materialized state —
+   * never trigger a new query or serialize a catalog to compute these.
+   */
+  protected sessionFootprintAttributes(): Record<string, number> {
+    return {};
+  }
 
   protected withTelemetry<A, E>(
     effect: Effect.Effect<A, E>,
@@ -265,12 +419,117 @@ export abstract class McpAgentSessionDOBase<
     return Effect.void;
   }
 
+  /**
+   * Declare that the Durable Object has finished deciding what to do about this
+   * cause — either it reported it through `captureCauseEffect`, or it
+   * recognized it as expected platform behaviour and deliberately did not.
+   *
+   * Either way the cause is *owned here*. The host's outer error
+   * instrumentation wraps the DO's entry points and would otherwise report the
+   * same rejection a second time as it escapes, producing two issues per
+   * failure; this is the hook that lets the host drop its own echo. Anything the
+   * DO never claims (an alarm crash, a transport fault) is untouched and keeps
+   * being reported by that instrumentation, which is the whole point of
+   * claiming explicitly instead of disabling it.
+   */
+  protected claimCauseHandled(_cause: Cause.Cause<unknown>): Effect.Effect<void> {
+    return Effect.void;
+  }
+
   protected flushTelemetry(): Promise<void> {
     return Promise.resolve();
   }
 
+  /**
+   * The session id as it appears in logs and span attributes.
+   *
+   * Purely observational, and therefore total: a log line or a span attribute
+   * must never be able to abort the work it is describing. The alarm path is
+   * the one that used to prove this the hard way — it logged its decision
+   * before doing it, and on an invocation where the name could not be resolved
+   * the LOG threw and took the whole alarm with it.
+   */
+  protected sessionIdForTelemetry(): string {
+    return this.sessionIdOrUndefined() ?? UNRESOLVED_SESSION_ID;
+  }
+
+  /**
+   * The session id, or `undefined` when this DO's name cannot be resolved from
+   * any source. Derived from {@link sessionNameOrUndefined} so it agrees with
+   * the guard that decided the DO was addressable in the first place.
+   */
+  protected sessionIdOrUndefined(): string | undefined {
+    const name = this.sessionNameOrUndefined();
+    if (name === undefined) return undefined;
+    const [, sessionId] = name.split(":");
+    return sessionId ? sessionId : undefined;
+  }
+
+  /**
+   * The session id for callers that cannot proceed without one — routing an
+   * execution back to its owner, addressing an approval URL. Those callers want
+   * the throw, because a wrong id is worse than a failure.
+   */
   protected get sessionId(): string {
+    const resolved = this.sessionIdOrUndefined();
+    if (resolved !== undefined) return resolved;
     return this.getSessionId();
+  }
+
+  /**
+   * The single place that answers "what is this Durable Object's name".
+   *
+   * PartyServer has three sources and does not consult them all in the same
+   * place: `this.name` reads `ctx.id.name` and an in-memory field that is only
+   * hydrated during initialization, while the durable `__ps_name` record is
+   * read *only* by that initialization. An entry point that skips
+   * initialization — the alarm override below, which handles most of its
+   * decisions itself and only delegates to `super.alarm()` on one branch — can
+   * therefore find the durable record present, conclude the session is
+   * addressable, and still have `this.name` throw on the very next read.
+   *
+   * Everything in this class goes through this accessor instead, so the guard
+   * and the reads that follow it can never disagree.
+   */
+  private sessionNameOrUndefined(): string | undefined {
+    return this.ctx.id.name ?? this.resolvedSessionName ?? this.partyServerNameOrUndefined();
+  }
+
+  /**
+   * Ask every source, including durable storage, and remember the answer.
+   *
+   * The remembered value is what makes the synchronous accessor above agree
+   * with this one for the rest of the invocation: a name recovered from the
+   * `__ps_name` record stays available to callers that cannot await.
+   */
+  private async resolveSessionName(): Promise<string | undefined> {
+    const inMemory = this.sessionNameOrUndefined();
+    if (inMemory !== undefined) {
+      this.resolvedSessionName = inMemory;
+      return inMemory;
+    }
+    const stored = await this.ctx.storage.get<string>(PARTYSERVER_NAME_KEY);
+    if (!stored) return undefined;
+    this.resolvedSessionName = stored;
+    return stored;
+  }
+
+  /**
+   * Read PartyServer's own name resolution without inheriting its throw.
+   *
+   * PartyServer exposes no non-throwing probe for "do you have a name yet", so
+   * "it throws" IS the signal for "not resolvable from memory" — the same shape
+   * as {@link connectionsOrNone}. In a unit harness the getter also
+   * throws on its uninitialized private field, which reads identically here and
+   * is equally correct.
+   */
+  private partyServerNameOrUndefined(): string | undefined {
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: see doc comment; partyserver's `name` getter throws instead of reporting absence.
+    try {
+      return (this as { readonly name?: string }).name;
+    } catch {
+      return undefined;
+    }
   }
 
   protected currentParentSpan(): Tracer.AnySpan | undefined {
@@ -299,7 +558,7 @@ export abstract class McpAgentSessionDOBase<
 
   protected forwardModelResumeToOwner(
     _owner: McpExecutionOwnerRoute,
-    _identity: McpApprovalOwner,
+    _identity: McpModelResumeCaller,
     _executionId: string,
     _response: ResumeResponse,
   ): Effect.Effect<McpSessionModelResumeResult, unknown> {
@@ -307,6 +566,49 @@ export abstract class McpAgentSessionDOBase<
       status: "execution_expired",
       ttlMs: PAUSED_APPROVAL_TIMEOUT_MS,
     });
+  }
+
+  /**
+   * Whether this host can route an eviction REQUEST to this session's own
+   * Durable Object instance rather than tearing it down directly in some
+   * OTHER session's request context. Hosts that override `requestSelfEviction`
+   * with a real self-addressed stub call return `true` here too. A host that
+   * returns `false` (the default) is never registered as an eviction
+   * candidate at all — see `init` — so it degrades to purely observational:
+   * the residency gauge and cap-overflow attribute still work, cap eviction
+   * just never picks it.
+   */
+  protected supportsCapEviction(): boolean {
+    return false;
+  }
+
+  /**
+   * Ask THIS session's own Durable Object instance — running in ITS OWN
+   * request/IoContext — to tear down its resident runtime because the
+   * isolate is over its cap.
+   *
+   * This must never be `evictResidentRuntimeForCap()` called directly on
+   * `this` from within another session's request. Even though that would be
+   * the exact same JS object in the exact same isolate (Durable Objects with
+   * the same id ARE the same instance), a plain method call does not create a
+   * new IoContext — it runs inside whatever IoContext is already current,
+   * which belongs to the CALLING session's request. workerd binds I/O objects
+   * (a postgres.js socket, a storage transaction, a span flush) to the
+   * IoContext that created them, so tearing this session down that way throws
+   * "Cannot perform I/O on behalf of a different request" or silently
+   * miscredits the I/O to the wrong request. Routing through this session's
+   * own Durable Object STUB (`mcpSessionStub(...).requestCapEviction()`) goes
+   * through the Workers RPC/fetch machinery instead, which gives the call a
+   * freshly-created IoContext bound to itself — so the teardown it triggers
+   * runs correctly scoped, no matter which session's `init` sent the request.
+   *
+   * Overridden per host, because only a concrete host knows its own
+   * self-addressed namespace binding. The base default is a no-op so a host
+   * that never overrides it (and therefore never overrides
+   * `supportsCapEviction` to `true`) is simply never asked.
+   */
+  protected requestSelfEviction(): Promise<void> {
+    return Promise.resolve();
   }
 
   protected readonly browserApprovalStore: BrowserApprovalStore = {
@@ -354,9 +656,29 @@ export abstract class McpAgentSessionDOBase<
       // the field. Their stored meta has no `resource`, and every such session
       // was minted against the default `/mcp` endpoint, so default it here
       // rather than let owner validation read `.kind` off undefined.
-      this.sessionMeta = stored
-        ? { ...stored, resource: stored.resource ?? defaultMcpResource }
-        : null;
+      if (!stored) {
+        this.sessionMeta = null;
+        return this.sessionMeta;
+      }
+
+      if (stored.orgRoleModel === undefined) {
+        // Records written before the role-model field existed cannot prove
+        // that their optional role was derived under an enforcing host. Treat
+        // them as an organization-role session with no role, which denies
+        // workspace writes until a live request refreshes the metadata.
+        const { orgRole: _untrustedLegacyRole, ...legacy } = stored;
+        this.sessionMeta = {
+          ...legacy,
+          orgRoleModel: "organization",
+          resource: stored.resource ?? defaultMcpResource,
+        };
+        return this.sessionMeta;
+      }
+
+      this.sessionMeta = {
+        ...stored,
+        resource: stored.resource ?? defaultMcpResource,
+      };
       return this.sessionMeta;
     }).pipe(Effect.withSpan("mcp.session.load_meta"));
   }
@@ -390,10 +712,43 @@ export abstract class McpAgentSessionDOBase<
 
   private async markActivity(now = Date.now()): Promise<void> {
     this.lastActivityMs = now;
+    // Keeps the isolate-wide eviction registry's LRU order current. A no-op
+    // when this session has no registry entry yet (nothing resident) or none
+    // any more (already disposed) — `touchResidentSession` is a lookup-then-set
+    // that quietly does nothing on a miss.
+    touchResidentSession(this.sessionIdForTelemetry(), now);
     await Promise.all([
       this.ctx.storage.put(LAST_ACTIVITY_KEY, now),
       this.ctx.storage.setAlarm(now + this.sessionTimeoutMs()),
     ]);
+  }
+
+  /**
+   * Keep this session's idle deadline armed across the SDK's own alarm
+   * bookkeeping.
+   *
+   * The agents SDK recomputes the Durable Object alarm from its schedule table
+   * and keep-alive refcount, and when it finds neither it does not leave the
+   * alarm alone — it DELETES it. It releases the last keep-alive ref at the end
+   * of every ordinary request, from a `waitUntil`, so the idle alarm that
+   * `markActivity` had just armed was being erased moments after the response
+   * went out. A session that had just served a tool call was therefore left
+   * with no alarm at all: the idle policy never ran again, and its runtime
+   * stayed resident until the platform evicted the whole object.
+   *
+   * The idle deadline belongs to this class, not to the SDK's scheduler, so it
+   * is re-asserted after the SDK has arranged whatever it needs. Only while a
+   * runtime is actually resident — once there is nothing left to reclaim the
+   * SDK's answer is right and re-arming would spin the alarm forever.
+   */
+  protected async ensureIdleAlarmArmed(): Promise<void> {
+    if (!this.hasResidentRuntime()) return;
+    const lastActivityMs = await this.loadLastActivity();
+    if (lastActivityMs <= 0) return;
+    const idleDeadlineMs = lastActivityMs + this.sessionTimeoutMs();
+    const armed = await this.ctx.storage.getAlarm();
+    if (armed !== null && armed <= idleDeadlineMs) return;
+    await this.ctx.storage.setAlarm(Math.max(idleDeadlineMs, Date.now() + 1));
   }
 
   private async loadLastActivity(): Promise<number> {
@@ -401,12 +756,6 @@ export abstract class McpAgentSessionDOBase<
     const stored = await this.ctx.storage.get<number>(LAST_ACTIVITY_KEY);
     this.lastActivityMs = stored ?? 0;
     return this.lastActivityMs;
-  }
-
-  private async hasPartyServerName(): Promise<boolean> {
-    if (this.ctx.id.name) return true;
-    const stored = await this.ctx.storage.get<string>(PARTYSERVER_NAME_KEY);
-    return !!stored;
   }
 
   private activeStreamCount(): number {
@@ -420,13 +769,20 @@ export abstract class McpAgentSessionDOBase<
     // which survives disposeIdleRuntime, so a later reconnect GET re-inits the
     // DO and replays it. Counting them would make every delivered-but-unacked
     // POST response pin the runtime alive indefinitely.
-    const rows = await this.ctx.storage.list<readonly JsonRpcRequestId[]>({
-      prefix: MCP_STREAM_REQS_KEY_PREFIX,
-      limit: 1_000,
-    });
+    //
+    // Rows stamped with an epoch older than this incarnation's are dead work,
+    // not running work: the isolate that was going to produce their response
+    // was reset, so nothing will ever answer them and they must not hold the
+    // runtime open. The transport's orphan sweep tells the client and removes
+    // the row on the next GET; until then they simply do not count.
+    const [openStreams, currentEpoch] = await Promise.all([
+      this.getOpenStreamRequestIds(),
+      this.currentSessionEpoch(),
+    ]);
     let count = 0;
-    for (const requestIds of rows.values()) {
-      if (Array.isArray(requestIds)) count += requestIds.length;
+    for (const stream of openStreams) {
+      if (stream.epoch < currentEpoch) continue;
+      count += stream.requestIds.length;
     }
     return count;
   }
@@ -465,25 +821,14 @@ export abstract class McpAgentSessionDOBase<
   }
 
   private async cleanupUnaddressableSessionAlarm(): Promise<void> {
-    await Effect.runPromise(this.closeRuntime());
-    await Effect.runPromise(
-      Effect.all([
-        Effect.ignore(Effect.tryPromise(() => this.ctx.storage.deleteAlarm())),
-        Effect.ignore(Effect.tryPromise(() => this.ctx.storage.delete(LAST_ACTIVITY_KEY))),
-      ]),
-    );
-  }
-
-  private async disposeIdleRuntime(input: {
-    readonly idleMs: number;
-    readonly pausedExecutionCount: number;
-  }): Promise<void> {
-    console.info(
+    // No name from any source means no session to act on: there is nothing to
+    // route, nothing to identify, and no id to put in this line. Say so, tear
+    // the runtime down, drop the alarm, and return normally — a session that
+    // cannot be addressed must not leave an alarm retrying forever.
+    console.warn(
       JSON.stringify({
-        event: "mcp_session_idle_runtime_dispose",
-        sessionId: this.sessionId,
-        idleMs: input.idleMs,
-        pausedExecutionCount: input.pausedExecutionCount,
+        event: "mcp_session_unaddressable_alarm_cleanup",
+        sessionId: this.sessionIdForTelemetry(),
       }),
     );
     await Effect.runPromise(this.closeRuntime());
@@ -495,15 +840,277 @@ export abstract class McpAgentSessionDOBase<
     );
   }
 
+  /** Whether anything is currently holding isolate memory for this session. */
+  private hasResidentRuntime(): boolean {
+    return this.initialized || this.engine !== null || this.dbHandle !== null;
+  }
+
+  /**
+   * Drop this session's execution runtime, returning its memory to the
+   * isolate. Nothing durable is discarded, so the next request restores the
+   * session and the client sees only restore latency.
+   *
+   * `reason` disambiguates WHY on the shared span and log line without
+   * splitting them: `"idle"` is the alarm-driven path (this session itself
+   * went quiet), `"cap"` is another session's `init` evicting this one because
+   * the isolate was over its resident-runtime ceiling. The mechanism —
+   * `closeRuntime` plus dropping the durable alarm/activity bookkeeping — is
+   * identical either way; only the trigger differs, and callers are expected
+   * to have already established (via their own eligibility check) that
+   * disposing this session right now is safe.
+   */
+  private async disposeIdleRuntime(input: {
+    readonly idleMs: number;
+    readonly pausedExecutionCount: number;
+    readonly activeStreamCount: number;
+    readonly reason?: "idle" | "cap";
+  }): Promise<void> {
+    const reason = input.reason ?? "idle";
+    console.info(
+      JSON.stringify({
+        event: "mcp_session_idle_runtime_dispose",
+        sessionId: this.sessionIdForTelemetry(),
+        idleMs: input.idleMs,
+        pausedExecutionCount: input.pausedExecutionCount,
+        activeStreamCount: input.activeStreamCount,
+        reason,
+      }),
+    );
+    const self = this;
+    const program = Effect.gen(function* () {
+      yield* self.closeRuntime();
+      yield* Effect.all([
+        Effect.ignore(Effect.tryPromise(() => self.ctx.storage.deleteAlarm())),
+        Effect.ignore(Effect.tryPromise(() => self.ctx.storage.delete(LAST_ACTIVITY_KEY))),
+      ]);
+      // Read the gauge AFTER the release, so the attribute reports what the
+      // isolate is actually holding now rather than what it held a moment ago.
+      yield* Effect.annotateCurrentSpan(residencyAttributes());
+    }).pipe(
+      // Span name kept stable for dashboard continuity across both triggers;
+      // `mcp.session.dispose_reason` is what disambiguates them.
+      Effect.withSpan("mcp.session.idle_runtime_dispose", {
+        attributes: {
+          "mcp.session.id": self.sessionId,
+          "mcp.session.idle_ms": input.idleMs,
+          "mcp.session.paused_execution_count": input.pausedExecutionCount,
+          "mcp.session.active_stream_count": input.activeStreamCount,
+          "mcp.session.dispose_reason": reason,
+        },
+      }),
+    );
+    // The alarm has no incoming trace context of its own, so this starts a new
+    // trace. It still has to be flushed explicitly — the alarm is not on any
+    // request's response path, and without the flush the span dies with the
+    // isolate and the mechanism stays unobservable in production.
+    // See `disposeAbortController`'s doc comment: nothing in production aborts
+    // this signal today; it exists so a unit test can interrupt this exact
+    // fiber and confirm `closeRuntime`'s now-uninterruptible teardown still
+    // runs to completion instead of being cut short.
+    const abortController = new AbortController();
+    this.disposeAbortController = abortController;
+    await Effect.runPromise(this.withSpanFlush(this.withTelemetry(program)), {
+      signal: abortController.signal,
+    }).finally(() => {
+      // Only clear the field if it is still THIS call's controller — see the
+      // matching comment in `init` for why an overlapping later call's
+      // controller must not be clobbered.
+      if (this.disposeAbortController === abortController) this.disposeAbortController = null;
+    });
+  }
+
+  /**
+   * Isolate is over its resident-runtime soft cap and this session was the
+   * LRU-eligible pick (see `pickEvictionCandidate`). Re-checks every
+   * disqualifying signal `decideSessionAlarm` treats as active work — LIVE,
+   * not the snapshot `canEvict` used to be picked — because a session can
+   * start a request in the gap between being picked and being disposed here.
+   * `canEvict`'s snapshot is a cheap, synchronous, necessarily-optimistic
+   * filter for CHOOSING among candidates; this is the authoritative gate that
+   * actually decides whether disposing this session right now is safe, and it
+   * includes the one signal `canEvict` cannot see synchronously — undelivered
+   * stream responses still in storage. A session that is no longer eligible is
+   * left alone: eviction becomes a no-op instead of a wrongful teardown.
+   */
+  private async evictResidentRuntimeForCap(): Promise<void> {
+    const [pausedExecutionCount, runningExecutionCount] = await Promise.all([
+      this.pausedExecutionCount(),
+      this.runningExecutionCount(),
+    ]);
+    const activeStreamCount = this.activeStreamCount();
+    if (pausedExecutionCount > 0 || runningExecutionCount > 0 || activeStreamCount > 0) return;
+    const idleMs = this.lastActivityMs > 0 ? Date.now() - this.lastActivityMs : 0;
+    await this.disposeIdleRuntime({
+      idleMs,
+      pausedExecutionCount,
+      activeStreamCount,
+      reason: "cap",
+    });
+  }
+
+  /**
+   * Cheap, synchronous eligibility filter consulted by `pickEvictionCandidate`
+   * to choose AMONG resident sessions. Deliberately conservative rather than
+   * exhaustive: it mirrors the same "no active work" signals
+   * `decideSessionAlarm` treats as disqualifying, restricted to what can be
+   * answered without an async storage read (undelivered stream responses,
+   * `runningExecutionCount`, requires one). `evictResidentRuntimeForCap`
+   * re-checks the full set — including that signal — right before actually
+   * disposing, so a false "evictable" here can only ever produce a safe
+   * no-op, never a wrongful eviction.
+   */
+  private canEvictResidentRuntime(): boolean {
+    if (this.activeStreamCount() > 0) return false;
+    if (!this.engine) return true;
+    // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: this is a best-effort eviction-selection filter; a broken engine read must fail toward "not evictable", never toward crashing whichever OTHER session's init is picking a candidate.
+    try {
+      return Effect.runSync(this.engine.pausedExecutionCount()) === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * The soft cap this instance enforces. A protected method rather than a bare
+   * reference to `RESIDENT_RUNTIME_SOFT_CAP`, matching `sessionTimeoutMs` and
+   * `maxPausedSessionIdleMs` elsewhere in this class, so tests can install a
+   * small cap and exercise real eviction without registering 32 sessions.
+   */
+  protected residentRuntimeSoftCap(): number {
+    return RESIDENT_RUNTIME_SOFT_CAP;
+  }
+
+  /**
+   * Before this session's own runtime is built, make room if the isolate is
+   * already at its resident-runtime cap. Picks AT MOST ONE other session —
+   * never loops — and never blocks or fails THIS init on the outcome: the
+   * eviction REQUEST is fired via `ctx.waitUntil` and this init proceeds
+   * immediately, because a memory-pressure mechanism must never itself become
+   * the reason a session fails or is delayed starting. If nothing is
+   * currently evictable (every resident is streaming, paused, or already has
+   * a request outstanding), this session still builds and the overflow is
+   * only recorded on the init span.
+   *
+   * `candidate.dispose` does not run the candidate's teardown here — it SENDS
+   * the candidate a request that ITS OWN Durable Object instance executes in
+   * its own context (see `requestSelfEviction`'s doc comment). Because the
+   * request is fire-and-forget, this init has no way to react to it failing:
+   * the registry entry is left in place either way (never released here on
+   * failure), since whatever the candidate holds is, as far as this init
+   * knows, still actually resident — only the candidate's own successful
+   * teardown removes its entry. `markEvictionRequested` timestamps the entry
+   * up front so a candidate whose request is stuck or failing does not squat
+   * the LRU pick forever: the next init's `pickEvictionCandidate` skips it
+   * (see the grace period there) and picks the NEXT candidate instead.
+   *
+   * Safe to fire at the same candidate twice — two different sessions' inits
+   * both picking the same LRU entry before either's request lands — because
+   * the candidate's own handler (`evictResidentRuntimeForCap`) re-checks
+   * liveness and its teardown (`closeRuntime`) is idempotent: a second
+   * request either finds the runtime already gone (a no-op) or finds it
+   * newly busy again and leaves it alone.
+   *
+   * The check reads `currentResidentRuntimeCount() + currentInFlightColdBuildCount()`,
+   * not `currentResidentRuntimeCount()` alone. Residency only moves once a
+   * cold build actually finishes, so without the in-flight term, N
+   * overlapping cold inits arriving at the cap would each read the same
+   * still-under-cap count before any of them finishes, none would evict, and
+   * residency would land N over the cap once every build completed. Admitting
+   * (reserving a slot) unconditionally below — whether or not eviction fires
+   * for THIS init — is what lets the NEXT concurrent init see this one
+   * reflected in the sum.
+   */
+  private evictForCapIfNeeded(): Effect.Effect<void> {
+    const self = this;
+    return Effect.gen(function* () {
+      const overCap =
+        currentResidentRuntimeCount() + currentInFlightColdBuildCount() >=
+        self.residentRuntimeSoftCap();
+      // Admission: this init is about to start a cold build, so it counts as
+      // in-flight from here whether or not the check above finds anything to
+      // evict. Released exactly once `evictForCapIfNeeded`'s caller (`init`)
+      // either finishes building or fails/is interrupted — see
+      // `releaseColdBuildSlotIfReserved`.
+      self.reservedColdBuildSlot = true;
+      reserveColdBuildSlot();
+      if (!overCap) return;
+      const candidate = pickEvictionCandidate();
+      if (!candidate) {
+        yield* Effect.annotateCurrentSpan({ "mcp.isolate.cap_overflow": true });
+        return;
+      }
+      yield* Effect.sync(() => self.queueCapEvictionRequest(candidate));
+    });
+  }
+
+  /**
+   * Release this init's in-flight cold-build reservation (see
+   * `evictForCapIfNeeded`), if it is still holding one. Idempotent, mirroring
+   * `countedAsResident`'s guard discipline: called from both of its possible
+   * finishing points — the build's success path in `init`, and an
+   * `Effect.ensuring` finalizer covering the build's failure/interrupt path —
+   * so whichever happens releases the slot exactly once, and the other
+   * becomes a safe no-op.
+   */
+  private releaseColdBuildSlotIfReserved(): Effect.Effect<void> {
+    const self = this;
+    return Effect.sync(() => {
+      if (!self.reservedColdBuildSlot) return;
+      self.reservedColdBuildSlot = false;
+      releaseColdBuildSlot();
+    });
+  }
+
+  /**
+   * Fires the eviction REQUEST at `candidate`'s own stub and returns
+   * immediately — same fire-and-forget shape as
+   * `queuePendingApprovalLeaseStart`/`queuePendingApprovalLeaseExpiration`
+   * below. `markEvictionRequested` is stamped up front, before the request
+   * even lands, so a stuck or slow candidate cannot be re-picked by the next
+   * init in the meantime (see `pickEvictionCandidate`'s grace period).
+   */
+  private queueCapEvictionRequest(candidate: ResidentSessionEntry): void {
+    markEvictionRequested(candidate.sessionId);
+    this.ctx.waitUntil(
+      Effect.runPromise(
+        Effect.tryPromise({
+          try: () => candidate.dispose("cap"),
+          catch: (cause: unknown) => cause,
+        }).pipe(
+          Effect.catch(() =>
+            Effect.sync(() => {
+              console.warn(
+                JSON.stringify({
+                  event: "mcp_session_cap_eviction_request_failed",
+                  sessionId: candidate.sessionId,
+                }),
+              );
+              console.error("[mcp-session] cap eviction request failed");
+            }),
+          ),
+        ),
+      ),
+    );
+  }
+
   private resolveAndStoreSessionMeta(token: McpSessionInit) {
     const self = this;
     return Effect.gen(function* () {
-      const resolved = yield* self.resolveSessionMeta(token);
-      // `init` runs again on every cold restore, and `resolveSessionMeta`
-      // rebuilds meta from the bearer token — which carries no negotiated
-      // capabilities. Carry the stored value forward, or restoring the session
-      // would erase the very bit that survives the restore.
+      // Read what this DO already knows BEFORE asking the host to resolve
+      // anything. `init` runs again on every cold restore, and the stored meta
+      // is this session's own durable record of the organization it was minted
+      // for — re-deriving that identity from the host's backing store is the
+      // single most failure-prone step of a restore (on cloud, a brand-new
+      // Postgres connection) and it is redundant for a session that already
+      // exists. It is offered only for the SAME organization; a token naming a
+      // different org resolves from scratch.
       const stored = yield* self.loadSessionMeta();
+      const reusable = stored && stored.organizationId === token.organizationId ? stored : null;
+      // The stored meta also carries the capabilities negotiated at
+      // `initialize`, which the bearer token knows nothing about. Carry them
+      // forward, or restoring the session would erase the very bit that
+      // survives the restore.
+      const resolved = yield* self.resolveSessionMeta(token, reusable);
       const sessionMeta: SessionMeta = {
         ...resolved,
         ...(token.webOrigin ? { webOrigin: token.webOrigin } : {}),
@@ -514,6 +1121,60 @@ export abstract class McpAgentSessionDOBase<
       );
       return sessionMeta;
     }).pipe(Effect.withSpan("mcp.session.resolve_and_store_meta"));
+  }
+
+  /**
+   * A Cloudflare platform reset happened. Record what KIND it was, on the span
+   * and in a structured log, so the volume stays countable per cause (deploy
+   * reset vs storage timeout vs backend blip) instead of collapsing into one
+   * opaque bucket the moment it stops being an error report.
+   */
+  private recordDurableObjectReset(input: {
+    readonly operation: string;
+    readonly failure: DurableObjectFailure;
+    readonly cause: Cause.Cause<unknown>;
+  }): Effect.Effect<void> {
+    const self = this;
+    return Effect.gen(function* () {
+      console.warn(
+        JSON.stringify({
+          event: "mcp_session_durable_object_reset",
+          operation: input.operation,
+          sessionId: self.sessionIdForTelemetry(),
+          resetKind: input.failure.kind,
+          disposition: input.failure.disposition,
+        }),
+      );
+      yield* Effect.annotateCurrentSpan({
+        "mcp.do.reset_kind": input.failure.kind,
+        "mcp.do.reset_disposition": input.failure.disposition,
+        "mcp.do.reset_operation": input.operation,
+      });
+    });
+  }
+
+  /**
+   * Run a storage write whose only job is bookkeeping, and let the Cloudflare
+   * platform take it away without taking the session with it.
+   *
+   * A platform reset (a deploy, a storage timeout, a backend blip) cancels
+   * whatever write is in flight. For a write nothing depends on, the right
+   * answer is to note it and carry on — the alternative, which is what used to
+   * happen, is that a fully built and perfectly healthy session is torn down and
+   * the user's request fails because a timestamp did not land.
+   *
+   * Scoped deliberately: only failures the classifier RECOGNIZES as platform
+   * resets are absorbed. Anything else is still a defect and still fails.
+   */
+  private bestEffortBookkeeping(operation: string, run: () => Promise<void>): Effect.Effect<void> {
+    const self = this;
+    return Effect.promise(run).pipe(
+      Effect.catchCause((cause) => {
+        const failure = classifyDurableObjectError(cause);
+        if (!failure) return Effect.failCause(cause);
+        return self.recordDurableObjectReset({ operation, failure, cause });
+      }),
+    );
   }
 
   private recordCauseOnSpan(cause: Cause.Cause<unknown>): Effect.Effect<void> {
@@ -534,16 +1195,12 @@ export abstract class McpAgentSessionDOBase<
   }): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
-      const first = Cause.prettyErrors(input.cause)[0];
       console.error(
         JSON.stringify({
           event: "mcp_execution_owner_directory_error",
           operation: input.operation,
           executionId: input.executionId,
-          sessionId: self.sessionId,
-          exceptionType: first?.name ?? "Error",
-          exceptionMessage: first?.message ?? "unknown",
-          cause: Cause.pretty(input.cause),
+          sessionId: self.sessionIdForTelemetry(),
         }),
       );
       yield* Effect.annotateCurrentSpan({
@@ -560,16 +1217,12 @@ export abstract class McpAgentSessionDOBase<
   }): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
-      const first = Cause.prettyErrors(input.cause)[0];
       console.error(
         JSON.stringify({
           event: "mcp_model_resume_forward_error",
           executionId: input.executionId,
-          sessionId: self.sessionId,
+          sessionId: self.sessionIdForTelemetry(),
           ownerSessionId: input.owner.sessionId,
-          exceptionType: first?.name ?? "Error",
-          exceptionMessage: first?.message ?? "unknown",
-          cause: Cause.pretty(input.cause),
         }),
       );
       yield* Effect.annotateCurrentSpan({
@@ -591,7 +1244,7 @@ export abstract class McpAgentSessionDOBase<
           event: "mcp_model_resume_forward_error",
           reason: "timeout",
           executionId: input.executionId,
-          sessionId: self.sessionId,
+          sessionId: self.sessionIdForTelemetry(),
           ownerSessionId: input.owner.sessionId,
           timeoutMs: input.timeoutMs,
         }),
@@ -621,7 +1274,32 @@ export abstract class McpAgentSessionDOBase<
 
   private closeRuntime(options: { readonly closeStreams?: boolean } = {}): Effect.Effect<void> {
     const self = this;
+    // A disposal is already tearing this runtime down — the idle alarm and a
+    // cap eviction request landing together, or a plain repeat call on any of
+    // `closeRuntime`'s existing callers. `server.close()`/`dbHandle.end()`
+    // are not safe to run twice concurrently on the same resources, and a
+    // second pass through the body below would double-release the residency
+    // counters. Wait for the SAME in-progress disposal instead of starting a
+    // second one; do not run the teardown body again.
+    if (self.disposingRuntime) {
+      const inProgress = self.disposingRuntime;
+      return Effect.promise(() => inProgress);
+    }
+    let resolveDisposal!: () => void;
+    const disposal = new Promise<void>((resolve) => {
+      resolveDisposal = resolve;
+    });
+    self.disposingRuntime = disposal;
     return Effect.gen(function* () {
+      // Flip this BEFORE the first async close below (`server.close()`), not
+      // after. `init` awaits `disposingRuntime` (set above) before deciding
+      // whether to rebuild, and it only gets the right answer because
+      // `initialized` is already `false` by the time that await resolves —
+      // otherwise a request that interleaved during the closes below would
+      // still see `initialized === true`, take `init`'s early-return path,
+      // and run against a server/engine that are mid-teardown or already
+      // gone.
+      self.initialized = false;
       yield* self.releaseAllPendingApprovalLeases();
       if (options.closeStreams ?? true) {
         yield* Effect.sync(() => self.closeActiveStreams());
@@ -629,17 +1307,58 @@ export abstract class McpAgentSessionDOBase<
       if (self.server) {
         const server = self.server;
         delete (self as { server?: McpServer }).server;
-        yield* Effect.promise(() => server.close()).pipe(Effect.ignore);
+        // `tryPromise`, not `promise`: a rejected close must land in the error
+        // channel where `ignore` absorbs it. With `Effect.promise` a rejection
+        // becomes a defect, which `ignore` does NOT absorb — the teardown
+        // would stop here while the `ensuring` below still resolved
+        // `disposingRuntime`, telling a waiting `init` the resources were
+        // released when the steps after this one never ran.
+        yield* Effect.tryPromise({
+          try: () => server.close(),
+          catch: (cause: unknown) => cause,
+        }).pipe(Effect.ignore);
       }
       Reflect.set(self, "_transport", undefined);
       self.engine = null;
       if (self.dbHandle) {
         const dbHandle = self.dbHandle;
         self.dbHandle = null;
-        yield* Effect.promise(() => Promise.resolve(dbHandle.end())).pipe(Effect.ignore);
+        // Same `tryPromise` reasoning as the server close above.
+        yield* Effect.tryPromise({
+          try: () => Promise.resolve(dbHandle.end()),
+          catch: (cause: unknown) => cause,
+        }).pipe(Effect.ignore);
       }
-      self.initialized = false;
-    });
+      if (self.countedAsResident) {
+        self.countedAsResident = false;
+        releaseResidentRuntime();
+        // Pairs with `registerResidentSession` in `init`. Idempotent, and
+        // gated on the same flag that guards the counter release, so a
+        // `closeRuntime` that runs on a path where nothing was ever built
+        // never removes an entry it did not add.
+        releaseResidentSession(self.sessionIdForTelemetry());
+      }
+    }).pipe(
+      // Uninterruptible once teardown starts, so it always runs to
+      // completion. The `Effect.ensuring` below resolves `disposingRuntime`
+      // unconditionally — a waiting `init` treats that resolution as "the
+      // resources are actually released" and proceeds to rebuild — which is
+      // only correct if nothing here can be interrupted or half-run partway
+      // through. Every step above is already bounded and safe to run
+      // uninterruptibly: the two closes route rejections into the error
+      // channel via `tryPromise` and `ignore` them (a bare `Effect.promise`
+      // would turn a rejection into a defect `ignore` cannot absorb), and
+      // `releaseAllPendingApprovalLeases` ignores its own failures
+      // (`deleteExecutionOwnerEntry` is `Effect.ignore`d too), so nothing
+      // here can defect either.
+      Effect.uninterruptible,
+      Effect.ensuring(
+        Effect.sync(() => {
+          if (self.disposingRuntime === disposal) self.disposingRuntime = null;
+          resolveDisposal();
+        }),
+      ),
+    );
   }
 
   private ensureRuntimeForApproval(): Effect.Effect<boolean> {
@@ -698,31 +1417,122 @@ export abstract class McpAgentSessionDOBase<
   }
 
   async init(): Promise<void> {
-    if (this.initialized) return;
+    if (this.disposingRuntime) {
+      // A disposal (idle alarm, cap eviction) is mid-teardown for this
+      // session's own Durable Object instance. `closeRuntime` flips
+      // `initialized` to `false` before its first async close specifically so
+      // this does not race it: wait for the disposal to actually finish —
+      // server closed, engine and db handle released, residency counters
+      // updated — before deciding whether a rebuild is even needed, instead
+      // of starting one against half-torn-down state.
+      await this.disposingRuntime;
+    }
     const props = isSessionProps(this.props) ? this.props : null;
     if (!props) {
       // oxlint-disable-next-line executor/no-try-catch-or-throw, executor/no-error-constructor -- boundary: McpAgent.init is a Promise-only framework hook and props are required before any Effect runtime exists.
       throw new Error("MCP session props are required");
     }
+    if (this.initialized) {
+      return;
+    }
     const self = this;
     const program = Effect.gen(function* () {
       yield* self.prepareErrorCaptureScope();
       const sessionMeta = yield* self.resolveAndStoreSessionMeta(props.session);
-      const dbHandle = yield* self.openSessionDbHandle();
-      const { mcpServer, engine } = yield* self.buildRuntime(sessionMeta, dbHandle);
+      // Before building anything that will itself occupy isolate memory
+      // (a live db handle, the engine, the built tool catalog), make room if
+      // this isolate is already at its resident-runtime cap. Deliberately
+      // BEFORE `openSessionDbHandle`, not just before `buildRuntime`: the db
+      // handle is one of the three things a resident runtime holds.
+      yield* self.evictForCapIfNeeded();
+      // The in-flight cold-build reservation `evictForCapIfNeeded` just took
+      // is released exactly once — success, failure, or interrupt — by the
+      // single `Effect.ensuring` wrapped around this ENTIRE program below,
+      // not a narrower one scoped to just this build block. A narrower wrap
+      // still leaves a gap between the reservation being taken above and the
+      // wrap starting here: an interrupt landing in exactly that gap would
+      // leak the reservation forever (the module counter only drifts up),
+      // which is why the release is anchored to the same scope as the
+      // acquisition instead.
+      const { dbHandle, mcpServer, engine } = yield* Effect.gen(function* () {
+        const dbHandle = yield* self.openSessionDbHandle();
+        const built = yield* self.buildRuntime(sessionMeta, dbHandle);
+        return { dbHandle, ...built };
+      });
       self.dbHandle = dbHandle;
       self.server = mcpServer;
       self.engine = engine;
       self.initialized = true;
-      yield* Effect.promise(() => self.markActivity()).pipe(
-        Effect.withSpan("McpSessionDO.markActivity"),
-      );
+      if (!self.countedAsResident) {
+        self.countedAsResident = true;
+        acquireResidentRuntime();
+        // Only a host that can route an eviction request back to THIS
+        // session's own Durable Object instance (see `requestSelfEviction`)
+        // registers as a candidate at all. A host that cannot is still
+        // counted in the gauge above — cap-overflow tracking stays accurate —
+        // it is just never picked, degrading to observational rather than
+        // running teardown in the wrong context.
+        if (self.supportsCapEviction()) {
+          // Paired with `releaseResidentSession` in `closeRuntime`. Registered
+          // as soon as this session counts as resident, so a cap check running
+          // in another session's `init` moments later already sees it as a
+          // candidate. `markActivity` below immediately corrects the initial
+          // timestamp via `touchResidentSession`, so `Date.now()` here only
+          // needs to be a safe placeholder, not the true last-activity time.
+          registerResidentSession({
+            sessionId: self.sessionIdForTelemetry(),
+            lastActivityMs: Date.now(),
+            canEvict: () => self.canEvictResidentRuntime(),
+            dispose: () => self.requestSelfEviction(),
+          });
+        }
+      }
+      // The gauge on the way up. Paired with the same attributes on
+      // `mcp.session.idle_runtime_dispose`, this is what shows whether idle
+      // sessions are actually giving their runtimes back in production.
+      // `sessionFootprintAttributes()` rides the same span so a heavy session
+      // can be attributed to what it holds, not just counted.
+      yield* Effect.annotateCurrentSpan({
+        ...residencyAttributes(),
+        ...self.sessionFootprintAttributes(),
+      });
+      // Last statement, and pure bookkeeping: the runtime above is already
+      // installed and serving. Losing the timestamp/alarm write to a platform
+      // reset must not undo any of it — the in-memory clock is already set and
+      // the next request re-arms the alarm.
+      yield* self
+        .bestEffortBookkeeping("init.mark_activity", () => self.markActivity())
+        .pipe(Effect.withSpan("McpSessionDO.markActivity"));
     }).pipe(
+      // Covers the ENTIRE program above, not just the build block: anything
+      // from `evictForCapIfNeeded`'s admission onward that ends this effect —
+      // success, failure, or interrupt — releases the cold-build reservation
+      // exactly once (`releaseColdBuildSlotIfReserved` is idempotent). Wrapping
+      // only the build block would leave the gap between admission and the
+      // build starting uncovered.
+      Effect.ensuring(self.releaseColdBuildSlotIfReserved()),
+      // ONE capture owner for an init defect. `init` can only reject its
+      // Promise, and the host's DO-level error instrumentation captures that
+      // rejection too — so the DO claims the cause below and the host drops its
+      // own echo, rather than both filing the same failure as two issues with
+      // the same trace id and span id.
       Effect.tapCause((cause) =>
         Effect.gen(function* () {
-          console.error("[mcp-session] init failed:", Cause.pretty(cause));
-          yield* self.captureCauseEffect(cause);
+          // A Cloudflare platform reset of an in-flight init is not a defect —
+          // every deploy causes one, by design. Record the kind so the volume
+          // stays measurable, let the caller render it as a retry, and do not
+          // page for it. Everything else is reported exactly as before.
+          const failure = classifyDurableObjectError(cause);
+          if (failure) {
+            yield* self.recordDurableObjectReset({ operation: "init", failure, cause });
+          } else {
+            console.error("[mcp-session] init failed");
+            yield* self.captureCauseEffect(cause);
+          }
           yield* self.recordCauseOnSpan(cause);
+          // Claimed AFTER any capture above, so the DO's own event is not
+          // mistaken for the host instrumentation's duplicate of it.
+          yield* self.claimCauseHandled(cause);
         }),
       ),
       Effect.catchCause((cause) =>
@@ -738,17 +1548,59 @@ export abstract class McpAgentSessionDOBase<
       }),
     );
     const traced = this.withTelemetry(program, props?.propagation);
+    // See `initAbortController`'s doc comment: nothing in production aborts
+    // this signal today, but wiring it through `runPromise` gives a unit test
+    // a real handle to interrupt this exact fiber deterministically instead
+    // of only ever exercising the failure/defect path.
+    const abortController = new AbortController();
+    self.initAbortController = abortController;
     return Effect.runPromise(
       traced.pipe(
         // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: Durable Object init method can only reject its Promise
         Effect.orDie,
         (effect) => self.withSpanFlush(effect),
       ),
+      { signal: abortController.signal },
+    ).finally(() => {
+      // Only clear the field if it is still THIS call's controller — an
+      // overlapping later `init` call may already have installed its own by
+      // the time this one settles, and clobbering that with `null` would
+      // leave a unit test unable to reach it.
+      if (self.initAbortController === abortController) self.initAbortController = null;
+    });
+  }
+
+  /**
+   * The candidate side of cap eviction. Called only through THIS session's own
+   * Durable Object stub — see `requestSelfEviction` — never invoked directly
+   * on an in-process reference by another session, which is the whole point:
+   * routing the call through the stub gives it a correctly-scoped IoContext
+   * for `evictResidentRuntimeForCap`'s teardown to run in.
+   *
+   * Safe to call more than once, including two overlapping calls (two
+   * different sessions' `init`s both having picked this one as their LRU
+   * candidate before either request lands): `evictResidentRuntimeForCap`
+   * re-checks liveness every time, and `closeRuntime` is idempotent, so a
+   * repeat call either finds the runtime already gone (a no-op) or finds it
+   * newly busy again and leaves it alone.
+   */
+  async requestCapEviction(): Promise<void> {
+    const self = this;
+    return Effect.runPromise(
+      Effect.gen(function* () {
+        yield* self.prepareErrorCaptureScope();
+        yield* Effect.promise(() => self.evictResidentRuntimeForCap());
+      }).pipe(
+        Effect.withSpan("McpSessionDO.requestCapEviction"),
+        // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
+        Effect.orDie,
+      ),
     );
   }
 
   async validateMcpSessionOwner(
     identity: McpApprovalOwner,
+    resource: McpResource,
   ): Promise<"ok" | "not_found" | "forbidden" | "terminated"> {
     const self = this;
     return Effect.runPromise(
@@ -769,18 +1621,19 @@ export abstract class McpAgentSessionDOBase<
         const sessionMeta = yield* self.loadSessionMeta();
         if (!sessionMeta) return "not_found" as const;
         if (self.initialized) {
-          yield* Effect.promise(() => self.markActivity()).pipe(
-            Effect.withSpan("McpSessionDO.markActivity"),
-          );
+          yield* self
+            .bestEffortBookkeeping("validate_owner.mark_activity", () => self.markActivity())
+            .pipe(Effect.withSpan("McpSessionDO.markActivity"));
         } else {
           yield* Effect.promise(() => self.onStart()).pipe(
             Effect.withSpan("McpSessionDO.restore_transport_runtime"),
           );
         }
-        return identity.accountId === sessionMeta.userId &&
-          identity.organizationId === sessionMeta.organizationId
-          ? ("ok" as const)
-          : ("forbidden" as const);
+        const ownerMatches =
+          identity.accountId === sessionMeta.userId &&
+          identity.organizationId === sessionMeta.organizationId;
+        const resourceMatches = mcpResourceKey(resource) === mcpResourceKey(sessionMeta.resource);
+        return ownerMatches && resourceMatches ? ("ok" as const) : ("forbidden" as const);
       }).pipe(
         Effect.withSpan("McpSessionDO.validateMcpSessionOwner"),
         // oxlint-disable-next-line executor/no-effect-escape-hatch -- boundary: DO RPC exposes Promise results
@@ -828,7 +1681,7 @@ export abstract class McpAgentSessionDOBase<
 
   async resumeExecutionForModel(
     executionId: string,
-    identity: McpApprovalOwner,
+    identity: McpModelResumeCaller,
     response: ResumeResponse,
     incoming?: IncomingTraceHeaders,
   ): Promise<McpSessionModelResumeResult> {
@@ -848,7 +1701,17 @@ export abstract class McpAgentSessionDOBase<
           return { status: "execution_expired" as const, ttlMs: PAUSED_APPROVAL_TIMEOUT_MS };
         }
 
-        const outcome = yield* self.resumeEngineWithLifecycle(executionId, response);
+        // This RPC runs outside any MCP request, so nothing else binds the
+        // caller's workspace-write access; without it the resume would rebind
+        // the paused execution to the fail-closed default and deny an admin's
+        // pending write. A caller that predates the field is treated as denied.
+        const orgWriteAccess: OrgWriteAccess =
+          identity.orgWriteAccess === "allowed" ? "allowed" : "denied";
+        const outcome = yield* self
+          .resumeEngineWithLifecycle(executionId, response)
+          .pipe(
+            Effect.provideService(CurrentOrgWriteAccess, makeOrgWriteAccessState(orgWriteAccess)),
+          );
         if (!outcome) {
           const alreadySettled = self.engine.isExecutionSettled
             ? yield* self.engine.isExecutionSettled(executionId)
@@ -886,7 +1749,7 @@ export abstract class McpAgentSessionDOBase<
 
   async resumeExecutionForApproval(
     executionId: string,
-    identity: McpApprovalOwner,
+    identity: McpApprovalPrincipal,
     response: ResumeResponse,
     incoming?: IncomingTraceHeaders,
   ): Promise<McpSessionResumeApprovalResult> {
@@ -903,7 +1766,10 @@ export abstract class McpAgentSessionDOBase<
         const paused = yield* self.engine.getPausedExecution(executionId);
         if (!paused) return { status: "not_found" } as const;
 
-        yield* self.recordApprovalResponse(executionId, response);
+        yield* self.recordApprovalResponse(executionId, {
+          response,
+          orgWriteAccess: identity.orgRole === "admin" ? "allowed" : "denied",
+        });
         return resumeApprovalResult(executionId, response);
       }).pipe(
         Effect.withSpan("McpSessionDO.resumeExecutionForApproval", {
@@ -928,7 +1794,11 @@ export abstract class McpAgentSessionDOBase<
   }
 
   override async alarm(): Promise<void> {
-    if (!(await this.hasPartyServerName())) {
+    // Resolve the name FIRST, from every source, and hold onto it. Everything
+    // below — the lease logs, the dispose log, `super.alarm()` — reads the
+    // session id off that same answer, so an alarm this guard lets through can
+    // no longer die on the next read of an id it just decided exists.
+    if ((await this.resolveSessionName()) === undefined) {
       await this.cleanupUnaddressableSessionAlarm();
       return;
     }
@@ -955,7 +1825,7 @@ export abstract class McpAgentSessionDOBase<
       console.info(
         JSON.stringify(
           pausedLeaseExtensionLog({
-            sessionId: this.sessionId,
+            sessionId: this.sessionIdForTelemetry(),
             pausedExecutionCount,
             idleMs,
             leaseMs: decision.leaseMs,
@@ -970,7 +1840,7 @@ export abstract class McpAgentSessionDOBase<
       console.info(
         JSON.stringify(
           runningLeaseExtensionLog({
-            sessionId: this.sessionId,
+            sessionId: this.sessionIdForTelemetry(),
             runningExecutionCount,
             activeStreamCount,
             idleMs,
@@ -986,7 +1856,12 @@ export abstract class McpAgentSessionDOBase<
       return;
     }
 
-    await this.disposeIdleRuntime({ idleMs, pausedExecutionCount });
+    await this.disposeIdleRuntime({
+      idleMs,
+      pausedExecutionCount,
+      activeStreamCount,
+      reason: "idle",
+    });
   }
 
   private validateApprovalIdentity(
@@ -1097,9 +1972,10 @@ export abstract class McpAgentSessionDOBase<
 
       const sessionMeta = yield* self.loadSessionMeta();
       if (!sessionMeta) return { status: "execution_forbidden" } as const;
-      const identity: McpApprovalOwner = {
+      const identity: McpModelResumeCaller = {
         accountId: sessionMeta.userId,
         organizationId: sessionMeta.organizationId,
+        orgWriteAccess: yield* currentOrgWriteAccess,
       };
       if (
         identity.accountId !== record.accountId ||
@@ -1170,9 +2046,9 @@ export abstract class McpAgentSessionDOBase<
       // which used to hold a ref across the pause and mask this by keeping
       // the ref transition away from 0->1.)
       const disposeKeepAlive = yield* Effect.promise(() => self.keepAlive());
-      yield* Effect.promise(() => self.markActivity()).pipe(
-        Effect.withSpan("McpSessionDO.markActivity"),
-      );
+      yield* self
+        .bestEffortBookkeeping("approval_lease.mark_activity", () => self.markActivity())
+        .pipe(Effect.withSpan("McpSessionDO.markActivity"));
       const timeout = setTimeout(() => {
         self.queuePendingApprovalLeaseExpiration(executionId);
       }, PAUSED_APPROVAL_TIMEOUT_MS);
@@ -1185,10 +2061,7 @@ export abstract class McpAgentSessionDOBase<
       Effect.tapCause((cause) =>
         Effect.gen(function* () {
           yield* Effect.sync(() => {
-            console.error(
-              "[mcp-session] pending approval lease start failed:",
-              Cause.pretty(cause),
-            );
+            console.error("[mcp-session] pending approval lease start failed");
           });
           yield* self.captureCauseEffect(cause);
         }),
@@ -1212,10 +2085,7 @@ export abstract class McpAgentSessionDOBase<
           Effect.tapCause((cause) =>
             Effect.gen(function* () {
               yield* Effect.sync(() => {
-                console.error(
-                  "[mcp-session] pending approval lease expiration failed:",
-                  Cause.pretty(cause),
-                );
+                console.error("[mcp-session] pending approval lease expiration failed");
               });
               yield* self.captureCauseEffect(cause);
             }),
@@ -1280,14 +2150,14 @@ export abstract class McpAgentSessionDOBase<
 
   private recordApprovalResponse(
     executionId: string,
-    response: ResumeResponse,
+    decision: BrowserApprovalDecision,
   ): Effect.Effect<void> {
     const self = this;
     return Effect.gen(function* () {
-      self.approvalResponses.set(executionId, response);
-      yield* Effect.promise(() => self.ctx.storage.put(approvalResponseKey(executionId), response));
+      self.approvalResponses.set(executionId, decision);
+      yield* Effect.promise(() => self.ctx.storage.put(approvalResponseKey(executionId), decision));
       const waiter = self.approvalWaiters.get(executionId);
-      if (waiter) yield* Deferred.succeed(waiter, response);
+      if (waiter) yield* Deferred.succeed(waiter, decision);
     });
   }
 
@@ -1309,7 +2179,10 @@ export abstract class McpAgentSessionDOBase<
       yield* Effect.sync(() => {
         console.info(JSON.stringify({ event: "mcp_pending_approval_lease_expire", executionId }));
       });
-      yield* self.recordApprovalResponse(executionId, response);
+      yield* self.recordApprovalResponse(executionId, {
+        response,
+        orgWriteAccess: "denied",
+      });
       if (self.engine && !self.approvalWaiters.has(executionId)) {
         yield* self.engine.resume(executionId, response).pipe(Effect.ignore);
       }
@@ -1321,7 +2194,7 @@ export abstract class McpAgentSessionDOBase<
     );
   }
 
-  private takeApprovalResponse(executionId: string): Effect.Effect<ResumeResponse | null> {
+  private takeApprovalResponse(executionId: string): Effect.Effect<BrowserApprovalDecision | null> {
     const self = this;
     return Effect.promise(async () => {
       const memoryResponse = self.approvalResponses.get(executionId);
@@ -1330,23 +2203,28 @@ export abstract class McpAgentSessionDOBase<
         await self.ctx.storage.delete(approvalResponseKey(executionId));
         return memoryResponse;
       }
-      const stored = await self.ctx.storage.get<ResumeResponse>(approvalResponseKey(executionId));
+      const stored = await self.ctx.storage.get<unknown>(approvalResponseKey(executionId));
       if (!stored) return null;
       await self.ctx.storage.delete(approvalResponseKey(executionId));
-      return stored;
+      const decision = Option.getOrNull(decodeBrowserApprovalDecision(stored));
+      if (decision) return decision;
+      const legacyResponse = decodeResumeResponse(stored);
+      return legacyResponse ? { response: legacyResponse, orgWriteAccess: "denied" } : null;
     });
   }
 
-  private waitForApprovalResponse(executionId: string): Effect.Effect<ResumeResponse | null> {
+  private waitForApprovalResponse(
+    executionId: string,
+  ): Effect.Effect<BrowserApprovalDecision | null> {
     const self = this;
     return Effect.gen(function* () {
       const existing = yield* self.takeApprovalResponse(executionId);
       if (existing) return existing;
 
       const waiter =
-        self.approvalWaiters.get(executionId) ?? (yield* Deferred.make<ResumeResponse>());
+        self.approvalWaiters.get(executionId) ?? (yield* Deferred.make<BrowserApprovalDecision>());
       self.approvalWaiters.set(executionId, waiter);
-      yield* Deferred.await(waiter).pipe(
+      const decision = yield* Deferred.await(waiter).pipe(
         Effect.ensuring(
           Effect.sync(() => {
             if (self.approvalWaiters.get(executionId) === waiter) {
@@ -1355,11 +2233,45 @@ export abstract class McpAgentSessionDOBase<
           }),
         ),
       );
-      return yield* self.takeApprovalResponse(executionId);
+      yield* self.takeApprovalResponse(executionId);
+      return decision;
     });
   }
 
   private async cleanup(): Promise<void> {
     await Effect.runPromise(this.closeRuntime());
+  }
+}
+
+/**
+ * Install the idle-deadline repair described on
+ * {@link McpAgentSessionDOBase.ensureIdleAlarmArmed}.
+ *
+ * At runtime this is an ordinary method override — the agents SDK calls
+ * `this._scheduleNextAlarm()` and gets this one. It cannot be written in the
+ * class body because the SDK declares that member `private`, and TypeScript
+ * refuses to let a subclass redeclare a private base member at all. So it is
+ * installed on the prototype, which is the same thing to the runtime and the
+ * only form the compiler accepts.
+ */
+type BoundAsyncMethod = (this: object) => Promise<void>;
+
+{
+  // Read off the INHERITED prototype, so this captures the SDK's own
+  // implementation rather than the wrapper being installed just below.
+  const inherited: object = Object.getPrototypeOf(McpAgentSessionDOBase.prototype);
+  const scheduleNextAlarm = Reflect.get(inherited, "_scheduleNextAlarm") as
+    | BoundAsyncMethod
+    | undefined;
+  if (scheduleNextAlarm) {
+    Reflect.set(
+      McpAgentSessionDOBase.prototype,
+      "_scheduleNextAlarm",
+      async function (this: object): Promise<void> {
+        await scheduleNextAlarm.call(this);
+        const ensureIdleAlarmArmed = Reflect.get(this, "ensureIdleAlarmArmed") as BoundAsyncMethod;
+        await ensureIdleAlarmArmed.call(this);
+      },
+    );
   }
 }
