@@ -7,57 +7,120 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # The default GITHUB_TOKEN cannot push commits that touch
+      # .github/workflows/*, which upstream changes routinely include.
+      # SYNC_UPSTREAM_TOKEN must be a PAT with repo + workflow scopes.
+      - name: Verify token
+        env:
+          SYNC_UPSTREAM_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+        run: |
+          if [ -z "$SYNC_UPSTREAM_TOKEN" ]; then
+            echo "::error::SYNC_UPSTREAM_TOKEN is not set. Create a classic PAT with 'repo' and 'workflow' scopes and add it as the repository secret SYNC_UPSTREAM_TOKEN."
+            exit 1
+          fi
+
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream remote
-        run: git remote add upstream https://github.com/UsefulSoftwareCo/executor.git
-
       - name: Fetch upstream
-        run: git fetch upstream
+        run: |
+          git remote add upstream https://github.com/UsefulSoftwareCo/executor.git
+          git fetch upstream
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          count=$(git rev-list --count main..upstream/main)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          if [ "$count" = "0" ]; then
+            echo "::notice::Upstream is already merged; nothing to do."
+          fi
 
       - name: Merge upstream/main
         id: merge
+        if: steps.check.outputs.count != '0'
         continue-on-error: true
         run: |
-          git checkout main
+          BRANCH="sync-upstream-$(date +%Y%m%d-%H%M)"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          git checkout -b "$BRANCH" main
           git merge upstream/main --no-edit
 
-      - name: Push (clean merge)
-        if: steps.merge.outcome == 'success'
-        run: git push origin main
-
-      - name: Push conflict branch + create PR
-        if: steps.merge.outcome != 'success'
+      - name: Commit conflict markers (needs manual resolution)
+        if: steps.check.outputs.count != '0' && steps.merge.outcome != 'success'
         run: |
-          BRANCH="sync-upstream-$(date +%Y%m%d)"
-          git checkout -b "$BRANCH"
-          # Abort the conflicted merge, re-attempt on the branch for the PR
-          git merge --abort
-          git merge upstream/main --no-edit || true
           git add -A
-          git commit -m "chore: sync upstream (conflicts need manual resolution)" --no-edit || true
-          git push origin "$BRANCH"
-          gh pr create \
-            --title "chore: sync upstream $(date +%Y-%m-%d)" \
-            --body "Upstream has new changes that conflict with our local modifications. Please resolve manually." \
-            --base main \
-            --head "$BRANCH"
+          git commit --no-edit
+
+      - name: Push branch
+        if: steps.check.outputs.count != '0'
+        run: git push origin "${{ steps.merge.outputs.branch }}"
+
+      - name: Create PR with diff summary
+        id: pr
+        if: steps.check.outputs.count != '0'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+          BRANCH: ${{ steps.merge.outputs.branch }}
+          COUNT: ${{ steps.check.outputs.count }}
+        run: |
+          LOG=$(git log --oneline main..upstream/main | head -100)
+          STAT=$(git diff --stat main...upstream/main | tail -1)
+          if [ "${{ steps.merge.outcome }}" = "success" ]; then
+            TITLE="chore: sync upstream $(date +%Y-%m-%d)"
+            NOTE="Clean merge of upstream changes. Auto-merge is enabled."
+          else
+            TITLE="chore: sync upstream $(date +%Y-%m-%d) (conflicts need manual resolution)"
+            NOTE="⚠️ Merge conflicts were committed as-is. Resolve them manually before merging — auto-merge is NOT enabled for this PR."
+          fi
+          {
+            echo "$NOTE"
+            echo ""
+            echo "Upstream is $COUNT commits ahead."
+            echo ""
+            echo "## Upstream commits"
+            echo ""
+            echo '```'
+            echo "$LOG"
+            echo '```'
+            echo ""
+            echo "## Diffstat"
+            echo ""
+            echo '```'
+            echo "$STAT"
+            echo '```'
+          } > body.md
+          PR_URL=$(gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body-file body.md)
+          echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+
+      # Merge commits (not squash) keep upstream/main in the ancestry so the
+      # next sync's main..upstream/main stays incremental.
+      - name: Enable auto-merge (clean merges only)
+        if: steps.check.outputs.count != '0' && steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+        run: gh pr merge --merge --auto --delete-branch "${{ steps.pr.outputs.url }}"
