@@ -11,7 +11,7 @@ import * as Sentry from "@sentry/cloudflare";
 import handler from "@tanstack/react-start/server-entry";
 
 import { isAppOwnedPath, servedByAppPlane } from "./app-paths";
-import { marketingProxyRequest } from "./edge/marketing";
+import { marketingProxyRequest, v2EdgeResponse } from "./edge/marketing";
 import { passthroughResponse } from "./edge/passthrough";
 import { withPrivateReferrerPolicy } from "./edge/referrer-policy";
 import { runWorkOsEventsSync } from "./auth/workos-events-runner";
@@ -308,19 +308,23 @@ const cloudflareHandler = {
   fetch: async (request, env, ctx) => {
     isolateRequestSeq += 1;
 
-    // Public pages must not enter TanStack Start: its first-request dynamic
-    // import loads the entire React + Effect server graph and can take seconds
-    // on a cold isolate. Classify and service-bind marketing at the Worker
-    // entry, before telemetry or fetchHandler touches that graph.
-    // Everything that returns before the app-plane dispatch below leaves the
-    // graph unevaluated for the next request; warm it in the background.
-    if (!servedByAppPlane(new URL(request.url).pathname, request.method)) {
-      prewarmAppPlane(ctx);
-    }
+    // On `executor.sh`, v2 answers marketing (including `/docs` and its
+    // telemetry proxies), sign-up, the fixed list of v2 paths and v2's
+    // connected-account callbacks; v1's legal pages stay on v1's marketing
+    // worker.
+    const v2 = v2EdgeResponse(request, env);
+    if (v2) return v2;
 
     const marketingRequest = marketingProxyRequest(request);
     const marketing: Fetcher | undefined = env.MARKETING;
     if (marketingRequest && marketing) return marketing.fetch(marketingRequest);
+
+    // Only v1-owned requests may warm v1's application. A dynamic import still
+    // evaluates JavaScript on this isolate's thread under waitUntil; starting it
+    // for a forwarded page or stylesheet delays the otherwise independent response.
+    if (!servedByAppPlane(new URL(request.url).pathname, request.method)) {
+      prewarmAppPlane(ctx);
+    }
 
     // Same reasoning, same seam: `/docs` and the PostHog proxy forward to an
     // external origin and never touch the router, React, or the Effect app.
@@ -328,6 +332,8 @@ const cloudflareHandler = {
     // first — measured at p50 3.1s on a cold isolate, against p50 33ms for the
     // request's own work, on a Worker where 1,666 dispatches spread across
     // 1,608 isolates (so nearly every request is cold). Forward before Start.
+    // On `executor.sh` v2 answers `/docs` above, so this serves it on other
+    // hosts; v1's own PostHog proxy is served here on every host.
     const passthroughPath = new URL(request.url).pathname;
     const passthrough = passthroughResponse(request, passthroughPath);
     if (passthrough) return passthrough;
