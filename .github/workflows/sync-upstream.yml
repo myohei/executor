@@ -20,13 +20,16 @@ jobs:
     steps:
       # The default GITHUB_TOKEN cannot push commits that touch
       # .github/workflows/*, which upstream changes routinely include.
-      # SYNC_UPSTREAM_TOKEN must be a PAT with repo + workflow scopes.
-      - name: Verify token
+      # Pushes therefore go over SSH using the repo-scoped write deploy key
+      # stored in SYNC_UPSTREAM_DEPLOY_KEY; PR creation and auto-merge stay
+      # on GITHUB_TOKEN (merging is not subject to the workflow-file push
+      # restriction).
+      - name: Verify deploy key
         env:
-          SYNC_UPSTREAM_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+          SYNC_UPSTREAM_DEPLOY_KEY: ${{ secrets.SYNC_UPSTREAM_DEPLOY_KEY }}
         run: |
-          if [ -z "$SYNC_UPSTREAM_TOKEN" ]; then
-            echo "::error::SYNC_UPSTREAM_TOKEN is not set. Create a classic PAT with 'repo' and 'workflow' scopes and add it as the repository secret SYNC_UPSTREAM_TOKEN."
+          if [ -z "$SYNC_UPSTREAM_DEPLOY_KEY" ]; then
+            echo "::error::SYNC_UPSTREAM_DEPLOY_KEY is not set. Add the private key of the fork-sync deploy key as this repository secret."
             exit 1
           fi
 
@@ -35,12 +38,23 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+
+      - name: Set up SSH deploy key
+        env:
+          SYNC_UPSTREAM_DEPLOY_KEY: ${{ secrets.SYNC_UPSTREAM_DEPLOY_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SYNC_UPSTREAM_DEPLOY_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # Pin github.com's official ed25519 host key.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" > ~/.ssh/known_hosts
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config core.sshCommand "ssh -i $HOME/.ssh/deploy_key -o IdentitiesOnly=yes"
+          git remote set-url --push origin git@github.com:myohei/executor.git
 
       - name: Fetch upstream
         run: |
@@ -80,7 +94,7 @@ jobs:
         id: pr
         if: steps.check.outputs.count != '0'
         env:
-          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.merge.outputs.branch }}
           COUNT: ${{ steps.check.outputs.count }}
         run: |
@@ -122,5 +136,5 @@ jobs:
       - name: Enable auto-merge (clean merges only)
         if: steps.check.outputs.count != '0' && steps.merge.outcome == 'success'
         env:
-          GH_TOKEN: ${{ secrets.SYNC_UPSTREAM_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh pr merge --merge --auto --delete-branch "${{ steps.pr.outputs.url }}"
