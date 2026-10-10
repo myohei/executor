@@ -1,0 +1,23 @@
+name: Debug gh token PR perms
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== REST: create PR (clearer error) ==="
+          gh api -X POST repos/myohei/executor/pulls \
+            -f title="debug: token pr test" \
+            -f head="sync-upstream-20261009-0029" \
+            -f base="main" 2>&1 | head -20
+          echo "=== bot permission on repo ==="
+          gh api "repos/myohei/executor/collaborators/github-actions[bot]/permission" 2>&1 | head -5
