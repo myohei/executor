@@ -124,12 +124,18 @@ jobs:
             echo "$STAT"
             echo '```'
           } > body.md
-          PR_URL=$(gh pr create \
-            --base main \
-            --head "$BRANCH" \
-            --title "$TITLE" \
-            --body-file body.md)
+          # REST, not `gh pr create`: the GraphQL createPullRequest mutation
+          # is denied for GITHUB_TOKEN even when the repository allows Actions
+          # to create pull requests; the REST endpoint is not.
+          PR_JSON=$(jq -n \
+            --arg title "$TITLE" \
+            --arg body "$(cat body.md)" \
+            --arg head "$BRANCH" \
+            '{title: $title, head: $head, base: "main", body: $body}' \
+            | gh api -X POST repos/myohei/executor/pulls --input -)
+          PR_URL=$(echo "$PR_JSON" | jq -r '.html_url')
           echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
+          echo "number=$(echo "$PR_JSON" | jq -r '.number')" >> "$GITHUB_OUTPUT"
 
       # Merge commits (not squash) keep upstream/main in the ancestry so the
       # next sync's main..upstream/main stays incremental.
@@ -137,4 +143,16 @@ jobs:
         if: steps.check.outputs.count != '0' && steps.merge.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr merge --merge --auto --delete-branch "${{ steps.pr.outputs.url }}"
+        run: gh api -X PUT "repos/myohei/executor/pulls/${{ steps.pr.outputs.number }}/auto-merge" -f merge_method='merge'
+
+      - name: Clean up stale sync branches
+        if: always() && steps.check.outputs.count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for ref in $(git ls-remote --heads origin "refs/heads/sync-upstream-*" | awk '{print $2}'); do
+            branch="${ref#refs/heads/}"
+            if [ "$branch" != "${{ steps.merge.outputs.branch }}" ]; then
+              git push origin --delete "$branch" || true
+            fi
+          done
