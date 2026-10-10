@@ -137,13 +137,24 @@ jobs:
           echo "url=$PR_URL" >> "$GITHUB_OUTPUT"
           echo "number=$(echo "$PR_JSON" | jq -r '.number')" >> "$GITHUB_OUTPUT"
 
-      # Merge commits (not squash) keep upstream/main in the ancestry so the
-      # next sync's main..upstream/main stays incremental.
-      - name: Enable auto-merge (clean merges only)
+      # Merge directly instead of enabling GitHub auto-merge: the auto-merge
+      # API requires branch protection on the base branch, which this fork
+      # does not use. The merged PR keeps the diff reviewable after the fact.
+      - name: Merge PR (clean merges only)
         if: steps.check.outputs.count != '0' && steps.merge.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh api -X PUT "repos/myohei/executor/pulls/${{ steps.pr.outputs.number }}/auto-merge" -f merge_method='merge'
+        run: |
+          # Retry: mergeability may not be computed yet right after creation.
+          ok=""
+          for i in 1 2 3; do
+            if gh api -X PUT "repos/myohei/executor/pulls/${{ steps.pr.outputs.number }}/merge" -f merge_method='merge'; then
+              ok="yes"
+              break
+            fi
+            sleep 15
+          done
+          [ -n "$ok" ] || exit 1
 
       - name: Clean up stale sync branches
         if: always() && steps.check.outputs.count != '0'
