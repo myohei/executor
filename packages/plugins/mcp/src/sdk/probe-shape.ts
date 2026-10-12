@@ -44,6 +44,7 @@
 
 import { Data, Duration, Effect, Layer, Option, Schema } from "effect";
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
+import { userAgentFor } from "./user-agent";
 
 /** MCP initialize request body used as the shape probe. Any real MCP
  *  server either answers it (unauth-OK server) or returns the spec-
@@ -277,7 +278,13 @@ export const probeMcpEndpointShape = (
   Effect.gen(function* () {
     const timeoutMs = options.timeoutMs ?? 8_000;
     const outcome = yield* Effect.gen(function* () {
-      const client = yield* HttpClient.HttpClient;
+      // Every probe request — including the RFC 9728 metadata fallback, which
+      // carries none of the configured headers — sends the User-Agent.
+      const client = (yield* HttpClient.HttpClient).pipe(
+        HttpClient.mapRequest(
+          HttpClientRequest.setHeader("user-agent", userAgentFor(options.headers ?? {})),
+        ),
+      );
 
       const readBody = (response: {
         readonly text: Effect.Effect<string, unknown>;
