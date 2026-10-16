@@ -175,6 +175,7 @@ const seedOrganization = (id: string) =>
 const stubAutumn = Layer.succeed(AutumnService)({
   use: () => Effect.die("feeders do not read billing"),
   ensureCustomer: () => Effect.void,
+  findCustomer: () => Effect.die("feeders do not read billing"),
   checkExecutionBalance: () => Effect.die("feeders do not check balances"),
   trackExecution: () => Effect.void,
   setMemberSeats: () => Effect.void,
@@ -673,6 +674,7 @@ describe("session handlers read membership from the mirror", () => {
   const deletingAutumn = Layer.succeed(AutumnService)({
     use: () => Effect.succeed({} as never),
     ensureCustomer: () => Effect.void,
+    findCustomer: () => Effect.die("feeders do not read billing"),
     checkExecutionBalance: () => Effect.die("deletion does not check balances"),
     trackExecution: () => Effect.void,
     setMemberSeats: () => Effect.void,
@@ -866,6 +868,7 @@ describe("session handlers read membership from the mirror", () => {
           return Effect.fail(failure);
         }),
       ensureCustomer: () => Effect.void,
+      findCustomer: () => Effect.die("feeders do not read billing"),
       checkExecutionBalance: () => Effect.die("deletion does not check balances"),
       trackExecution: () => Effect.void,
       setMemberSeats: () => Effect.void,
@@ -1234,6 +1237,7 @@ describe("account service writes through to the mirror", () => {
           subscriptions: [{ planId: "team", status: "active" }],
         } as never),
       ensureCustomer: () => Effect.void,
+      findCustomer: () => Effect.die("feeders do not read billing"),
       checkExecutionBalance: () => Effect.die("invite does not check balances"),
       trackExecution: () => Effect.void,
       setMemberSeats: () => Effect.void,
@@ -1314,6 +1318,7 @@ describe("account service writes through to the mirror", () => {
       const freeAutumn = Layer.succeed(AutumnService)({
         use: () => Effect.succeed({ subscriptions: [] } as never),
         ensureCustomer: () => Effect.void,
+        findCustomer: () => Effect.die("feeders do not read billing"),
         checkExecutionBalance: () => Effect.die("invite does not check balances"),
         trackExecution: () => Effect.void,
         setMemberSeats: () => Effect.void,
@@ -1541,6 +1546,7 @@ describe("seat reporter", () => {
       const recording = Layer.succeed(AutumnService)({
         use: () => Effect.die("the seat reporter sets seats, it does not read"),
         ensureCustomer: () => Effect.void,
+        findCustomer: () => Effect.die("feeders do not read billing"),
         checkExecutionBalance: () => Effect.die("the seat reporter does not check balances"),
         trackExecution: () => Effect.void,
         setMemberSeats: (organizationId, seats) =>
