@@ -34,6 +34,13 @@ export const organizationsAtom = Atom.refreshOnWindowFocus(
   }),
 );
 
+// Whether the selected org can move to Executor v2, and where. Eligibility
+// reads WorkOS and Autumn, so it is fetched once per dashboard load and kept.
+export const v2ImportAtom = CloudApiClient.query("cloudAuth", "v2Import", {
+  timeToLive: "5 minutes",
+  reactivityKeys: [ReactivityKey.auth],
+});
+
 export const createOrganization = CloudApiClient.mutation("cloudAuth", "createOrganization");
 
 export const deleteOrganization = CloudApiClient.mutation("cloudAuth", "deleteOrganization");

@@ -139,6 +139,7 @@
     "agents@0.17.3": "patches/agents@0.17.3.patch",
     "libsql@0.5.29": "patches/libsql@0.5.29.patch",
     "@electric-sql/pglite-socket@0.1.4": "patches/@electric-sql%2Fpglite-socket@0.1.4.patch",
-    "@modelcontextprotocol/client@2.0.0": "patches/@modelcontextprotocol%2Fclient@2.0.0.patch"
+    "@modelcontextprotocol/client@2.0.0": "patches/@modelcontextprotocol%2Fclient@2.0.0.patch",
+    "@executor-js/emulate@0.14.3-mfa.0": "patches/@executor-js%2Femulate@0.14.3-mfa.0.patch"
   }
 }
