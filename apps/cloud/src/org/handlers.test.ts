@@ -227,6 +227,7 @@ const stubDb = Layer.succeed(DbService)({ db: {} as never });
 const stubAutumn = Layer.succeed(AutumnService)({
   use: unread("the delete does not consult billing"),
   ensureCustomer: unread("the delete does not provision billing"),
+  findCustomer: unread("the delete does not read billing"),
   checkExecutionBalance: unread("the delete does not check balances"),
   trackExecution: unread("the delete does not track usage"),
   setMemberSeats: unread("the delete does not count seats"),
