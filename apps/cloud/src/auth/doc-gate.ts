@@ -36,15 +36,19 @@ import {
   type AuthHint,
 } from "@executor-js/react/multiplayer/auth-hint";
 
+import { env } from "cloudflare:workers";
+
 import { isAppOwnedPath } from "../app-paths";
 import { makeDbLayer } from "../db/db";
+import { v2AppOrigin } from "../edge/marketing";
+import { movedDashboardLocation } from "../org/move-to-v2";
 import { makeUserStoreLayer, UserStoreService } from "./context";
 import { parseCookie } from "./cookies";
 import { LAST_ORG_COOKIE } from "./last-org-cookie";
 import { makeMemberDirectoryLayer } from "./member-directory";
 import { makeWorkOsMirrorLayer } from "./workos-mirror";
 import { sealedSessionDisplayName } from "./middleware";
-import { authorizeOrganizationSelector } from "./organization";
+import { authorizeOrganization, authorizeOrganizationSelector } from "./organization";
 import { loginPath, safeReturnTo } from "./return-to";
 import { ONBOARDING_PATHS, PUBLIC_PATHS } from "./route-paths";
 import { WorkOSClient } from "./workos";
@@ -191,6 +195,55 @@ const authorizeLastOrgSlug = async (
   return Exit.isSuccess(exit) ? exit.value : null;
 };
 
+// ── Moved to v2 ──────────────────────────────────────────────────────────────
+
+/**
+ * Where to send this page load when the organization it opens has moved to
+ * v2, or `null` to serve the v1 dashboard (see `movedDashboardLocation`). The
+ * organization is the one the URL names (`/<slug>/…`), or for a bare path the
+ * session's own, the one the client canonicalizes onto. With
+ * `V2_SESSION_HANDOFF_SECRET` set, the location is v2's session handoff, which
+ * signs the member in to v2 as the user its import mapped. A failed read serves
+ * the dashboard: this is navigation only, and every write the dashboard could
+ * make is refused server-side while the organization is moving or moved.
+ */
+const movedToV2Location = async (
+  session: VerifiedSession,
+  firstSegment: string,
+): Promise<string | null> => {
+  const v2Origin = v2AppOrigin(env);
+  if (v2Origin === null) return null;
+  const target = isValidOrgSlug(firstSegment)
+    ? { slug: firstSegment }
+    : session.organizationId
+      ? { organizationId: session.organizationId }
+      : null;
+  if (target === null) return null;
+  const exit = await getRuntime().runPromiseExit(
+    movedDashboardLocation({
+      target,
+      v2Origin,
+      // Only once the session has verified: the token vouches for its user.
+      handoff: env.V2_SESSION_HANDOFF_SECRET
+        ? { secret: env.V2_SESSION_HANDOFF_SECRET, user: session.userId }
+        : undefined,
+      isMember: (organizationId) =>
+        authorizeOrganization(session.userId, organizationId).pipe(
+          Effect.map((org) => org !== null),
+        ),
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          makeUserStoreLayer(),
+          makeMemberDirectoryLayer(),
+          makeWorkOsMirrorLayer(),
+        ).pipe(Layer.provideMerge(makeDbLayer())),
+      ),
+    ),
+  );
+  return Exit.isSuccess(exit) ? exit.value : null;
+};
+
 const hintSetCookie = (hint: AuthHint) =>
   `${AUTH_HINT_COOKIE}=${encodeAuthHint(hint)}; ${HINT_COOKIE_ATTRIBUTES}; Max-Age=${AUTH_HINT_MAX_AGE_SECONDS}`;
 
@@ -292,6 +345,12 @@ export const authGateMiddleware = createMiddleware({ type: "request" }).server(
           });
         }
       }
+    }
+
+    // An organization that has moved to v2 is opened there instead.
+    if (!ONBOARDING_PATHS.has(pathname)) {
+      const movedTo = await movedToV2Location(session, firstSegment);
+      if (movedTo) return redirect(movedTo, { refreshedSession: session.refreshedSession });
     }
 
     // Serve the shell, minting the auth-hint cookie when the browser lacks a
