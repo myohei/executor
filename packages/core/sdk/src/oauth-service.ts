@@ -236,6 +236,9 @@ export interface OAuthServiceDeps {
    *  (`ExecutorConfig.orgWrites`): refuses `owner: "org"` targets on the
    *  user-intent client/connect surfaces. */
   readonly guardOrgWrite: (owner: Owner) => Effect.Effect<void, OrgWriteDeniedError>;
+  /** The host's workspace-wide write gate (`ExecutorConfig.workspaceWriteGate`),
+   *  checked where a flow would spend something before `guardOrgWrite` runs. */
+  readonly workspaceWriteGate?: Effect.Effect<void, OrgWriteDeniedError>;
   readonly defaultWritableProvider: () => CredentialProvider | null;
   /** Write the connection row with OAuth lifecycle fields + produce its tools. */
   readonly mintOAuthConnection: (
@@ -2161,6 +2164,9 @@ export const makeOAuthService = (deps: OAuthServiceDeps): OAuthService => {
     OAuthCompleteError | OAuthSessionNotFoundError | OrgWriteDeniedError | StorageFailure
   > =>
     Effect.gen(function* () {
+      // A frozen workspace refuses before the authorization code is exchanged:
+      // `mintFromToken` checks too, but only after the code is spent.
+      if (deps.workspaceWriteGate) yield* deps.workspaceWriteGate;
       const sessionRow = yield* deps.fuma.use("oauth_session.findFirst", (db) =>
         looseDb(db).findFirst("oauth_session", {
           where: (b: any) => b("state", "=", String(input.state)),
