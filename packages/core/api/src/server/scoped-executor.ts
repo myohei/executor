@@ -119,6 +119,14 @@ export interface HostConfigShape {
    */
   readonly enterpriseManagedRollout?: ExecutorConfig["enterpriseManagedRollout"];
   /**
+   * Forwarded to `ExecutorConfig.workspaceWriteGate`: the host's veto over
+   * every user-intent write and OAuth token refresh in a workspace (cloud
+   * freezes an organization while it moves). Declared here — not per-request —
+   * because the gate itself reads live per-workspace state on every call, so
+   * one function serves both request planes. Omitted -> always writable.
+   */
+  readonly workspaceWriteGate?: ExecutorConfig["workspaceWriteGate"];
+  /**
    * Forwarded verbatim to `ExecutorConfig.toolsSyncTtlMs`: how long a
    * connection's persisted remote tool catalog stays fresh. Omit to take the
    * SDK default (15 minutes); `null` disables time-based re-sync. Declared
@@ -341,6 +349,9 @@ export const makeScopedExecutor = <
       oauthCallbackStateOrgSlug: orgSlug,
       firstPartyOAuthClients: config.firstPartyOAuthClients,
       enterpriseManagedRollout: config.enterpriseManagedRollout,
+      ...(config.workspaceWriteGate === undefined
+        ? {}
+        : { workspaceWriteGate: config.workspaceWriteGate }),
       coreTools: {
         webBaseUrl,
         orgSlug,

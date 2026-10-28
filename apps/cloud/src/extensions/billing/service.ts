@@ -4,7 +4,7 @@
 
 import { env } from "cloudflare:workers";
 import { Autumn } from "autumn-js";
-import { Context, Data, Effect, Layer } from "effect";
+import { Context, Data, Effect, Layer, Option, Schema } from "effect";
 
 import { captureCauseEffect } from "../../observability";
 
@@ -70,6 +70,27 @@ export const autumnStatusOf = (failure: AutumnFailure): number | undefined => {
 };
 
 // ---------------------------------------------------------------------------
+// Read-only customer lookup
+// ---------------------------------------------------------------------------
+
+/** Autumn's API host, the autumn-js SDK's default server. */
+const AUTUMN_DEFAULT_URL = "https://api.useautumn.com";
+/** The API version autumn-js 1.2.8 sends, so this read sees the same shapes
+ *  as the SDK's calls. */
+const AUTUMN_API_VERSION = "2.2.0";
+
+/** One of an Autumn customer's subscriptions, as plan id and status. */
+export type AutumnSubscription = { readonly planId: string; readonly status: string };
+
+/** The fields of a `customers.get` answer the app reads; the rest is ignored. */
+const CustomerBody = Schema.Struct({
+  subscriptions: Schema.Array(Schema.Struct({ plan_id: Schema.String, status: Schema.String })),
+});
+const decodeCustomerBody = Schema.decodeUnknownOption(CustomerBody);
+/** Autumn's error body; only its code is read. */
+const decodeErrorBody = Schema.decodeUnknownOption(Schema.Struct({ code: Schema.String }));
+
+// ---------------------------------------------------------------------------
 // Service interface
 // ---------------------------------------------------------------------------
 
@@ -80,6 +101,18 @@ export type IAutumnService = Readonly<{
    * never seen it. Idempotent — safe to call on every org creation.
    */
   ensureCustomer: (organizationId: string) => Effect.Effect<void, AutumnFailure, never>;
+  /**
+   * Read the organization's Autumn customer without creating it: its
+   * subscriptions, or `null` when Autumn has no customer with this id. Any
+   * other answer, including a 404 that is not `customer_not_found`, fails.
+   */
+  findCustomer: (
+    organizationId: string,
+  ) => Effect.Effect<
+    { readonly subscriptions: ReadonlyArray<AutumnSubscription> } | null,
+    AutumnError,
+    never
+  >;
   checkExecutionBalance: (
     organizationId: string,
   ) => Effect.Effect<{ readonly allowed: boolean }, AutumnFailure, never>;
@@ -116,6 +149,7 @@ const make = Effect.sync(() => {
     return {
       use: () => notConfigured,
       ensureCustomer: () => notConfigured,
+      findCustomer: () => notConfigured,
       checkExecutionBalance: () => notConfigured,
       trackExecution: () => Effect.void,
       setMemberSeats: () => Effect.void,
@@ -144,6 +178,61 @@ const make = Effect.sync(() => {
 
   const ensureCustomer = (organizationId: string) =>
     Effect.asVoid(use((c) => c.customers.getOrCreate({ customerId: organizationId })));
+
+  // autumn-js 1.2.8 has no read-only customer call, so `customers.get` goes
+  // over HTTP with the SDK's secret, server and API version.
+  const customersGetUrl = `${(env.AUTUMN_API_URL || AUTUMN_DEFAULT_URL).replace(/\/+$/, "")}/v1/customers.get`;
+
+  const findCustomer = (organizationId: string) =>
+    Effect.gen(function* () {
+      yield* Effect.annotateCurrentSpan({ "autumn.customer.id": organizationId });
+      const failed = (message: string, cause?: unknown) => new AutumnError({ message, cause });
+      const response = yield* Effect.tryPromise({
+        try: (signal) =>
+          fetch(customersGetUrl, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${secretKey}`,
+              accept: "application/json",
+              "content-type": "application/json",
+              "x-api-version": AUTUMN_API_VERSION,
+            },
+            body: JSON.stringify({ customer_id: organizationId }),
+            signal,
+          }),
+        catch: (cause) => failed("Autumn customer lookup failed", cause),
+      });
+      yield* Effect.annotateCurrentSpan({ "http.response.status_code": response.status });
+      if (response.status !== 200 && response.status !== 404) {
+        return yield* failed(`Autumn customer lookup answered ${response.status}`, {
+          statusCode: response.status,
+        });
+      }
+      const body = yield* Effect.tryPromise({
+        try: (): Promise<unknown> => response.json(),
+        catch: (cause) => failed("Autumn customer lookup returned invalid JSON", cause),
+      });
+      if (response.status === 404) {
+        // Only Autumn's own code means "no customer"; any other 404, such as
+        // an unknown route, is a failure.
+        const missing = Option.exists(
+          decodeErrorBody(body),
+          (error) => error.code === CUSTOMER_NOT_FOUND_CODE,
+        );
+        if (missing) return null;
+        return yield* failed("Autumn customer lookup answered 404", { statusCode: 404 });
+      }
+      const customer = decodeCustomerBody(body);
+      if (Option.isNone(customer)) {
+        return yield* failed("Autumn customer lookup returned an unexpected body");
+      }
+      return {
+        subscriptions: customer.value.subscriptions.map((subscription) => ({
+          planId: subscription.plan_id,
+          status: subscription.status,
+        })),
+      };
+    }).pipe(Effect.withSpan("autumn.findCustomer"));
 
   /**
    * Run `operation`; if Autumn answers "no such customer", provision the
@@ -239,6 +328,7 @@ const make = Effect.sync(() => {
   return {
     use,
     ensureCustomer,
+    findCustomer,
     checkExecutionBalance,
     trackExecution,
     setMemberSeats,
