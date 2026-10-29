@@ -73,6 +73,14 @@ export interface OAuthTestServerOptions {
    *  back, so a client that re-sends its recorded grant is refused (issue
    *  #1969). Omit to accept any `scope`, the default. */
   readonly refreshGrantScopes?: readonly string[];
+  /** Refuse an authorize request for a scope outside the ones a dynamically
+   *  registered client registered for, answering `invalid_scope` the way
+   *  Mercury does. Omit to authorize any scope, the default. */
+  readonly enforceRegisteredScopes?: boolean;
+  /** Register a dynamically registered client only for the requested scopes
+   *  in this list, answering the narrowed set as the registration's `scope`
+   *  (RFC 7591 §3.2.1). Omit to register every requested scope, the default. */
+  readonly registrableScopes?: readonly string[];
   readonly invalidRefreshTokenDescription?: string;
   /** RFC 6749 error code returned when a refresh-token grant is rejected.
    *  Defaults to `invalid_grant`; set to e.g. `invalid_request` to mirror
@@ -191,6 +199,8 @@ interface ClientRecord {
   readonly clientSecret: string | null;
   readonly redirectUris: ReadonlySet<string>;
   readonly tokenEndpointAuthMethod: string;
+  /** Scopes a dynamically registered client registered for. */
+  readonly registeredScopes?: ReadonlySet<string>;
 }
 
 interface AuthorizationTransaction {
@@ -707,10 +717,19 @@ export const serveOAuthTestServer = (
               "The provided redirect URIs are not approved for use by this authorization server.",
             );
           }
+          const requestedScope = typeof json.scope === "string" ? json.scope : scopes.join(" ");
+          const registeredScope =
+            options.registrableScopes === undefined
+              ? requestedScope
+              : requestedScope
+                  .split(/\s+/)
+                  .filter((scope) => options.registrableScopes!.includes(scope))
+                  .join(" ");
           clients.set(clientId, {
             clientSecret,
             redirectUris,
             tokenEndpointAuthMethod: requestedMethod,
+            registeredScopes: new Set(registeredScope.split(/\s+/).filter(Boolean)),
           });
           return jsonResponse(
             201,
@@ -722,7 +741,7 @@ export const serveOAuthTestServer = (
               redirect_uris: [...redirectUris],
               grant_types: arrayOfStrings(json.grant_types),
               response_types: arrayOfStrings(json.response_types),
-              scope: typeof json.scope === "string" ? json.scope : scopes.join(" "),
+              scope: registeredScope,
             },
             { "cache-control": "no-store" },
           );
@@ -740,6 +759,19 @@ export const serveOAuthTestServer = (
           const client = clients.get(clientId);
           if (client && client.redirectUris.size > 0 && !client.redirectUris.has(redirectUri)) {
             return oauthError(400, "invalid_request", "redirect_uri is not registered");
+          }
+          const registeredScopes = client?.registeredScopes;
+          if (options.enforceRegisteredScopes && registeredScopes) {
+            const unregistered = (requestUrl.searchParams.get("scope") ?? "")
+              .split(/\s+/)
+              .filter((scope) => scope.length > 0 && !registeredScopes.has(scope));
+            if (unregistered.length > 0) {
+              return oauthError(
+                400,
+                "invalid_scope",
+                `The OAuth 2.0 Client is not allowed to request scope '${unregistered[0]}'.`,
+              );
+            }
           }
           if (!client) {
             clients.set(clientId, {

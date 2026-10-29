@@ -1,4 +1,8 @@
-const DEFAULT_E2E_MCP_SESSION_TIMEOUT_MS = 3_000;
+// Expiry coverage waits on this, so it stays far below production's five
+// minutes. Its floor is the cap-eviction scenario: it opens sessions one at a
+// time and needs cap + 1 of them resident at once, so that many opens must
+// finish inside this window (see resident-runtime-cap.ts).
+const DEFAULT_E2E_MCP_SESSION_TIMEOUT_MS = 8_000;
 // Keep expiry coverage fast while leaving enough room for a cold browser route
 // to compile under CI contention. Production allows nine minutes.
 const DEFAULT_E2E_MCP_PAUSED_SESSION_IDLE_TIMEOUT_MS = 30_000;

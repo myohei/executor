@@ -111,6 +111,15 @@ scenario(
     const target = yield* Target;
     const identity = yield* target.newIdentity();
     yield* Effect.promise(async () => {
+      // ADMIN_MFA_RATE_LIMITER allows 5 per 60s, and the local limiter counts
+      // in clock-aligned 60s windows that reset at each boundary. A burst that
+      // straddles one is split across two windows and never reaches the limit,
+      // so start it with most of a window ahead.
+      const windowMs = 60_000;
+      const remainingMs = windowMs - (Date.now() % windowMs);
+      if (remainingMs < 10_000) {
+        await new Promise((resolve) => setTimeout(resolve, remainingMs + 250));
+      }
       const statuses: number[] = [];
       for (let attempt = 0; attempt < 6; attempt++) {
         const response = await fetch(new URL("/api/auth/admin-mfa/start", target.baseUrl), {
