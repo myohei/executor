@@ -18,4 +18,12 @@
 // expect), that is not a correctness bug — eviction is designed to be
 // transparent, restoring on the next call — but it means this constant needs
 // to grow: raise it here, never by special-casing a scenario against it.
+//
+// The idle timeout bounds it from the other side. The scenario opens sessions
+// one at a time while each one idles out MCP_SESSION_TIMEOUT_MS after it opened,
+// so cap + 1 opens must finish inside that window or residency never reaches
+// the cap. An open costs about 80-125ms on a CI runner, and more on slower
+// machines: 25 opens took the whole of the old 3s window, and the scenario
+// failed whenever they ran over. Growing this constant means growing that
+// timeout too (mcp-session-timeouts.ts and the cloud shard env in ci.yml).
 export const E2E_MCP_RESIDENT_RUNTIME_SOFT_CAP = 24;
