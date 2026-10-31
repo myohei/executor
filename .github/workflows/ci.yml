@@ -310,7 +310,9 @@ jobs:
       - name: Run cloud shard
         if: matrix.target == 'cloud'
         env:
-          MCP_SESSION_TIMEOUT_MS: "3000"
+          # Long enough for the cap-eviction scenario to hold more sessions
+          # resident than the e2e cap (see e2e/setup/resident-runtime-cap.ts).
+          MCP_SESSION_TIMEOUT_MS: "8000"
           # Still 18x shorter than production, but long enough for a cold Vite
           # resume route to compile under a fully loaded CI runner.
           MCP_PAUSED_SESSION_IDLE_TIMEOUT_MS: "30000"
