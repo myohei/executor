@@ -18,6 +18,7 @@ import {
   OAuthSessionNotFoundError,
   OAuthStartError,
   OAuthState,
+  isUserActionableError,
   type Connection,
   type ConnectResult,
 } from "@executor-js/sdk";
@@ -57,7 +58,8 @@ const startResultToResponse = (result: ConnectResult) =>
         state: result.state,
       };
 
-const toPopupErrorMessage = (error: unknown): PopupErrorMessage => {
+/** What the OAuth popup shows for a failed callback. Exported for its test. */
+export const toPopupErrorMessage = (error: unknown): PopupErrorMessage => {
   const completeError = decodeOAuthCompleteError(error);
   if (Option.isSome(completeError))
     return {
@@ -85,6 +87,11 @@ const toPopupErrorMessage = (error: unknown): PopupErrorMessage => {
       short: "OAuth session expired or not found",
       details: `State: ${sessionNotFound.value.state}`,
     };
+
+  // A refusal the user can act on (connecting needs a workspace admin, or the
+  // host has paused changes to the workspace) says why.
+  if (isUserActionableError(error))
+    return { short: "Could not complete authentication", details: error.userMessage };
 
   return { short: "Authentication failed" };
 };
