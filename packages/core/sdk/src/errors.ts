@@ -154,11 +154,18 @@ export class IntegrationRemovalNotAllowedError extends Schema.TaggedErrorClass<I
  *  with `orgWrites: "denied"` — a member who may USE workspace resources but
  *  not configure them. Reads, tool execution, and operational writes (token
  *  refresh, catalog re-sync) are unaffected; only the user-intent settings
- *  surfaces raise this. */
+ *  surfaces raise this.
+ *
+ *  Also raised, with a `reason`, when the host's `workspaceWriteGate` refuses
+ *  every user-intent write in the workspace (see `ExecutorConfig`). */
 export class OrgWriteDeniedError
   extends Schema.TaggedErrorClass<OrgWriteDeniedError>()(
     "OrgWriteDeniedError",
-    {},
+    {
+      /** The host's message when it refused writes for the whole workspace,
+       *  shown instead of the admin-role message. */
+      reason: Schema.optional(Schema.String),
+    },
     { httpApiStatus: 403 },
   )
   implements UserActionableError
@@ -167,7 +174,9 @@ export class OrgWriteDeniedError
   readonly code = "org_write_denied";
 
   override get message(): string {
-    return "Adding connections or changing workspace settings requires a workspace admin.";
+    return (
+      this.reason ?? "Adding connections or changing workspace settings requires a workspace admin."
+    );
   }
 
   get userMessage(): string {
