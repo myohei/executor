@@ -11,6 +11,8 @@ import {
 } from "@executor-js/api/server";
 
 import { ApiKeyService } from "../auth/api-keys";
+import { ORG_SELECTOR_HEADER, authorizeOrganizationSelector } from "../auth/organization";
+import { frozenWriteResponse } from "../org/move-to-v2";
 import { UserStoreService } from "../auth/context";
 import { WorkOsMirror } from "../auth/workos-mirror";
 import { sessionFromSealed, type Session } from "../auth/middleware";
@@ -76,6 +78,24 @@ const AccountProviderMiddleware = HttpRouter.middleware<{
         // The account API never re-sets the cookie, so the fallback sealed
         // session is `""` (vs `SessionAuthLive`, which keeps the inbound cookie).
         const session: Session | null = resolved ? sessionFromSealed(resolved, "") : null;
+
+        // The account plane's freeze (see `../org/move-to-v2`): every
+        // non-GET `/account/*` route changes the organization the selector
+        // names (its API keys, members, roles, name), so one check here covers
+        // them all. Only a write by a member of the selected organization is
+        // checked; anything else is refused by the service as before.
+        if (resolved && request.method !== "GET" && request.method !== "HEAD") {
+          const selector = request.headers[ORG_SELECTOR_HEADER];
+          const org = selector
+            ? yield* authorizeOrganizationSelector(resolved.userId, selector).pipe(
+                Effect.orElseSucceed(() => null),
+              )
+            : null;
+          if (org) {
+            const refused = yield* frozenWriteResponse(org.id);
+            if (refused) return refused;
+          }
+        }
 
         const proof = resolved
           ? yield* readAdminMfaProof(

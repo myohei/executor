@@ -168,6 +168,7 @@ type HarnessSession = {
     requestIds: ReadonlyArray<string | number>,
   ) => Promise<void>;
   dbHandle: { readonly end: () => void } | null;
+  destroy: () => Promise<void>;
   engine: ExecutionEngine<Cause.YieldableError> | null;
   getConnections?: () => Iterable<unknown>;
   getSessionId: () => string;
@@ -667,6 +668,46 @@ describe("McpAgentSessionDOBase transport restore", () => {
         defaultMcpResource,
       ),
     ).resolves.toBe("ok");
+  });
+
+  it("answers not_found, without restoring, for a request that lands after destroy wiped storage", async () => {
+    const session = await makeHarnessSession();
+    let restores = 0;
+    session.runMcpAgentOnStart = async () => {
+      restores += 1;
+      session.initialized = true;
+    };
+    // Pause the SDK's teardown right after its storage wipe: the condemned
+    // marker and the stored meta are gone, the isolate abort has not run yet,
+    // and requests still reach this instance.
+    const sdk = Object.getPrototypeOf(McpAgentSessionDOBase.prototype) as {
+      destroy: (this: HarnessSession) => Promise<void>;
+    };
+    const sdkDestroy = sdk.destroy;
+    const wiped = makeDeferred();
+    const finishTeardown = makeDeferred();
+    sdk.destroy = async function () {
+      await this.ctx.storage.deleteAll();
+      wiped.resolve();
+      await finishTeardown.promise;
+    };
+    try {
+      const destroying = session.destroy();
+      await wiped.promise;
+
+      await expect(
+        session.validateMcpSessionOwner(
+          { accountId: "user-1", organizationId: "org-1" },
+          defaultMcpResource,
+        ),
+      ).resolves.toBe("not_found");
+      expect(restores).toBe(0);
+
+      finishTeardown.resolve();
+      await destroying;
+    } finally {
+      sdk.destroy = sdkDestroy;
+    }
   });
 
   it("rejects the same owner on a different MCP resource", async () => {
