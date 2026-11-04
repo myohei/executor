@@ -6,6 +6,8 @@ import { trackEvent } from "@executor-js/react/api/analytics";
 import { AUTH_PATHS } from "../auth/api";
 import { OrgMenuSlot } from "./components/org-menu-slot";
 import { SupportSlot } from "./components/support-slot";
+import { V2ImportLink } from "./components/v2-import-link";
+import { V2MovedNotice } from "./components/v2-moved-notice";
 
 // ---------------------------------------------------------------------------
 // Cloud shell — the SHARED multiplayer shell, identical to self-host, with
@@ -13,7 +15,10 @@ import { SupportSlot } from "./components/support-slot";
 //   - sign-out          navigate through cloud's WorkOS logout, land home
 //   - nav items         defaults + Organization + Billing (cloud-only sections)
 //   - org menu slot     multi-org switcher + create-org dialog (cloud-only)
-//   - support slot      the "Get support" dialog button (cloud-only)
+//   - support slot      the "Move to Executor v2" link, shown only to users
+//                       v2 would let import this org ("Open in Executor v2"
+//                       once it has moved, with the moved notice), and the
+//                       "Get support" dialog button (cloud-only)
 // API keys live in the main sidebar nav (via `defaultShellNavItems`); the
 // shared shell renders the account dropdown frame and sign-out, with
 // `orgMenuSlot` injected at the top of the dropdown.
@@ -52,7 +57,13 @@ export function Shell(props: { readonly content?: React.ReactNode }) {
       onSignOut={signOut}
       navItems={items}
       orgMenuSlot={<OrgMenuSlot />}
-      supportSlot={<SupportSlot />}
+      supportSlot={
+        <>
+          <V2ImportLink />
+          <V2MovedNotice />
+          <SupportSlot />
+        </>
+      }
       content={props.content}
     />
   );
