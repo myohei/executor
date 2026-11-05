@@ -1,12 +1,19 @@
-import { describe, expect, it } from "@effect/vitest";
+import { afterAll, describe, expect, it } from "@effect/vitest";
+import { routeConfigs } from "autumn-js/backend";
 import { Effect, Layer } from "effect";
+import { HttpRouter, HttpServer } from "effect/unstable/http";
 
-import { MemberDirectory } from "@executor-js/api/server";
+import { MemberDirectory, requestScopedMiddleware } from "@executor-js/api/server";
 
 import { UserStoreService } from "../../auth/context";
 import { WorkOSClient, type WorkOSClientService } from "../../auth/workos";
 import { WorkOsMirror, type WorkOsMirrorShape } from "../../auth/workos-mirror";
+import { DbService, makeDbLayer } from "../../db/db";
+import { organizations, orgMovedToV2 } from "../../db/schema";
+import { ORG_MOVING_CODE, ORG_MOVING_MESSAGE } from "../../org/move-to-v2";
 import {
+  AutumnRoutesLive,
+  BILLING_READ_PATHS,
   CHECKOUT_TAX_ID_PARAMS,
   resolveBillingOrganization,
   withCheckoutTaxIdCollection,
@@ -161,5 +168,130 @@ describe("billing checkout tax ID collection", () => {
   it("leaves other billing routes unchanged", () => {
     const body = { planId: "team" };
     expect(withCheckoutTaxIdCollection("/api/billing/previewAttach", body)).toBe(body);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Billing's freeze (see `../../org/move-to-v2`): while an organization moves
+// to v2, only the reads the billing pages make reach Autumn.
+// ---------------------------------------------------------------------------
+
+describe("billing freeze", () => {
+  it("serves only Autumn's read routes while an organization moves", () => {
+    const routes = routeConfigs.map((config) => `/api/billing/${config.route}`);
+    for (const path of BILLING_READ_PATHS) expect(routes).toContain(path);
+    // A route Autumn adds later is refused until it is listed as a read.
+    expect(
+      routes
+        .filter((path) => !BILLING_READ_PATHS.has(path))
+        .map((path) => path.slice("/api/billing/".length))
+        .sort(),
+    ).toEqual([
+      "attach",
+      "createReferralCode",
+      "multiAttach",
+      "openCustomerPortal",
+      "redeemReferralCode",
+      "setupPayment",
+      "updateSubscription",
+    ]);
+  });
+
+  // MEMBER belongs to every organization, as the mirror reports it.
+  const anyOrgDirectory = Layer.succeed(MemberDirectory)({
+    membership: (accountId, organizationId) =>
+      Effect.succeed(
+        accountId === MEMBER
+          ? {
+              accountId,
+              membershipId: `om_${organizationId}`,
+              organizationId,
+              email: null,
+              name: null,
+              avatarUrl: null,
+              role: "admin",
+              status: "active" as const,
+              lastActiveAt: null,
+            }
+          : null,
+      ),
+    membershipById: () => Effect.die("not read here"),
+    membershipsOf: () => Effect.die("not read here"),
+    members: () => Effect.die("not read here"),
+    membersById: () => Effect.die("not read here"),
+    findByEmail: () => Effect.die("not read here"),
+  });
+
+  const sessionWorkOS = Layer.succeed(
+    WorkOSClient,
+    new Proxy({} as WorkOSClientService, {
+      get: (_target, prop) =>
+        prop === "authenticateRequest"
+          ? () => Effect.succeed({ userId: MEMBER, email: "member@placeholder.test" })
+          : () => Effect.die(`unexpected WorkOSClient.${String(prop)} call`),
+    }),
+  );
+
+  const apps: { dispose: () => Promise<void> }[] = [];
+  afterAll(async () => {
+    await Promise.all(apps.map((app) => app.dispose()));
+  });
+
+  const post = async (organizationId: string, route: string) => {
+    const rsLive = Layer.mergeAll(makeDbLayer(), stubUsers, anyOrgDirectory, stubMirror);
+    const app = HttpRouter.toWebHandler(
+      AutumnRoutesLive.pipe(
+        Layer.provide(requestScopedMiddleware(rsLive).layer),
+        // The route reads WorkOS from the app's boot context, as in production.
+        Layer.provideMerge(sessionWorkOS),
+        Layer.provide(HttpServer.layerServices),
+      ),
+      { disableLogger: true },
+    );
+    apps.push(app);
+    const response = await app.handler(
+      new Request(`https://executor.test/api/billing/${route}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-executor-organization": organizationId,
+        },
+        body: JSON.stringify({ planId: "team" }),
+      }),
+      undefined as never,
+    );
+    return { status: response.status, body: (await response.json()) as { code?: string } };
+  };
+
+  const seedMovingOrg = () =>
+    Effect.runPromise(
+      Effect.gen(function* () {
+        const { db } = yield* DbService;
+        const id = `org_${crypto.randomUUID().replaceAll("-", "")}`;
+        yield* Effect.promise(() =>
+          db.insert(organizations).values({ id, name: "Synthetic Org", slug: id.slice(4, 20) }),
+        );
+        yield* Effect.promise(() => db.insert(orgMovedToV2).values({ orgId: id, state: "moving" }));
+        return id;
+      }).pipe(Effect.provide(makeDbLayer())),
+    );
+
+  it("refuses a plan change for a moving organization before calling Autumn", async () => {
+    const org = await seedMovingOrg();
+    for (const route of ["attach", "updateSubscription", "openCustomerPortal"]) {
+      expect(await post(org, route)).toEqual({
+        status: 423,
+        body: { error: ORG_MOVING_MESSAGE, code: ORG_MOVING_CODE },
+      });
+    }
+  });
+
+  it("still hands a moving organization's billing reads to Autumn", async () => {
+    const org = await seedMovingOrg();
+    // No Autumn key is configured here, so Autumn's own handler refuses the
+    // request: proof it got past the freeze.
+    expect(await post(org, "getOrCreateCustomer")).toMatchObject({
+      body: { code: "billing_request_failed" },
+    });
   });
 });

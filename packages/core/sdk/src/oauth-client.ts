@@ -282,6 +282,14 @@ export type CreateOAuthClientInput = OAuthClient & {
    *  reject an authorize request whose redirect_uri differs from the
    *  registration). Ignored for manual clients. */
   readonly originRedirectUri?: string | null;
+  /** The scopes a DCR registration sent as the client's `scope`. Persisted so
+   *  reuse can tell whether a registration covers a later request. Ignored for
+   *  manual clients. */
+  readonly originRequestedScopes?: readonly string[] | null;
+  /** The scopes the server registered the client for, from the registration
+   *  response; null when it did not say. Persisted so start never asks for a
+   *  scope outside them. Ignored for manual clients. */
+  readonly originScopes?: readonly string[] | null;
 };
 
 /** Metadata-only projection of a registered client for listing in the UI.

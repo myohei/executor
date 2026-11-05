@@ -303,6 +303,17 @@ export const parseV2Edge = (env: V2EdgeEnv): V2Edge | string | null => {
   return { service, signUpUrl: parsed, oauthStatePrefix, analyticsProxyPath, errorTunnelPath };
 };
 
+/**
+ * v2's app host, or `null` where v1 does not hand requests to v2 (local dev
+ * without the v2 settings, test workers, or broken settings). It is the origin
+ * of v2's sign-up page, the same host the edge sends v2 dashboard links to.
+ */
+export const v2AppOrigin = (env: V2EdgeEnv): URL | null => {
+  const edge = parseV2Edge(env);
+  if (edge === null || typeof edge === "string") return null;
+  return new URL(edge.signUpUrl.origin);
+};
+
 /** Whether a connected-account callback carries v2's state prefix. Reads the
  *  query only: a callback without `state` in its query stays with v1. */
 const isV2OAuthCallback = (url: URL, prefix: string): boolean =>
