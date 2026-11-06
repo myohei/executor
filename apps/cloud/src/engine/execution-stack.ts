@@ -49,6 +49,7 @@ import executorConfig from "../../executor.config";
 import { cloudEnterpriseManagedRollout } from "../analytics/ema-rollout";
 import { DbService } from "../db/db";
 import { cloudDbProviderLayer } from "../db/fuma";
+import { cloudWorkspaceWriteGate } from "../org/move-to-v2";
 import { firstPartyOAuthClientsFor } from "./first-party-oauth-clients";
 
 export { makeExecutionStack } from "@executor-js/api/server";
@@ -112,6 +113,10 @@ export const CloudHostConfig: Layer.Layer<HostConfig> = Layer.sync(HostConfig, (
   // gate; everywhere else the seam stays empty and the profile is attempted as
   // before. Gating happens at connect only — see the SDK contract.
   enterpriseManagedRollout: cloudEnterpriseManagedRollout(),
+  // An organization moving to (or moved to) Executor v2 is frozen: connection
+  // and OAuth writes and OAuth token refreshes are refused from every plane,
+  // read live on each guarded operation. See `../org/move-to-v2`.
+  workspaceWriteGate: cloudWorkspaceWriteGate,
 }));
 
 export const CloudCodeExecutorProvider: Layer.Layer<CodeExecutorProvider> = Layer.sync(

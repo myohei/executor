@@ -1,0 +1,96 @@
+diff --git a/dist/dist-AJUH5YLR.js b/dist/dist-AJUH5YLR.js
+index 0590e15752d2536b7d8e63f378c92ac7910a91be..de28354560fa4ef00122ef4407b667d9f84a16c6 100644
+--- a/dist/dist-AJUH5YLR.js
++++ b/dist/dist-AJUH5YLR.js
+@@ -234,6 +234,17 @@ function autumnApiRoutes(ctx) {
+     const customer = ensureCustomer(as(), id, data);
+     return c.json(serializeCustomer(as(), customer, { expand: parseExpand(body.expand) }));
+   });
++  app.post("/v1/customers.get", async (c) => {
++    const body = await c.req.json().catch(() => ({}));
++    const id = String(body.customer_id ?? body.customerId ?? "");
++    if (!id) return c.json({ message: "customer_id is required", code: "invalid_request" }, 400);
++    const store2 = as();
++    const customer = store2.customers.findOneBy("customer_id", id);
++    if (!customer) {
++      return c.json({ message: `Customer ${id} not found`, code: "customer_not_found" }, 404);
++    }
++    return c.json(serializeCustomer(store2, customer, { expand: parseExpand(body.expand) }));
++  });
+   app.post("/v1/customers.list", async (c) => {
+     const store2 = as();
+     const customers = store2.customers.all().map((customer) => serializeCustomer(store2, customer));
+@@ -1318,6 +1329,7 @@ var manifest = {
+           path: "/v1/customers.get_or_create",
+           status: "hand-authored"
+         },
++        { operationId: "customers.get", method: "POST", path: "/v1/customers.get", status: "hand-authored" },
+         { operationId: "customers.list", method: "POST", path: "/v1/customers.list", status: "hand-authored" },
+         { operationId: "customers.update", method: "POST", path: "/v1/customers.update", status: "hand-authored" },
+         { operationId: "balances.track", method: "POST", path: "/v1/balances.track", status: "hand-authored" },
+diff --git a/dist/dist-JYIVTHI5.js b/dist/dist-JYIVTHI5.js
+index 34e94fd406b65f83f30ea92b08e8ca7466b32838..7b7892bd71851575b23176c07722bdcbc66440ae 100644
+--- a/dist/dist-JYIVTHI5.js
++++ b/dist/dist-JYIVTHI5.js
+@@ -445,7 +445,7 @@ function serializeOrganization(org, domains = []) {
+     domains: domains.map(serializeOrganizationDomain),
+     stripe_customer_id: null,
+     external_id: org.external_id,
+-    metadata: {},
++    metadata: org.metadata ?? {},
+     created_at: org.created_at,
+     updated_at: org.updated_at
+   };
+@@ -881,6 +881,24 @@ function userManagementRoutes(ctx) {
+     return c.json(serializeApiKey(key, { includeValue: true }), 201);
+   });
+ }
++function mergeOrganizationMetadata(existing, update) {
++  if (update === null || typeof update !== "object" || Array.isArray(update)) {
++    return { ok: false, reason: "metadata must be an object" };
++  }
++  const entries = Object.entries(update);
++  if (entries.length === 0) return { ok: true, metadata: {} };
++  const merged = { ...existing };
++  for (const [key, value] of entries) {
++    if (value === null) {
++      delete merged[key];
++      continue;
++    }
++    if (typeof value !== "string") return { ok: false, reason: "metadata values must be strings" };
++    merged[key] = value;
++  }
++  if (Object.keys(merged).length > 10) return { ok: false, reason: "metadata has more than 10 keys" };
++  return { ok: true, metadata: merged };
++}
+ function organizationRoutes(ctx) {
+   const { app, store, baseUrl } = ctx;
+   const ws = () => getWorkosStore(store);
+@@ -888,10 +906,13 @@ function organizationRoutes(ctx) {
+     const body = await c.req.json().catch(() => ({}));
+     const name = String(body.name ?? "");
+     if (!name) return workosError(c, 422, "invalid_request", "name is required");
++    const metadata = body.metadata === void 0 ? { ok: true, metadata: {} } : mergeOrganizationMetadata({}, body.metadata);
++    if (!metadata.ok) return workosError(c, 422, "invalid_request", metadata.reason);
+     const organization = ws().organizations.insert({
+       workos_id: workosId("org"),
+       name,
+-      external_id: typeof body.external_id === "string" ? body.external_id : null
++      external_id: typeof body.external_id === "string" ? body.external_id : null,
++      metadata: metadata.metadata
+     });
+     return c.json(
+       serializeOrganization(organization, ws().organizationDomains.findBy("organization_id", organization.workos_id)),
+@@ -909,8 +930,11 @@ function organizationRoutes(ctx) {
+     const organization = ws().organizations.findOneBy("workos_id", c.req.param("id"));
+     if (!organization) return workosError(c, 404, "entity_not_found", "Organization not found.");
+     const body = await c.req.json().catch(() => ({}));
++    const metadata = body.metadata === void 0 ? { ok: true, metadata: organization.metadata ?? {} } : mergeOrganizationMetadata(organization.metadata ?? {}, body.metadata);
++    if (!metadata.ok) return workosError(c, 422, "invalid_request", metadata.reason);
+     const updated = ws().organizations.update(organization.id, {
+-      name: typeof body.name === "string" && body.name ? body.name : organization.name
++      name: typeof body.name === "string" && body.name ? body.name : organization.name,
++      metadata: metadata.metadata
+     });
+     return c.json(
+       serializeOrganization(updated, ws().organizationDomains.findBy("organization_id", updated.workos_id))
