@@ -9,11 +9,13 @@ import { UserStoreService } from "../auth/context";
 import { ORG_SELECTOR_HEADER } from "../auth/organization";
 import { WorkOSClient, type WorkOSClientService } from "../auth/workos";
 import { WorkOsMirror, type WorkOsMirrorShape } from "../auth/workos-mirror";
-import { DbService } from "../db/db";
+import { DbService, makeDbLayer } from "../db/db";
+import { organizations, orgMovedToV2 } from "../db/schema";
 import { AutumnService } from "../extensions/billing/service";
 import { OrgHttpApi, Forbidden } from "./api";
 import { OrgMemberRole, orgAuthMiddleware } from "./auth-middleware";
 import { OrgHandlers, assertDomainInSessionOrg, requireAdmin } from "./handlers";
+import { ORG_MOVED_CODE, ORG_MOVING_CODE, ORG_MOVING_MESSAGE } from "./move-to-v2";
 
 // ---------------------------------------------------------------------------
 // Domain-handler guards. The member / role / invite / org-name endpoints moved
@@ -158,10 +160,10 @@ const DOMAIN = "dom_1";
 const createdAt = new Date("2026-01-01T00:00:00.000Z");
 
 // The mirror's row for the caller, at whatever role a test sets.
-const callerRow = (role: "admin" | "member"): DirectoryMember => ({
+const callerRow = (role: "admin" | "member", org: string): DirectoryMember => ({
   accountId: CALLER,
-  membershipId: `om_${CALLER}_${ORG}`,
-  organizationId: ORG,
+  membershipId: `om_${CALLER}_${org}`,
+  organizationId: org,
   email: null,
   name: null,
   avatarUrl: null,
@@ -171,10 +173,10 @@ const callerRow = (role: "admin" | "member"): DirectoryMember => ({
 });
 
 const unread = (why: string) => () => Effect.die(why);
-const stubDirectory = (role: "admin" | "member") =>
+const stubDirectory = (role: "admin" | "member", org: string) =>
   Layer.succeed(MemberDirectory)({
     membership: (accountId, organizationId) =>
-      Effect.succeed(accountId === CALLER && organizationId === ORG ? callerRow(role) : null),
+      Effect.succeed(accountId === CALLER && organizationId === org ? callerRow(role, org) : null),
     membershipById: unread("the org plane does not look up by membership id"),
     membershipsOf: unread("the org plane reads one membership, not the list"),
     members: unread("the org plane does not list members"),
@@ -220,13 +222,13 @@ const stubMirror = Layer.succeed(
   }),
 );
 
-// The handlers never reach the database here: the directory and the store are
-// stubbed above, so the request-scoped `DbService` is a placeholder.
-const stubDb = Layer.succeed(DbService)({ db: {} as never });
+// The directory and the store are stubbed above; the one database read is the
+// organization's move-to-v2 state (`./move-to-v2`), against the test database.
 
 const stubAutumn = Layer.succeed(AutumnService)({
   use: unread("the delete does not consult billing"),
   ensureCustomer: unread("the delete does not provision billing"),
+  findCustomer: unread("the delete does not read billing"),
   checkExecutionBalance: unread("the delete does not check balances"),
   trackExecution: unread("the delete does not track usage"),
   setMemberSeats: unread("the delete does not count seats"),
@@ -235,25 +237,25 @@ const stubAutumn = Layer.succeed(AutumnService)({
 // WorkOS as the org plane sees it: session authentication and the domain to
 // delete. `stubWorkOS` dies on anything else, so a `listUserMemberships` call
 // would fail the test — membership is never re-checked against WorkOS.
-const workosForCaller = (deleted: string[]) =>
+const workosForCaller = (deleted: string[], org: string) =>
   stubWorkOS({
     authenticateSealedSession: () =>
       Effect.succeed({
         userId: CALLER,
         sessionId: "test-settings-session",
         email: "caller@placeholder.test",
-        organizationId: ORG,
+        organizationId: org,
       }),
     getOrganizationDomain: () =>
-      Effect.succeed({ id: DOMAIN, organizationId: ORG, domain: "acme.test" }),
+      Effect.succeed({ id: DOMAIN, organizationId: org, domain: "acme.test" }),
     deleteOrganizationDomain: (domainId: string) =>
       Effect.sync(() => {
         deleted.push(domainId);
       }),
   });
 
-const orgApp = (role: "admin" | "member", workos: Layer.Layer<WorkOSClient>) => {
-  const rsLive = Layer.mergeAll(stubDb, stubUsers, stubDirectory(role), stubMirror);
+const orgApp = (role: "admin" | "member", workos: Layer.Layer<WorkOSClient>, org: string) => {
+  const rsLive = Layer.mergeAll(makeDbLayer(), stubUsers, stubDirectory(role, org), stubMirror);
   const App = HttpApiBuilder.layer(OrgHttpApi).pipe(
     Layer.provide(OrgHandlers),
     Layer.provide(orgAuthMiddleware(rsLive)),
@@ -269,24 +271,43 @@ afterAll(async () => {
   await Promise.all(apps.map((app) => app.dispose()));
 });
 
-const deleteDomain = async (role: "admin" | "member") => {
+const deleteDomain = async (role: "admin" | "member", org: string = ORG) => {
   const deleted: string[] = [];
-  const app = orgApp(role, workosForCaller(deleted));
+  const app = orgApp(role, workosForCaller(deleted, org), org);
   apps.push(app);
   const response = await app.handler(
     new Request(`https://executor.test/org/domains/${DOMAIN}`, {
       method: "DELETE",
       headers: {
         cookie: `wos-session=sealed; ${await verifiedSettingsCookie(CALLER)}`,
-        [ORG_SELECTOR_HEADER]: ORG,
+        [ORG_SELECTOR_HEADER]: org,
       },
     }),
     // beta.59: the handler type expects a context argument; this layer stack
     // needs none at runtime — pass undefined like the api.request-scope tests.
     undefined as never,
   );
-  return { status: response.status, deleted };
+  return {
+    status: response.status,
+    retryAfter: response.headers.get("retry-after"),
+    body: (await response.json()) as unknown,
+    deleted,
+  };
 };
+
+/** An organization in the test database whose move to v2 is in `state`. */
+const seedMovingOrg = (state: "moving" | "moved") =>
+  Effect.runPromise(
+    Effect.gen(function* () {
+      const { db } = yield* DbService;
+      const id = `org_${crypto.randomUUID().replaceAll("-", "")}`;
+      yield* Effect.promise(() =>
+        db.insert(organizations).values({ id, name: "Synthetic Org", slug: id.slice(4, 20) }),
+      );
+      yield* Effect.promise(() => db.insert(orgMovedToV2).values({ orgId: id, state }));
+      return id;
+    }).pipe(Effect.provide(makeDbLayer())),
+  );
 
 describe("Org domain handlers over HTTP: the admin gate is the authorized role", () => {
   it("lets a mirrored admin delete a domain", async () => {
@@ -298,6 +319,24 @@ describe("Org domain handlers over HTTP: the admin gate is the authorized role",
   it("refuses a mirrored plain member, without ever consulting WorkOS", async () => {
     const { status, deleted } = await deleteDomain("member");
     expect(status).toBe(403);
+    expect(deleted).toEqual([]);
+  });
+
+  it("refuses an admin's change to an organization moving to v2", async () => {
+    const { status, retryAfter, body, deleted } = await deleteDomain(
+      "admin",
+      await seedMovingOrg("moving"),
+    );
+    expect(status).toBe(423);
+    expect(retryAfter).toBe("60");
+    expect(body).toEqual({ error: ORG_MOVING_MESSAGE, code: ORG_MOVING_CODE });
+    expect(deleted).toEqual([]);
+  });
+
+  it("refuses an admin's change to an organization that moved to v2", async () => {
+    const { status, body, deleted } = await deleteDomain("admin", await seedMovingOrg("moved"));
+    expect(status).toBe(423);
+    expect(body).toMatchObject({ code: ORG_MOVED_CODE });
     expect(deleted).toEqual([]);
   });
 });
