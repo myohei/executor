@@ -299,6 +299,20 @@ export const coreTables = defineTables({
       // since re-registering every legacy client on upgrade would churn
       // providers for the majority whose callback never changed.
       origin_redirect_uri: nullableTextColumn("origin_redirect_uri"),
+      // The space-delimited scopes a DCR registration asked for (RFC 7591
+      // `scope`); empty when it sent none. Reuse picks a client only when the
+      // scopes it asked for cover the request, so a server that has since
+      // added scopes gets a new registration rather than refusing every
+      // reconnect through the old client. Null for manual clients and for DCR
+      // rows written before this column existed: unlike the redirect URI, a
+      // missing record is not treated as covering.
+      origin_requested_scopes: nullableTextColumn("origin_requested_scopes"),
+      // The space-delimited scopes the server registered the client for, from
+      // the registration response's `scope` (RFC 7591 §3.2.1; the server may
+      // narrow what was asked for). A server may refuse an authorize request
+      // for a scope outside them, so start never asks for more. Null when the
+      // response did not say, for manual clients and for older rows.
+      origin_scopes: nullableTextColumn("origin_scopes"),
       created_at: dateColumn("created_at"),
     },
     ["tenant", "owner", "subject", "slug"],
