@@ -432,6 +432,8 @@ describe("oauth.registerDynamicClient", () => {
             clientSecret: "",
           });
           // Simulate the migration's backfill: legacy DCR stamp + issuer set.
+          // Its registered scopes are recorded too; a row without them is
+          // never reused (see oauth-dcr-registered-scopes.test.ts).
           yield* Effect.promise(() =>
             config.db.updateMany("oauth_client", {
               where: (b) => b("slug", "=", String(legacySlug)),
@@ -439,6 +441,8 @@ describe("oauth.registerDynamicClient", () => {
                 origin_kind: "dynamic_client_registration",
                 origin_integration: null,
                 origin_issuer: probe.issuer,
+                origin_requested_scopes: "read",
+                origin_scopes: "read",
               },
             }),
           );
