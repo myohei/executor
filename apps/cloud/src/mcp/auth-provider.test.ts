@@ -25,7 +25,7 @@ import { Data, Effect, Layer, Predicate } from "effect";
 import { McpAuthProvider, orgWriteAccessForPrincipal } from "@executor-js/host-mcp";
 
 import { WorkOSError } from "../auth/errors";
-import { cloudMcpAuthProviderLayer } from "./auth-provider";
+import { cloudMcpAuthProviderLayer, type CloudPrincipal } from "./auth-provider";
 import {
   MCP_ORGANIZATION_HEADER,
   McpAuth,
@@ -48,11 +48,29 @@ const request = () =>
     body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", id: 1 }),
   });
 
+// The bare `/mcp`, which pins no organization in the URL.
+const bareRequest = () =>
+  new Request("https://executor.sh/mcp", {
+    method: "POST",
+    headers: {
+      authorization: "Bearer token_fixture",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", id: 1 }),
+  });
+
 // A verified bearer that carries an account + org — the org-authorize branch is
 // what we exercise, so verifyBearer succeeds here.
 const stubAuth = Layer.succeed(McpAuth)({
   verifyBearer: () =>
     Effect.succeed(mcpAuthorized({ accountId: ACCOUNT_ID, organizationId: ORG_ID })),
+});
+
+// A verified bearer whose token names no organization: an account signed in
+// through an MCP client's OAuth with no v1 organization.
+const stubAuthNoOrganization = Layer.succeed(McpAuth)({
+  verifyBearer: () =>
+    Effect.succeed(mcpAuthorized({ accountId: ACCOUNT_ID, organizationId: null })),
 });
 
 const stubAuthMissingBearer = Layer.succeed(McpAuth)({
@@ -87,10 +105,11 @@ class StubInfraError extends Data.TaggedError("StubInfraError")<{
 const authenticateWith = (
   orgAuth: Layer.Layer<McpOrganizationAuth>,
   auth: Layer.Layer<McpAuth> = stubAuth,
+  makeRequest: () => Request = request,
 ) =>
   Effect.gen(function* () {
     const provider = yield* McpAuthProvider;
-    return yield* provider.authenticate(request());
+    return yield* provider.authenticate(makeRequest());
   }).pipe(
     Effect.provide(cloudMcpAuthProviderLayer.pipe(Layer.provide(Layer.mergeAll(auth, orgAuth)))),
   );
@@ -172,6 +191,85 @@ describe("cloud MCP org-authorization classification", () => {
           )
         : null;
       expect(legacyAccess).toBe("denied");
+    }),
+  );
+
+  it.effect("a moved org's mark rides on the principal; an unmoved org carries none", () =>
+    Effect.gen(function* () {
+      const moved = yield* authenticateWith(
+        Layer.succeed(McpOrganizationAuth)({
+          authorize: () =>
+            Effect.succeed({
+              id: ORG_ID,
+              name: "Stub Org",
+              memberRole: "member",
+              movedToV2: { v2OrganizationId: "v2-org" },
+            }),
+        }),
+      );
+      const unmoved = yield* authenticateWith(stubOrgAuthActive);
+      const movedMark = Predicate.isTagged(moved, "Authenticated")
+        ? (moved.principal as CloudPrincipal).movedToV2
+        : "not authenticated";
+      const unmovedMark = Predicate.isTagged(unmoved, "Authenticated")
+        ? (unmoved.principal as CloudPrincipal).movedToV2
+        : "not authenticated";
+      expect(movedMark).toEqual({ v2OrganizationId: "v2-org" });
+      expect(unmovedMark).toBeUndefined();
+    }),
+  );
+
+  it.effect(
+    "no organization in the token or the URL -> Forbidden naming Executor v2's MCP URL, with no lookup",
+    () =>
+      Effect.gen(function* () {
+        const selectors: Array<string> = [];
+        const outcome = yield* authenticateWith(
+          Layer.succeed(McpOrganizationAuth)({
+            authorize: (_accountId, selector) => {
+              selectors.push(selector);
+              return Effect.succeed(null);
+            },
+          }),
+          stubAuthNoOrganization,
+          bareRequest,
+        );
+        expect(outcome).toEqual({
+          _tag: "Forbidden",
+          code: -32001,
+          message:
+            "Executor has moved. This account has no organization on executor.sh/mcp: connect https://mcp.executor.sh/mcp instead. If you belong to an organization on executor.sh, reconnect this server and sign in again to choose it.",
+        });
+        expect(selectors, "nothing names an organization to look up").toEqual([]);
+      }),
+  );
+
+  it.effect("a token naming no organization still opens the organization its URL pins", () =>
+    Effect.gen(function* () {
+      const selectors: Array<string> = [];
+      const outcome = yield* authenticateWith(
+        Layer.succeed(McpOrganizationAuth)({
+          authorize: (_accountId, selector) => {
+            selectors.push(selector);
+            return Effect.succeed({ id: ORG_ID, name: "Stub Org", memberRole: "member" });
+          },
+        }),
+        stubAuthNoOrganization,
+      );
+      const principal = Predicate.isTagged(outcome, "Authenticated") ? outcome.principal : null;
+      expect(principal?.organizationId).toBe(ORG_ID);
+      expect(selectors).toEqual([ORG_ID]);
+    }),
+  );
+
+  it.effect("a revoked membership keeps its own Forbidden copy", () =>
+    Effect.gen(function* () {
+      const outcome = yield* authenticateWith(stubOrgAuthNoMembership);
+      expect(outcome).toEqual({
+        _tag: "Forbidden",
+        code: -32001,
+        message: "No organization in session — log in via the web app first",
+      });
     }),
   );
 
