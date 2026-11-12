@@ -68,12 +68,14 @@ const matchesPathPattern = (pathname: string, pattern: string): boolean =>
   pattern.endsWith("/*") ? pathname.startsWith(pattern.slice(0, -1)) : pathname === pattern;
 
 /** Path patterns v2 answers on `executor.sh`. `/git/*` never matches
- *  `/gitlab/...`. v2's outbound OAuth client metadata document stays off this
- *  list: its move to `executor.sh` is pending, and v1's own document
+ *  `/gitlab/...`. v1's own client metadata document
  *  (`/oauth/client-id-metadata.json`) stays with v1. */
 const V2_PATHS: ReadonlyArray<string> = [
   // Sign-in issuer metadata for the issuer `https://executor.sh/api/auth`.
   "/.well-known/oauth-authorization-server/api/auth",
+  // v2's outbound OAuth client metadata document: its connected-account
+  // sign-ins name it as their client ID, beside their callback on this origin.
+  "/oauth/client-metadata.json",
   "/git/*",
   "/.well-known/agent-skills/*",
 ];
@@ -301,6 +303,27 @@ export const parseV2Edge = (env: V2EdgeEnv): V2Edge | string | null => {
     return "V2_ERROR_TUNNEL_PATH must be /api/<16 lowercase hex>/submit";
   }
   return { service, signUpUrl: parsed, oauthStatePrefix, analyticsProxyPath, errorTunnelPath };
+};
+
+/**
+ * v2's app host, or `null` where v1 does not hand requests to v2 (local dev
+ * without the v2 settings, test workers, or broken settings). It is the origin
+ * of v2's sign-up page, the same host the edge sends v2 dashboard links to.
+ */
+export const v2AppOrigin = (env: V2EdgeEnv): URL | null => {
+  const signUpUrl = v2SignUpUrl(env);
+  return signUpUrl === null ? null : new URL(signUpUrl.origin);
+};
+
+/**
+ * v2's sign-up page (the `V2_SIGN_UP_URL` var), where new organizations are
+ * created, or `null` where v1 does not hand requests to v2 (see
+ * {@link v2AppOrigin}).
+ */
+export const v2SignUpUrl = (env: V2EdgeEnv): URL | null => {
+  const edge = parseV2Edge(env);
+  if (edge === null || typeof edge === "string") return null;
+  return new URL(edge.signUpUrl);
 };
 
 /** Whether a connected-account callback carries v2's state prefix. Reads the
