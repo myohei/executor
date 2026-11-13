@@ -7,7 +7,10 @@
 // KNOWS who it's serving:
 //
 // - signed out → 302 /login (carrying ?returnTo=) before any app HTML exists
-// - org-less   → 302 /create-org (onboarding owns those sessions)
+// - org-less   → 302 to Executor v2's sign-up page (v1 creates no
+//   organizations), or to /join when the session holds a pending invitation
+//   into an existing organization
+// - /create-org → 302 to v2's sign-up page, for every signed-in session
 // - signed in  → the prerendered shell is served, and the auth-hint cookie is
 //   minted when the browser doesn't hold a current one — the client seeds its
 //   auth state from that cookie right after mount (there is no per-request
@@ -36,18 +39,22 @@ import {
   type AuthHint,
 } from "@executor-js/react/multiplayer/auth-hint";
 
+import { env } from "cloudflare:workers";
+
 import { isAppOwnedPath } from "../app-paths";
 import { makeDbLayer } from "../db/db";
+import { v2AppOrigin, v2SignUpUrl } from "../edge/marketing";
+import { movedDashboardLocation } from "../org/move-to-v2";
 import { makeUserStoreLayer, UserStoreService } from "./context";
 import { parseCookie } from "./cookies";
 import { LAST_ORG_COOKIE } from "./last-org-cookie";
 import { makeMemberDirectoryLayer } from "./member-directory";
 import { makeWorkOsMirrorLayer } from "./workos-mirror";
 import { sealedSessionDisplayName } from "./middleware";
-import { authorizeOrganizationSelector } from "./organization";
+import { authorizeOrganization, authorizeOrganizationSelector } from "./organization";
 import { loginPath, safeReturnTo } from "./return-to";
-import { ONBOARDING_PATHS, PUBLIC_PATHS } from "./route-paths";
-import { WorkOSClient } from "./workos";
+import { CREATE_ORG_PATH, JOIN_PATH, PUBLIC_PATHS } from "./route-paths";
+import { WorkOSClient, isPendingOrganizationInvitation } from "./workos";
 
 const SESSION_COOKIE = "wos-session";
 /** Mirrors the handlers' COOKIE_OPTIONS (path /, HttpOnly, Lax, 7d, Secure). */
@@ -191,6 +198,70 @@ const authorizeLastOrgSlug = async (
   return Exit.isSuccess(exit) ? exit.value : null;
 };
 
+// ── No organization ──────────────────────────────────────────────────────────
+
+/**
+ * Whether this email holds a pending invitation into an organization — the
+ * same WorkOS read the join page lists them from (`pendingInvitations`). A
+ * failed read answers `true`: the join page reads again, and an invitee must
+ * not be sent away from their invitation by a transient failure.
+ */
+const hasPendingInvitation = async (email: string): Promise<boolean> => {
+  const exit = await getRuntime().runPromiseExit(
+    Effect.flatMap(WorkOSClient.asEffect(), (workos) => workos.listInvitationsByEmail(email)),
+  );
+  return !Exit.isSuccess(exit) || exit.value.data.some(isPendingOrganizationInvitation);
+};
+
+// ── Moved to v2 ──────────────────────────────────────────────────────────────
+
+/**
+ * Where to send this page load when the organization it opens has moved to
+ * v2, or `null` to serve the v1 dashboard (see `movedDashboardLocation`). The
+ * organization is the one the URL names (`/<slug>/…`), or for a bare path the
+ * session's own, the one the client canonicalizes onto. With
+ * `V2_SESSION_HANDOFF_SECRET` set, the location is v2's session handoff, which
+ * signs the member in to v2 as the user its import mapped. A failed read serves
+ * the dashboard: this is navigation only, and every write the dashboard could
+ * make is refused server-side while the organization is moving or moved.
+ */
+const movedToV2Location = async (
+  session: VerifiedSession,
+  firstSegment: string,
+): Promise<string | null> => {
+  const v2Origin = v2AppOrigin(env);
+  if (v2Origin === null) return null;
+  const target = isValidOrgSlug(firstSegment)
+    ? { slug: firstSegment }
+    : session.organizationId
+      ? { organizationId: session.organizationId }
+      : null;
+  if (target === null) return null;
+  const exit = await getRuntime().runPromiseExit(
+    movedDashboardLocation({
+      target,
+      v2Origin,
+      // Only once the session has verified: the token vouches for its user.
+      handoff: env.V2_SESSION_HANDOFF_SECRET
+        ? { secret: env.V2_SESSION_HANDOFF_SECRET, user: session.userId }
+        : undefined,
+      isMember: (organizationId) =>
+        authorizeOrganization(session.userId, organizationId).pipe(
+          Effect.map((org) => org !== null),
+        ),
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          makeUserStoreLayer(),
+          makeMemberDirectoryLayer(),
+          makeWorkOsMirrorLayer(),
+        ).pipe(Layer.provideMerge(makeDbLayer())),
+      ),
+    ),
+  );
+  return Exit.isSuccess(exit) ? exit.value : null;
+};
+
 const hintSetCookie = (hint: AuthHint) =>
   `${AUTH_HINT_COOKIE}=${encodeAuthHint(hint)}; ${HINT_COOKIE_ATTRIBUTES}; Max-Age=${AUTH_HINT_MAX_AGE_SECONDS}`;
 
@@ -252,13 +323,25 @@ export const authGateMiddleware = createMiddleware({ type: "request" }).server(
       return redirect("/", { refreshedSession: session.refreshedSession });
     }
 
-    // A session with no organization belongs in onboarding — same decision
-    // the client AuthGate makes mid-session, made here before the document
-    // exists so the app shell is never painted for an org-less session.
-    if (!session.organizationId && !ONBOARDING_PATHS.has(pathname)) {
-      return redirect("/create-org", {
-        refreshedSession: session.refreshedSession,
-      });
+    // v1 creates no organizations: its create-an-organization address opens
+    // v2's sign-up page, whatever organizations the session already has.
+    const signUpUrl = v2SignUpUrl(env);
+    if (pathname === CREATE_ORG_PATH && signUpUrl !== null) {
+      return redirect(signUpUrl.href, { refreshedSession: session.refreshedSession });
+    }
+
+    // A session with no organization is sent on before the document exists,
+    // so the app shell is never painted for it — the client AuthGate does the
+    // same mid-session. New organizations are created in v2, so it goes to
+    // v2's sign-up page, unless it holds a pending invitation into an existing
+    // organization: that is accepted on the join page. Where this deployment
+    // has no v2, the join page is the only place it can go.
+    if (!session.organizationId && pathname !== JOIN_PATH) {
+      const location =
+        signUpUrl !== null && !(await hasPendingInvitation(session.email))
+          ? signUpUrl.href
+          : JOIN_PATH;
+      return redirect(location, { refreshedSession: session.refreshedSession });
     }
 
     // A BARE console path (no org slug in the URL) canonicalizes onto the org
@@ -278,7 +361,7 @@ export const authGateMiddleware = createMiddleware({ type: "request" }).server(
       lastOrgSlug &&
       isValidOrgSlug(lastOrgSlug) &&
       !isValidOrgSlug(firstSegment) &&
-      !ONBOARDING_PATHS.has(pathname)
+      pathname !== JOIN_PATH
     ) {
       const sessionOrgSlug = (await organizationDisplay(session.organizationId)).slug;
       if (lastOrgSlug !== sessionOrgSlug) {
@@ -292,6 +375,12 @@ export const authGateMiddleware = createMiddleware({ type: "request" }).server(
           });
         }
       }
+    }
+
+    // An organization that has moved to v2 is opened there instead.
+    if (pathname !== JOIN_PATH) {
+      const movedTo = await movedToV2Location(session, firstSegment);
+      if (movedTo) return redirect(movedTo, { refreshedSession: session.refreshedSession });
     }
 
     // Serve the shell, minting the auth-hint cookie when the browser lacks a

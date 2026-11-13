@@ -106,6 +106,8 @@ export const oauth_client = pgTable(
     origin_integration: text("origin_integration"),
     origin_issuer: text("origin_issuer"),
     origin_redirect_uri: text("origin_redirect_uri"),
+    origin_requested_scopes: text("origin_requested_scopes"),
+    origin_scopes: text("origin_scopes"),
     created_at: timestamp("created_at").notNull(),
     row_id: varchar("row_id", { length: 255 })
       .primaryKey()
