@@ -18,7 +18,7 @@ import { CloudApiClient } from "./client";
 // shared `onIdentify` callback. Identity comes from the provider-neutral
 // account surface, identical to self-host.
 //
-// Cloud-only multi-org bits (org switcher, create-org, pending invites) stay
+// Cloud-only multi-org bits (org switcher, pending invites) stay
 // here as cloud-local atoms over CloudApiClient — they are NOT part of the
 // shared account contract and coexist with the shared `/account/*` atoms.
 // ---------------------------------------------------------------------------
@@ -34,7 +34,12 @@ export const organizationsAtom = Atom.refreshOnWindowFocus(
   }),
 );
 
-export const createOrganization = CloudApiClient.mutation("cloudAuth", "createOrganization");
+// Whether the selected org can move to Executor v2, and where. Eligibility
+// reads WorkOS and Autumn, so it is fetched once per dashboard load and kept.
+export const v2ImportAtom = CloudApiClient.query("cloudAuth", "v2Import", {
+  timeToLive: "5 minutes",
+  reactivityKeys: [ReactivityKey.auth],
+});
 
 export const deleteOrganization = CloudApiClient.mutation("cloudAuth", "deleteOrganization");
 

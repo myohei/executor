@@ -19,7 +19,10 @@ import * as React from "react";
 //
 // PROPERTY RULES — properties must never carry:
 //   - secrets, tokens, credential values, copied clipboard contents
-//   - emails, person/org names, or any user-entered free text
+//   - emails, person/org names, or any user-entered free text — except a
+//     message the user writes TO us in a field presented as feedback and sends
+//     deliberately (`v2_moved_feedback_sent.feedback`); it is a survey answer,
+//     not incidental input
 //   - connection names or tool ADDRESSES (both embed user-entered label text;
 //     integration slugs and spec-derived tool names are fine)
 //   - policy patterns (user-entered globs) — use `pattern_kind` instead
@@ -163,7 +166,7 @@ export interface AnalyticsEvents {
   mcp_install_command_copied: {
     transport: "http" | "stdio";
     elicitation_mode?: string;
-    surface: "integrations" | "setup_mcp";
+    surface: "integrations";
   };
   mcp_install_transport_switched: { transport: "http" | "stdio" };
   mcp_install_elicitation_mode_changed: { elicitation_mode: string };
@@ -183,12 +186,21 @@ export interface AnalyticsEvents {
   // ── Cloud: auth & onboarding ─────────────────────────────────────────────
   login_cta_clicked: {};
   signed_out: {};
-  org_created: { success: boolean };
   org_deleted: { success: boolean };
   org_switched: { success: boolean };
   org_invitation_accepted: { success: boolean };
-  setup_mcp_completed: {};
-  setup_mcp_skipped: {};
+  v2_import_opened: {};
+  /** The org switcher's link to create an organization in Executor v2. */
+  v2_new_org_opened: {};
+  // The "moved to Executor v2" notice, for an org v2 has already imported.
+  // The org rides on the posthog group, like every other event.
+  v2_moved_modal_shown: {};
+  v2_moved_open_clicked: { via: "modal" | "sidebar" };
+  /** "Keep using v1" was clicked, whether or not feedback follows. */
+  v2_moved_stay_clicked: {};
+  v2_moved_feedback_sent: { feedback: string };
+  /** Closed without answering (the ✕, Escape, or a click outside). */
+  v2_moved_dismissed: { step: "notice" | "feedback" };
 
   // ── Cloud: billing & support ─────────────────────────────────────────────
   billing_plan_selected: {

@@ -356,6 +356,15 @@ export abstract class McpAgentSessionDOBase<
    * second time.
    */
   private disposingRuntime: Promise<void> | null = null;
+  /**
+   * Set once `destroy()` begins. The SDK's teardown drops its tables and wipes
+   * storage (the condemned marker included) before it aborts the isolate, and
+   * requests still land on this instance in between. From this point the
+   * in-memory session meta no longer describes stored state, so it must not
+   * vouch for the session: a request that trusted it would restore the runtime
+   * against dropped tables and fail as an unhandled error.
+   */
+  private destroyStarted = false;
   private onStartPromise: Promise<void> | null = null;
   private lastActivityMs = 0;
   private resolvedSessionName: string | undefined = undefined;
@@ -650,6 +659,9 @@ export abstract class McpAgentSessionDOBase<
 
   private loadSessionMeta(): Effect.Effect<SessionMeta | null> {
     return Effect.promise(async () => {
+      // See `destroyStarted`: once teardown begins, the cached meta outlives
+      // the storage it mirrors.
+      if (this.destroyStarted) return null;
       if (this.sessionMeta) return this.sessionMeta;
       const stored = await this.ctx.storage.get<SessionMeta>(SESSION_META_KEY);
       // Backfill `resource` for sessions persisted before scoped toolkits added
@@ -1784,6 +1796,7 @@ export abstract class McpAgentSessionDOBase<
   }
 
   override async destroy(): Promise<void> {
+    this.destroyStarted = true;
     await this.cleanup();
     await super.destroy();
   }
