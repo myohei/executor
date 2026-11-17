@@ -21,6 +21,7 @@ import {
   McpOAuthReauthorizationRequired,
 } from "./errors";
 import { connectionHttpStatusFromCause, isStreamableHttpProtocolError } from "./http-status";
+import { withDefaultUserAgent } from "./user-agent";
 import { detectInsufficientScope } from "@executor-js/sdk/core";
 
 // ---------------------------------------------------------------------------
@@ -625,10 +626,12 @@ export const createMcpConnector = (input: ConnectorInput): McpConnector => {
     });
   }
 
-  // Remote transport
-  const headers = input.headers ?? {};
+  // Remote transport. Both remote SDK transports apply `requestInit.headers`
+  // to every request they send, including OAuth metadata discovery, so the
+  // default User-Agent goes there.
+  const headers = withDefaultUserAgent(input.headers ?? {});
   const remoteTransport = input.remoteTransport ?? "auto";
-  const requestInit = Object.keys(headers).length > 0 ? { headers } : undefined;
+  const requestInit = { headers };
   const fetch = input.httpClientLayer
     ? fetchFromHttpClientLayer(input.httpClientLayer, input.staticOAuthBearer === true)
     : undefined;
