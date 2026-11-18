@@ -15,6 +15,7 @@ import { WorkOsMirror } from "../auth/workos-mirror";
 import { ORG_SELECTOR_HEADER, authorizeOrganizationSelector } from "../auth/organization";
 import { WorkOSClient } from "../auth/workos";
 import { DbService } from "../db/db";
+import { frozenWriteResponse } from "./move-to-v2";
 
 const unauthorized = () =>
   HttpServerResponse.jsonUnsafe(
@@ -85,6 +86,13 @@ const OrgAuthMiddleware = HttpRouter.middleware<{
             { _tag: "Forbidden", message: "Verify your identity to open organization settings." },
             { status: 403, headers: { "cache-control": "no-store" } },
           );
+
+        // The domain routes' freeze (see `./move-to-v2`): verifying or
+        // deleting a domain changes the organization.
+        if (request.method !== "GET" && request.method !== "HEAD") {
+          const refused = yield* frozenWriteResponse(org.id);
+          if (refused) return refused;
+        }
 
         const session = sessionFromSealed(result, cookieValue);
         const auth = AuthContext.of({
