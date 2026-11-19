@@ -158,6 +158,7 @@ const stubDirectory = Layer.succeed(MemberDirectory)({
 const stubAutumn = Layer.succeed(AutumnService)({
   use: () => Effect.die("revoke does not touch billing"),
   ensureCustomer: () => Effect.die("revoke does not touch billing"),
+  findCustomer: () => Effect.die("revoke does not touch billing"),
   checkExecutionBalance: () => Effect.die("revoke does not touch billing"),
   trackExecution: () => Effect.void,
   setMemberSeats: () => Effect.void,
