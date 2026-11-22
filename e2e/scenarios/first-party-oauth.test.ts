@@ -187,9 +187,10 @@ scenario(
         });
       });
 
-      // The Executor-owned Google app is withheld from every listing: it is no
-      // longer offered for new connections, so connecting Google means bringing
-      // your own OAuth app. It stays fully resolvable by slug, which the
+      // The Executor-owned Google app is listed only for users the
+      // `google-oauth-review` flag admits, and withheld whenever no flag service
+      // answers. The e2e stack configures no PostHog project (cloud.boot.ts),
+      // so here it is withheld. It stays fully resolvable by slug, which the
       // `oauth.start` cases below exercise — that is the guarantee for everyone
       // already connected through it. Its reviewed consumer scope bundle, no
       // longer introspectable from here, is asserted on the config it is built
