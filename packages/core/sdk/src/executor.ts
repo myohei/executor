@@ -1,5 +1,6 @@
 import {
   Cause,
+  Context,
   Deferred,
   Duration,
   Effect,
@@ -22,6 +23,7 @@ import type { AnyColumn } from "@executor-js/fumadb/schema";
 import {
   StorageError,
   CredentialWriteIncompleteError,
+  activeFumaDbRef,
   afterCommit,
   afterCommitRequired,
   isStorageFailure,
@@ -271,6 +273,36 @@ const refreshGateFor = (rootDb: object): RefreshGate => {
   refreshGateByRootDb.set(rootDb, created);
   return created;
 };
+
+// ---------------------------------------------------------------------------
+// The host's workspace write gate (`ExecutorConfig.workspaceWriteGate`) inside
+// a storage transaction.
+//
+// The gate is the host's I/O (cloud reads the workspace's move state), so it is
+// never run while a transaction is open: the transaction holds the request's
+// connection, and on a single-session database every other connection waits
+// for it to commit — a gate waiting on one would wait forever. A user-intent
+// write transaction therefore consults the gate just before it opens and binds
+// the verdict here for its duration; the guards inside read it.
+// ---------------------------------------------------------------------------
+
+interface WorkspaceWriteVerdict {
+  readonly tenant: Tenant;
+  readonly exit: Exit.Exit<void, OrgWriteDeniedError>;
+}
+
+const WorkspaceWriteVerdictRef = Context.Reference<WorkspaceWriteVerdict | null>(
+  "executor/WorkspaceWriteVerdict",
+  { defaultValue: () => null },
+);
+
+/** The refusal of a guarded write that ran inside a storage transaction which
+ *  did not ask the host's write gate before it opened (one opened with
+ *  `transaction` rather than `writeTransaction`). The gate cannot be asked
+ *  from there, and the write is not let through unchecked: it fails closed,
+ *  and the transaction's opener is the bug to fix. */
+const WRITE_GATE_NOT_CONSULTED_REASON =
+  "Executor could not check whether this workspace accepts changes.";
 
 // ---------------------------------------------------------------------------
 // Elicitation handler — resolved once at `createExecutor({ onElicitation })`
@@ -854,6 +886,36 @@ export interface ExecutorConfig<TPlugins extends readonly AnyPlugin[] = readonly
    * like `platformView`'s blanket `writes: "denied"`.
    */
   readonly orgWrites?: OrgWriteAccess | "request";
+  /**
+   * The host's veto over every user-intent write in the workspace and every
+   * OAuth token refresh, for every member regardless of role — for a host that
+   * freezes a workspace while it is being moved or maintained. Consulted on
+   * each guarded operation (never cached here), so a host reading live state
+   * sees it change mid-session:
+   *
+   *   - every surface `orgWrites` guards, for any owner: connection
+   *     create/update/remove/refresh, OAuth client CRUD and connect flows,
+   *     policies, integration registration/update/removal;
+   *   - OAuth `complete`, before the authorization code is exchanged;
+   *   - every OAuth token refresh (proactive, reactive, health), before the
+   *     token endpoint is called.
+   *
+   * Failing with `OrgWriteDeniedError` (its `reason` is the message shown)
+   * refuses the operation; a refused refresh fails resolution with that
+   * message as a `CredentialResolutionError` without marking the grant dead.
+   * Reads, tool execution over connections that need no refresh, and
+   * operational writes (tool-catalog re-sync, health bookkeeping) are not
+   * consulted. Omitted -> always writable.
+   *
+   * Never called inside a storage transaction: a guarded write that runs in
+   * one (every user-intent write transaction, the plugin-facing
+   * `ctx.transaction` included) consults the gate once, just before the
+   * transaction opens, and its guards read that verdict. A host gate may
+   * therefore read its state over its own database connection: on a
+   * single-session database (PGlite, libSQL) a second connection waiting on
+   * an open transaction would never be served.
+   */
+  readonly workspaceWriteGate?: (tenant: Tenant) => Effect.Effect<void, OrgWriteDeniedError>;
 }
 
 /** Default freshness window for remote-catalog connections (see
@@ -1938,8 +2000,33 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     // surface outright. Deliberately NOT wired into the storage owner policy —
     // operational org-row writes (token refresh, tool-catalog re-sync) must
     // keep working for a denied member.
+    //
+    // The host's workspace gate (`ExecutorConfig.workspaceWriteGate`) runs
+    // first and for every owner: a frozen workspace refuses personal writes
+    // too. Outside a transaction it is asked live. Inside one it is never
+    // asked (see `WorkspaceWriteVerdictRef`): the guard reads the verdict the
+    // enclosing write transaction took before it opened. A transaction that
+    // took none is a wiring bug here, not a state to guess, so the write is
+    // refused rather than let through unchecked.
+    const hostWriteGate = config.workspaceWriteGate;
+    const askHostWriteGate: Effect.Effect<void, OrgWriteDeniedError> =
+      hostWriteGate === undefined
+        ? Effect.void
+        : Effect.suspend(() => hostWriteGate(config.tenant));
+    const workspaceWriteGate: Effect.Effect<void, OrgWriteDeniedError> =
+      hostWriteGate === undefined
+        ? Effect.void
+        : Effect.gen(function* () {
+            const verdict = yield* WorkspaceWriteVerdictRef;
+            if (verdict !== null && verdict.tenant === config.tenant) return yield* verdict.exit;
+            if ((yield* activeFumaDbRef) !== null) {
+              return yield* new OrgWriteDeniedError({ reason: WRITE_GATE_NOT_CONSULTED_REASON });
+            }
+            return yield* askHostWriteGate;
+          });
     const guardOrgWrite = (owner?: Owner): Effect.Effect<void, OrgWriteDeniedError> =>
       Effect.gen(function* () {
+        yield* workspaceWriteGate;
         const access =
           config.orgWrites === "request" ? yield* currentOrgWriteAccess : config.orgWrites;
         if (access === "denied" && (owner === undefined || owner === "org")) {
@@ -2023,6 +2110,27 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     );
     const blobs = config.blobs ?? makeFumaBlobStore(fuma);
     const transaction = <A, E>(effect: Effect.Effect<A, E>) => fuma.transaction(effect);
+
+    // A user-intent write transaction: every transaction whose body may reach
+    // a workspace write guard (`guardOrgWrite`, a token refresh). When it is
+    // the outermost one, the host's write gate is asked BEFORE it opens and
+    // the verdict rides into it, so no guard inside does host I/O while the
+    // transaction holds the connection. Nested in another transaction it
+    // passes through like `transaction` and inherits the outer verdict.
+    // Operational transactions (catalog persistence, compensation, storage
+    // bookkeeping) stay on `transaction` and never ask the gate.
+    const writeTransaction = <A, E>(
+      effect: Effect.Effect<A, E>,
+    ): Effect.Effect<A, E | StorageFailure> =>
+      hostWriteGate === undefined
+        ? transaction(effect)
+        : Effect.gen(function* () {
+            if ((yield* activeFumaDbRef) !== null) return yield* transaction(effect);
+            const exit = yield* Effect.exit(askHostWriteGate);
+            return yield* transaction(effect).pipe(
+              Effect.provideService(WorkspaceWriteVerdictRef, { tenant: config.tenant, exit }),
+            );
+          });
 
     // Runtime-observed output shapes ("muscle memory"): learned on the
     // execute success path, served by tools.schema when a tool declares no
@@ -2935,7 +3043,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         }),
       );
 
-    const refreshConnectionToken = (
+    const runSharedRefresh = (
       row: ConnectionRow,
       provider: CredentialProvider,
       trigger: RefreshTrigger = "proactive",
@@ -2982,6 +3090,30 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         );
         return Effect.forkDetach(run).pipe(Effect.andThen(Deferred.await(deferred)));
       });
+
+    // The host's workspace gate is asked first, on the caller's fiber and
+    // before any token endpoint is called: a frozen workspace's refresh token
+    // must stay unused (another system may be about to take it over). The
+    // refusal names the connection and carries the host's message; it is not
+    // `reauthRequired`, so nothing records the grant as dead.
+    const refreshConnectionToken = (
+      row: ConnectionRow,
+      provider: CredentialProvider,
+      trigger: RefreshTrigger = "proactive",
+    ): Effect.Effect<string | null, StorageFailure | CredentialResolutionError> =>
+      workspaceWriteGate.pipe(
+        Effect.catchTag("OrgWriteDeniedError", (refused) =>
+          Effect.fail(
+            new CredentialResolutionError({
+              owner: row.owner as Owner,
+              integration: IntegrationSlug.make(row.integration),
+              name: ConnectionName.make(row.name),
+              message: refused.message,
+            }),
+          ),
+        ),
+        Effect.andThen(runSharedRefresh(row, provider, trigger)),
+      );
 
     // Resolve every named input of a connection (`variable → value`). A
     // single-secret connection yields `{ token: <value> }`; an apiKey method with
@@ -3265,7 +3397,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       pluginId: string,
       input: RegisterIntegrationInput,
     ): Effect.Effect<void, OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           const now = new Date();
           const existing = yield* findIntegrationRow(input.slug);
@@ -3328,7 +3460,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         readonly config?: IntegrationConfig;
       },
     ): Effect.Effect<void, OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite();
           const now = new Date();
@@ -3366,7 +3498,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       void,
       IntegrationRemovalNotAllowedError | OrgWriteDeniedError | StorageFailure
     > =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite();
           const existing = yield* findIntegrationRow(slug);
@@ -3469,7 +3601,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       slug: IntegrationSlug,
       spec: HealthCheckSpec | null,
     ): Effect.Effect<void, IntegrationNotFoundError | OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite();
           const row = yield* findIntegrationRow(slug);
@@ -4787,7 +4919,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       ref: ConnectionRef,
       input: UpdateConnectionInput,
     ): Effect.Effect<Connection, ConnectionNotFoundError | OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite(ref.owner);
           const row = yield* findConnectionRow(ref);
@@ -4818,7 +4950,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const connectionsRemove = (
       ref: ConnectionRef,
     ): Effect.Effect<void, ConnectionNotFoundError | OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite(ref.owner);
           const row = yield* findConnectionRow(ref);
@@ -6061,7 +6193,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const policiesCreate = (
       input: CreateToolPolicyInput,
     ): Effect.Effect<ToolPolicy, OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite(input.owner);
           if (!isValidPattern(input.pattern)) {
@@ -6111,7 +6243,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const policiesUpdate = (
       input: UpdateToolPolicyInput,
     ): Effect.Effect<ToolPolicy, OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite(input.owner);
           if (input.pattern !== undefined && !isValidPattern(input.pattern)) {
@@ -6147,7 +6279,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
     const policiesRemove = (
       input: RemoveToolPolicyInput,
     ): Effect.Effect<void, OrgWriteDeniedError | StorageFailure> =>
-      transaction(
+      writeTransaction(
         Effect.gen(function* () {
           yield* guardOrgWrite(input.owner);
           const where = (b: AnyCb) => b.and(byOwner(input.owner)(b), b("id", "=", input.id));
@@ -6821,6 +6953,7 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
       credentialWriteRuntimeId,
       ownedKeys: (owner: Owner) => ownedKeys(owner),
       guardOrgWrite: (owner: Owner) => guardOrgWrite(owner),
+      workspaceWriteGate,
       defaultWritableProvider,
       mintOAuthConnection: (input: MintOAuthConnectionInput) => mintOAuthConnection(input),
       integrationExists: (slug) => findIntegrationRow(slug).pipe(Effect.map((row) => row !== null)),
@@ -6983,7 +7116,10 @@ export const createExecutor = <const TPlugins extends readonly AnyPlugin[] = rea
         },
         oauth,
         execute: (address, args, options) => execute(address, args, options),
-        transaction: <A, E>(effect: Effect.Effect<A, E>) => transaction(effect),
+        // Every plugin transaction is a user-intent write unit (integration
+        // registration, spec update/removal, auth configuration), so the
+        // host's write gate is asked before it opens; see `writeTransaction`.
+        transaction: <A, E>(effect: Effect.Effect<A, E>) => writeTransaction(effect),
         afterCommit: (effect: Effect.Effect<void>) => afterCommit(effect),
       };
 

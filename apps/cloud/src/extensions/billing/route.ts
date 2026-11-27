@@ -4,6 +4,7 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstab
 import { autumnHandler } from "autumn-js/backend";
 
 import { WorkOSClient } from "../../auth/workos";
+import { frozenWriteResponse } from "../../org/move-to-v2";
 import { ORG_SELECTOR_HEADER, authorizeOrganizationSelector } from "../../auth/organization";
 import {
   HttpResponseError,
@@ -16,6 +17,20 @@ type BillingSession = {
 };
 
 const ATTACH_PATH = "/api/billing/attach";
+
+/** The billing routes that only read, served while an organization moves. */
+export const BILLING_READ_PATHS: ReadonlySet<string> = new Set(
+  [
+    "getOrCreateCustomer",
+    "getEntity",
+    "listPlans",
+    "listEvents",
+    "aggregateEvents",
+    "previewAttach",
+    "previewMultiAttach",
+    "previewUpdateSubscription",
+  ].map((route) => `/api/billing/${route}`),
+);
 
 // Stripe Checkout hides the VAT / tax ID field unless the session asks for it.
 // Autumn always passes an existing Stripe customer, and Stripe then requires
@@ -89,6 +104,16 @@ const handler = Effect.gen(function* () {
   const org = yield* resolveBillingOrganization(webRequest, session);
 
   const url = new URL(webRequest.url);
+
+  // Billing's freeze (see `../../org/move-to-v2`): a plan change, checkout,
+  // payment setup, portal session or referral for an organization moving to
+  // v2 could be charged twice or lost, so everything but the reads the
+  // billing pages make is refused. A route added later is refused until it
+  // is listed here.
+  if (!BILLING_READ_PATHS.has(url.pathname)) {
+    const refused = yield* frozenWriteResponse(org.id);
+    if (refused) return refused;
+  }
   const body =
     request.method !== "GET" && request.method !== "HEAD"
       ? yield* Effect.mapError(
