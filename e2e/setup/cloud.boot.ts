@@ -128,6 +128,13 @@ export const bootCloud = async (options: CloudBootOptions): Promise<CloudBooted>
     // scope policy, and authorization URL construction end to end.
     FIRST_PARTY_GOOGLE_CLIENT_ID: "e2e-first-party-google",
     FIRST_PARTY_GOOGLE_CLIENT_SECRET: "e2e-first-party-google-secret",
+    // No PostHog project. wrangler.jsonc ships the production project key as a
+    // var, and the worker evaluates server-side feature flags with it (the
+    // Google OAuth listing, the enterprise-managed auth rollout). Inheriting it
+    // made e2e outcomes follow whatever those flags are set to in production
+    // and sent every synthetic e2e user to the production project. With no
+    // key, each gate takes its documented no-flag-service path.
+    VITE_PUBLIC_POSTHOG_KEY: "",
     // Shrink the per-org hourly execution cap (prod default 1000) to a number
     // the rate-limit-backstop scenario can actually exhaust with real
     // executions — but see execution-limits.ts: it must stay above every other
