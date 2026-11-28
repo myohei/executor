@@ -52,6 +52,13 @@ import type {
   ResolvedPrincipal,
 } from "@executor-js/api/server";
 
+import { DbService } from "../db/db";
+import {
+  assertOrgWritable,
+  isFrozenWriteRequest,
+  orgFreezeRefusal,
+  orgFreezeRefusalForCode,
+} from "../org/move-to-v2";
 import { ApiKeyService } from "./api-keys";
 import { workosApiJwtBearerConfig } from "./api-jwt-bearer";
 import { WorkOsMirror } from "./workos-mirror";
@@ -391,6 +398,35 @@ export const resolveProtectedPrincipal = (
   });
 
 /**
+ * The protected plane's freeze: a member's request that would change an
+ * organization moving to (or moved to) Executor v2 is refused here, once, for
+ * every route behind this plane (integrations, connections, secrets, policies,
+ * toolkits, artifacts, plugin settings, OAuth start/complete and clients),
+ * whichever credential sent it. Executions are exempt (see
+ * `isFrozenWriteRequest`): they keep running, and the executor's own gate
+ * refuses the writes and token refreshes inside them; so is the OAuth callback
+ * page, which that gate refuses before the code is exchanged. The state is
+ * read on every such request; a failed read refuses too. Platform (org API
+ * key) principals are read-only already and are refused as such downstream.
+ *
+ * The refusal rides the shared `Unavailable` failure, carrying the freeze code
+ * and message; `cloudIdentityFailureStrategy` renders it with the freeze status.
+ */
+const refuseFrozenWrite = (
+  request: Request,
+  principal: ResolvedPrincipal,
+): Effect.Effect<void, Unavailable, DbService> => {
+  if (principal.kind === "platform") return Effect.void;
+  if (!isFrozenWriteRequest(request.method, new URL(request.url).pathname)) return Effect.void;
+  return assertOrgWritable(principal.organizationId).pipe(
+    Effect.mapError((error) => {
+      const refusal = orgFreezeRefusal(error);
+      return new Unavailable({ code: refusal.code, message: refusal.message });
+    }),
+  );
+};
+
+/**
  * Cloud's NEUTRAL `IdentityProvider` Layer. Closes over the long-lived
  * `WorkOSClient` + `ApiKeyService`; the request-scoped `UserStoreService` +
  * `MemberDirectory` stay REQUIREMENTS OF THE LAYER, satisfied per request by the
@@ -403,16 +439,17 @@ export const resolveProtectedPrincipal = (
 export const workosIdentityLayer: Layer.Layer<
   IdentityProvider,
   never,
-  WorkOSClient | ApiKeyService | UserStoreService | MemberDirectory | WorkOsMirror
+  WorkOSClient | ApiKeyService | UserStoreService | MemberDirectory | WorkOsMirror | DbService
 > = Layer.effect(
   IdentityProvider,
   Effect.gen(function* () {
     const context = yield* Effect.context<
-      WorkOSClient | ApiKeyService | UserStoreService | MemberDirectory | WorkOsMirror
+      WorkOSClient | ApiKeyService | UserStoreService | MemberDirectory | WorkOsMirror | DbService
     >();
     return IdentityProvider.of({
       authenticate: (request) =>
         resolveProtectedPrincipal(request, workosApiJwtBearerConfig).pipe(
+          Effect.tap((principal) => refuseFrozenWrite(request, principal)),
           // `UserStoreError` / `WorkOSError` are org-resolution infra failures —
           // surface as a 500 defect, exactly as the old inline resolver let them
           // bubble. The narrow `die` here is the runtime edge for that infra
@@ -436,18 +473,32 @@ export const workosIdentityLayer: Layer.Layer<
 // Render a shared identity failure as cloud's exact `{ error, code }` JSON body
 // at the given status. `code` + `message` ride on the shared error (cloud always
 // supplies both); the defaults only guard the self-host-produced bare errors.
+// A freeze refusal (see `refuseFrozenWrite`) is rendered with its own status
+// and `Retry-After` rather than the tag's.
 const renderIdentityFailure =
   (status: number, fallbackCode: string, fallbackMessage: string) =>
-  (failure: { readonly code?: string; readonly message?: string }) =>
-    Effect.succeed(
+  (failure: { readonly code?: string; readonly message?: string }) => {
+    const freeze = failure.code === undefined ? null : orgFreezeRefusalForCode(failure.code);
+    return Effect.succeed(
       HttpServerResponse.jsonUnsafe(
         {
           error: failure.message ?? fallbackMessage,
           code: failure.code ?? fallbackCode,
         },
-        { status },
+        freeze === null
+          ? { status }
+          : {
+              status: freeze.status,
+              headers: {
+                "cache-control": "no-store",
+                ...(freeze.retryAfterSeconds === undefined
+                  ? {}
+                  : { "retry-after": String(freeze.retryAfterSeconds) }),
+              },
+            },
       ),
     );
+  };
 
 /**
  * Cloud's failure-rendering STRATEGY. Where self-host's `textFailureStrategy`
